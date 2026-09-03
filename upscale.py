@@ -45,7 +45,7 @@ SUBFOLDER = "_upscale"
 CONFIG_KEYS = ("first_sigma", "upscale")
 # hashed only when set (see config_hash): `junction` = [ramp, edge, deep]
 # the refine holds its junction windows with, in place of the recipe's
-OPTIONAL_CONFIG_KEYS = ("junction", "junction_mode")
+OPTIONAL_CONFIG_KEYS = ("junction", "junction_mode", "drift")
 
 
 def profile_folder(base_folder, profile):
@@ -328,8 +328,20 @@ def sequence_text(document, rel_folder):
         # enter is derived, so its enter marker goes.
         drop_exit = bool(nxt and sources[k] in (nxt.get("pinned_to") or {}))
         drop_enter = bool(prev and sources[k] in (prev.get("pinned_to") or {}))
-        suffix = shift_markers(suffix, int(entry.get("head_shift", 0) or 0),
-                               drop_enter=drop_enter, drop_exit=drop_exit)
+        head_shift = int(entry.get("head_shift", 0) or 0)
+        # A clip refined with NO junction pin keeps its source's pinned
+        # head untrimmed (the loop has nothing to pin it to: a timeline
+        # that starts on an extension, or a cut right before it), so its
+        # rendering is `head_shift` frames longer at the head than the
+        # source delivered, and those frames are scaffolding the source
+        # never showed. The source line's implicit "enter at 0" must
+        # become "enter at head_shift". A PINNED clip's extra head frames
+        # are the opposite case -- a ramped junction re-drew them to be
+        # delivered -- so there the implicit enter stays at 0.
+        untrimmed = head_shift > 0 and not entry.get("pinned_to")
+        suffix = shift_markers(suffix, head_shift,
+                               drop_enter=drop_enter, drop_exit=drop_exit,
+                               enter_default=0 if untrimmed else None)
         out.append("%s/%s%s" % (rel_folder, entry["output"], suffix))
     return "\n".join(out)
 
@@ -337,22 +349,36 @@ def sequence_text(document, rel_folder):
 _MARKER = re.compile(r"^(\s*@\s*)(\d*)(\.\.)?(\d*)(?=\s|\[|$)")
 
 
-def shift_markers(suffix, shift, drop_enter=False, drop_exit=False):
+def shift_markers(suffix, shift, drop_enter=False, drop_exit=False,
+                  enter_default=None):
     """A sequence line's tail (` @ a..b [opts]`) with the cut moved.
 
     Cut markers index a clip's DELIVERED frames; a refined clip whose
     head starts `shift` frames earlier than its source's needs every
     marker moved by `shift`. Dropped markers are removed outright; a
     marker left with nothing to say disappears with its `@`.
+
+    `enter_default` (an int) makes an ABSENT enter marker count as that
+    frame before shifting, so a line that entered at 0 of the source
+    enters at `shift` of the rendering; None leaves an absent enter
+    absent, which is what a rendering whose extra head frames are meant
+    to be delivered needs.
     """
-    m = _MARKER.match(suffix or "")
+    suffix = suffix or ""
+    m = _MARKER.match(suffix)
     if not m:
-        return suffix or ""
+        if enter_default is None or not int(shift) or drop_enter:
+            return suffix
+        enter = str(max(0, int(enter_default) + int(shift)))
+        rest = suffix.lstrip()
+        return " @ %s" % enter + (" " + rest if rest else "")
     enter, dots, exit_ = m.group(2), m.group(3), m.group(4)
     rest = suffix[m.end():]
     # "@ N" alone is an ENTER marker
     if enter and not dots:
         enter, exit_ = enter, ""
+    if not enter and enter_default is not None and int(shift):
+        enter = str(int(enter_default))
     if drop_enter:
         enter = ""
     if drop_exit:

@@ -80,9 +80,9 @@ class H3UpscaleLoopStart:
     CATEGORY = "obvpm/h3"
     FUNCTION = "start"
     RETURN_TYPES = (wt.LOOP, "STRING", wt.PINSPECS, "STRING", "FLOAT",
-                    "INT", "INT")
+                    "INT", "INT", "BOOLEAN", "INT")
     RETURN_NAMES = ("flow", "clip_path", "pin_specs", "out_folder",
-                    "first_sigma", "index", "total")
+                    "first_sigma", "index", "total", "drift", "noise_offset")
     DESCRIPTION = (
         "Opens an upscale/refine loop over a timeline. Everything between "
         "this node and H3 Upscale Loop End is the loop body and runs once "
@@ -104,6 +104,13 @@ class H3UpscaleLoopStart:
         "lives with the pass (and is part of its config hash).",
         "0-based position in the timeline.",
         "How many clips the timeline holds.",
+        "The drift toggle, passed through. Wire to H3 MCtx Drift Mask's "
+        "`enabled` on the refine model path, so the model patch and the "
+        "profile hash agree.",
+        "Where this clip's RAW latent starts on the timeline, in frames. "
+        "Wire to H3 Chain Noise's frame_offset so every clip samples in "
+        "one continuous noise field (the pinned window then carries the "
+        "same noise in parent and child).",
     )
 
     @classmethod
@@ -192,9 +199,12 @@ class H3UpscaleLoopStart:
                     "tooltip": "How the junction window is pinned. mirror "
                                "= the mode the take was made with (masked "
                                "for an extend: the window is held exactly, "
-                               "nothing more). both = held exactly AND fed "
-                               "to the model as keyframe conditioning rows. "
-                               "guided = NOT held: the window is the clip's "
+                               "nothing more). both = held exactly AND "
+                               "fed to the model as keyframe conditioning "
+                               "rows -- the parent's refined texture is "
+                               "then a clean REFERENCE the model can copy "
+                               "appearance from, not just content it may "
+                               "not change. guided = NOT held: the window is the clip's "
                                "starting point and its steering rows, the "
                                "clip re-draws it in its own hand and "
                                "DELIVERS it, and the neighbour hands over "
@@ -205,6 +215,16 @@ class H3UpscaleLoopStart:
                                "invents differently on each side of). The "
                                "seam is then a guided one, pixel-grade. "
                                "Part of the profile hash when not mirror."}),
+                "drift": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Drift control for the held window: instead "
+                               "of a clean wall, the held rows are rebuilt "
+                               "every step at the content's own noise level "
+                               "(H3 MCtx Drift Mask on the refine model "
+                               "path, wired from this node's `drift` "
+                               "output). Removes the level dip a refine "
+                               "shows right after a clean held window. "
+                               "Works with mirror and both. Hashed when on."}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
@@ -217,8 +237,8 @@ class H3UpscaleLoopStart:
 
     def start(self, sequence, base_folder, profile, first_sigma,
               upscale_note, start_index=-1, junction_ramp=0,
-              junction_edge=0.4, junction_mode="mirror", unique_id=None,
-              **_):
+              junction_edge=0.4, junction_mode="mirror", drift=False,
+              unique_id=None, **_):
         import folder_paths
 
         clips = upscale.parse_sequence(sequence)
@@ -237,8 +257,14 @@ class H3UpscaleLoopStart:
             junction = [int(junction_ramp), round(float(junction_edge), 4), 0.0]
             config["junction"] = junction
         mode = str(junction_mode or "mirror")
+        if mode == "drift":
+            # the pre-split spelling: drift used to be a junction mode
+            mode, drift = "mirror", True
         if mode != "mirror":
             config["junction_mode"] = mode
+        drift = bool(drift)
+        if drift:
+            config["drift"] = True
         out_dir = folder_paths.get_output_directory()
         name = str(profile or "").strip()
         if not name:
@@ -315,7 +341,36 @@ class H3UpscaleLoopStart:
                 "folder": folder, "rel_folder": rel_folder, "source": clip,
                 "config": config, "hash": hash_value}
         return (flow, clip, specs, rel_folder, float(first_sigma),
-                index, len(clips))
+                index, len(clips), drift,
+                self._raw_starts(lines, headers)[index])
+
+    @staticmethod
+    def _raw_starts(lines, headers):
+        """Each clip's RAW-latent start on the timeline, in frames.
+
+        Delivered frame f of clip i sits at T_i + (f - enter_i), where T_i
+        is the delivered duration of everything before it; raw frame r is
+        delivered frame r - head_i. So the raw latent starts at
+        T_i - enter_i - head_i -- negative for a first clip whose pinned
+        head precedes the timeline, which is fine: it is a coordinate.
+        For a masked extend this puts the child's held window on exactly
+        the parent's frames it was cut from, so a noise field indexed by
+        this coordinate gives both the same noise there.
+        """
+        starts, t = [], 0
+        for line, header in zip(lines, headers):
+            suffix = line[len(line.split("@")[0].rstrip()):]
+            m = upscale._MARKER.match(suffix)
+            enter = int(m.group(2)) if m and m.group(2) and not (m.group(3) and not m.group(2)) else 0
+            exit_ = int(m.group(4)) if m and m.group(3) and m.group(4) else None
+            if m and m.group(2) and not m.group(3):
+                enter, exit_ = int(m.group(2)), None
+            delivered = int(header.get("delivered_frames", 0) or 0)
+            head = int(header.get("pinned_head_frames", 0) or 0)
+            starts.append(t - enter - head)
+            end = exit_ if exit_ is not None else delivered
+            t += max(0, end - enter)
+        return starts
 
     @staticmethod
     def _headers(clips):
@@ -517,19 +572,29 @@ class H3UpscaleLoopEnd:
         # than the source's: a ramped junction ships part of the held
         # window. The source line's `@` cut markers index the SOURCE's
         # delivered frames, so the assembly moves them by this.
+        # Read for EVERY clip, pinned or not: a clip with no junction pin
+        # in this profile (the first clip of a timeline that starts on an
+        # extension) is refined as a root, so its rendering keeps the
+        # source's pinned head untrimmed -- source_head frames the source
+        # never delivered. `sequence_text` turns that into an enter
+        # marker; without the number the cut plays them.
         head_shift = 0
-        if flow.get("pinned_to"):
-            try:
-                saved = str(after)
-                if not os.path.isabs(saved):
-                    saved = nodes_load.resolve_clip_path(saved)
-                refined_head = int(mctx.read_header(
-                    mctx.sidecar_path(saved)).get("pinned_head_frames", 0) or 0)
-                head_shift = int(flow.get("source_head") or 0) - refined_head
-            except Exception:
-                _LOG.exception("obvpm.h3: could not read the refined "
-                               "clip's head; cut markers keep the source "
-                               "frame numbers")
+        try:
+            saved = str(after)
+            if not os.path.isabs(saved):
+                saved = nodes_load.resolve_clip_path(saved)
+            refined_head = int(mctx.read_header(
+                mctx.sidecar_path(saved)).get("pinned_head_frames", 0) or 0)
+            head_shift = int(flow.get("source_head") or 0) - refined_head
+            if head_shift > 0 and not flow.get("pinned_to"):
+                _LOG.info("obvpm.h3: %s was refined without a junction pin "
+                          "but its source delivered from frame %d; the "
+                          "cut will enter the rendering there",
+                          flow["source"], head_shift)
+        except Exception:
+            _LOG.exception("obvpm.h3: could not read the refined "
+                           "clip's head; cut markers keep the source "
+                           "frame numbers")
         document = upscale.read_manifest(folder)
         upscale.record(document, flow["source"], os.path.basename(str(after)),
                        flow["config"], flow["hash"],

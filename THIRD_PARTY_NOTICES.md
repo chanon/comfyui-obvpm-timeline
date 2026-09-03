@@ -15,6 +15,21 @@ positions (a capability ComfyUI core has since merged natively, PR
 that project informed the pins design: tail slicing soundness rules,
 audio window end-alignment on the shared timeline, and trim behavior.
 
+## ComfyUI-MiniMaxH3-Contex-Loop (GPL-3.0)
+
+Copyright (C) 2026 NikoDemon80
+https://github.com/NikoDemon80/ComfyUI-MiniMaxH3-Contex-Loop
+
+`H3 MCtx Drift Mask` (`nodes_drift.py`) implements that pack's
+Drift-Control AV rule: at every model evaluation the carried context
+rows are held at `sigma_next / sigma_current` rather than at zero, with
+the four rows nearest the generated content tapering .75/.50/.25/0 so
+the boundary stays exact, and an apply-model wrapper hands H3 the same
+mask as its per-row timestep labels. The two-hook structure (sampler
+denoise-mask function plus apply-model wrapper) and the taper are
+theirs; the code is written against this pack's own pin layout, with
+nothing vendored.
+
 ## ComfyUI-MMH3Tools (MIT)
 
 Copyright (c) ckinpdx

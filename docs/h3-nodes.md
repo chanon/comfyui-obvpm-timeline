@@ -270,6 +270,85 @@ audio grid up ~8 ms per clip, and the surplus would compound at every
 join in a chain. Use this node when you want the delivered frames
 mid-graph; H3 MCtx Trim and Save Video does the same trim internally.
 
+## H3 MCtx Drift Mask
+
+A model patch for the refine pass's junction pins. Sits on the refine
+sampler's MODEL path and reads the `pins` wire from Apply.
+
+A masked pin holds its window at mask 0, which core labels as clean
+conditioning for the whole run. In a refine the free rows next to it
+already carry content at the pass's small sigma, and a clean wall beside
+noisy content pulls the prediction next to it: measured as a ~2 luma dip
+right after every pinned head that recovers over two to three seconds,
+in every junction mode. This node takes the wall down. Two mixes:
+
+- **`renoise`** (default) rebuilds the held rows at every step from the
+  carried clean latent, noised to the chosen level with the run's own
+  fixed noise — the way ordinary inpainting samplers treat a masked
+  region. The row's noise is then what its label says by construction,
+  whatever the sampler did last step, so it works at any step count and
+  nothing can drift. Core's post-step x0 blend still returns the rows to
+  clean, so the join and the trim geometry are unchanged.
+- **`blend`** is Contex-Loop's Drift-Control rule: core's own mix of the
+  sampler's state with the clean latent, held rows at
+  `sigma_next / sigma_current`. Validated by them at 20 steps; measured
+  here to **fail under a 4–5 step turbo schedule**, where the ratios sit
+  near 1 for every step that matters and then snap to clean for a last
+  step covering 43% of the range. Kept for schedules with a small final
+  step.
+
+The **level** says how noisy the held rows are each step: `matched` is
+the content's own sigma (the context is indistinguishable from content
+at every step — no wall anywhere, the big last step included); `ahead`
+is `sigma_next / sigma_current`; `constant` is `level_value × sigma`.
+The model is handed the levels as its per-row labels, so what it is told
+matches what it is given. Audio is untouched.
+
+| Input | Type | Notes |
+|---|---|---|
+| `model` | MODEL | the MiniMax H3 model the refine samples with |
+| `pins` | PINS | from Apply — which rows are held, and on which side |
+| `enabled` | BOOLEAN | off = pass through. Wire from Loop Start's `drift` so the model patch and the profile hash agree |
+| `mix` | COMBO | `renoise` or `blend`, above |
+| `level` | COMBO | `matched`, `ahead` or `constant`, above |
+| `level_value` | FLOAT | the fraction for `constant`; ignored otherwise |
+| `taper_steps` | INT | latent steps nearest the join that fall from the level to exact (`4` = `.75/.50/.25/0`, Contex-Loop's recipe). `0` keeps the whole window at the level, join row included — the output is returned to clean after every step regardless, so the trim is unaffected |
+
+These settings are not part of the profile hash (the loop cannot see
+them); put a word in Loop Start's `upscale_note` when you change them so
+the run opens its own folder.
+
+Output: `model` (a clone with the hooks installed). With no held pins —
+a root clip, a guide-only pin — the input model passes through. Refuses
+a model that already carries a dynamic denoise-mask patch (Differential
+Diffusion), since the two would fight over the same hook.
+
+## H3 Chain Noise
+
+A NOISE source for the refine sampler that draws noise per **absolute
+timeline position** rather than per clip.
+
+A refine invents its fine texture largely from its noise. With a fixed
+seed, every clip of the same size gets the *identical* noise tensor,
+positionally — so the child's first free frame after a junction carries
+the noise its parent had at frame 39, not a continuation of the noise the
+parent's last frame was refined under, and the two sides of the join
+invent unrelated detail. This node indexes one noise field by timeline
+frame: a clip whose raw latent starts at frame F gets, for its latent
+step k, the noise of absolute step `steps(F) + k`, and each audio tick
+likewise. A pinned window then carries the same noise in the parent and
+the child, and the free frames on both sides of a join sit in one
+continuous field. Each step's draw is independent, so a clip's noise
+depends only on where it sits, not on which clip is being refined.
+
+| Input | Type | Notes |
+|---|---|---|
+| `noise_seed` | INT | the field's seed; same seed = same field for every clip of the chain |
+| `frame_offset` | INT | where this clip's raw latent starts on the timeline, in frames — wire from Loop Start's `noise_offset` (negative for a first clip whose pinned head precedes the timeline) |
+
+Output: `noise`, for the sampler's noise input. Off-grid offsets (a plain
+cut upstream) snap to the covering latent step.
+
 ## H3 MCtx Timeline
 
 The composition hub — see the [widget guide](h3.md#the-timeline-widget)
@@ -535,18 +614,28 @@ where the result goes.
 | `start_index` | INT | `-1` resumes where the profile left off; the loop drives this itself after the first iteration |
 | `junction_ramp` | INT | **soft junctions.** `0` mirrors each take's recorded hold (a hard hold for most). `N` ramps the held window's mask over its last `N` frames, from exact up to `junction_edge` at the join, so the two clips' re-derived detail blends across the ramp instead of switching on one frame — a refine invents fine texture (distant people, foliage), each clip invents its own, and a hard handover shows it even where the motion is exact. The ramped frames are re-drawn and delivered by the later clip, so the earlier one exits that much sooner; total length is unchanged. Part of the profile hash |
 | `junction_edge` | FLOAT | with a ramp: the mask value at the join, as a fraction of the pass's own sigma (`0` still exact, `1` fully this clip's refine). `0.4` is the generation side's arriving default |
-| `junction_mode` | COMBO | `mirror` pins the way the take was made (held exactly). `both` holds exactly **and** feeds the window as keyframe rows. `guided` does not hold at all: the window is the clip's starting point and steering rows, the clip re-draws it and **delivers** it, and the neighbour hands over at the window's start — the neighbour's texture becomes this clip's across 39 frames of one generation rather than switching on one frame, which is the defect a per-clip refine shows at a hard join (each clip invents its own fine detail). The seam becomes a guided, pixel-grade one. Hashed when not `mirror` |
+| `junction_mode` | COMBO | `mirror` pins the way the take was made (held exactly). `both` holds exactly **and** feeds the window as keyframe rows, so the parent's refined texture is a clean *reference* the model can copy appearance from, not only content it may not change. `guided` does not hold at all: the window is the clip's starting point and steering rows, the clip re-draws it and **delivers** it, and the neighbour hands over at the window's start — the neighbour's texture becomes this clip's across 39 frames of one generation rather than switching on one frame, which is the defect a per-clip refine shows at a hard join (each clip invents its own fine detail). The seam becomes a guided, pixel-grade one. Hashed when not `mirror` |
+
+| `drift` | BOOLEAN | drift control for the held window: instead of a clean wall, the held rows are rebuilt every step at the content's own noise level by [H3 MCtx Drift Mask](#h3-mctx-drift-mask) on the refine model path, wired from this node's `drift` output. Removes the level dip a refine shows right after a clean held window. Works with `mirror` and `both`. Hashed when on |
 
 Outputs: `flow` (to Loop End), `clip_path` (to the path loader),
 `pin_specs` (the junction pin, mirroring the original pin's geometry
 against the previously *refined* clip), `out_folder`, `first_sigma`,
-`index`, `total`.
+`index`, `total`, `drift` (the toggle, for H3 MCtx Drift Mask's
+`enabled`), and `noise_offset` (this clip's
+raw-latent start on the timeline, for [H3 Chain Noise](#h3-chain-noise)).
 
 The profile folder is the whole state: the refined clips plus a
 `profile.json` recording what settings produced them, which **source**
 each came from, and which refined neighbours each was pinned to. Sources
 are never touched, so a pass can be re-run or abandoned, and several
 profiles of one project coexist.
+
+A timeline may start on an extension clip. That clip has no neighbour
+to pin to, so it is refined as a root and its rendering keeps the
+source's pinned head untrimmed; the loop records the difference and the
+assembled cut enters the rendering where the source's delivery began, so
+those scaffolding frames are never played.
 
 **Editing the timeline does not restart the pass.** A profile is its
 settings, not its sequence; a refined clip is reused wherever the current
