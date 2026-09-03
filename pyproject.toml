@@ -1,0 +1,22 @@
+[project]
+name = "comfyui-obvpm-h3"
+description = "Non-linear clip composition for MiniMax H3: takes carry their latents in a sidecar, so a generation can continue an earlier one exactly (extend, prepend, bridge), and a timeline assembles them by smart-cut. Companion to comfyui-obvpm."
+version = "0.1.0"
+license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.9"
+
+# Deliberately empty: every third-party import in this pack (torch,
+# torchaudio, numpy, safetensors, av) is already in ComfyUI's own
+# requirements.txt. Listing them again would let this pack's pins
+# contradict core's on someone else's install.
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/chanon/comfyui-obvpm-h3"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = "chanon"
+DisplayName = "comfyui-obvpm-h3"
+Icon = ""
