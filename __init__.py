@@ -14,11 +14,13 @@ one pack, so saved workflows keep loading.
 from .nodes_assemble import H3Assemble, H3AssembleUpscale, H3Timeline
 from .nodes_drift import H3MCtxDriftMask
 from .nodes_encode import H3MCtxFromFrames
+from .nodes_extend import H3RefineHoldExtend
 from .nodes_load import (H3LoadConditioning, H3LoadMCtx, H3LoadMCtxPath,
                          H3LoadVideoWithMCtx)
 from .nodes_loop import H3UpscaleLoopEnd, H3UpscaleLoopStart
 from .nodes_mode import H3RunModeGate
 from .nodes_noise import H3ChainNoise
+from .nodes_pad import H3UpscaleCrop, H3UpscalePad
 from .nodes_refs import H3RecordReferences
 from .nodes_result import H3ResultPreview
 from .nodes_pins import (
@@ -54,6 +56,9 @@ NODE_CLASS_MAPPINGS = {
     "H3TrimPinned": H3TrimPinned,
     "H3MCtxDriftMask": H3MCtxDriftMask,
     "H3ChainNoise": H3ChainNoise,
+    "H3UpscalePad": H3UpscalePad,
+    "H3UpscaleCrop": H3UpscaleCrop,
+    "H3RefineHoldExtend": H3RefineHoldExtend,
     "H3Assemble": H3Assemble,
     "H3AssembleUpscale": H3AssembleUpscale,
     "H3Timeline": H3Timeline,
@@ -78,6 +83,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3TrimPinned": "H3 MCtx Trim Pinned",
     "H3MCtxDriftMask": "H3 MCtx Drift Mask",
     "H3ChainNoise": "H3 Chain Noise",
+    "H3UpscalePad": "H3 Upscale Pad",
+    "H3UpscaleCrop": "H3 Upscale Crop",
+    "H3RefineHoldExtend": "H3 Refine Hold Extend",
     "H3Assemble": "H3 MCtx Assemble",
     "H3AssembleUpscale": "H3 Assemble Upscale",
     "H3Timeline": "H3 MCtx Timeline",

@@ -45,7 +45,11 @@ SUBFOLDER = "_upscale"
 CONFIG_KEYS = ("first_sigma", "upscale")
 # hashed only when set (see config_hash): `junction` = [ramp, edge, deep]
 # the refine holds its junction windows with, in place of the recipe's
-OPTIONAL_CONFIG_KEYS = ("junction", "junction_mode", "drift")
+# `pad` = latent steps of neighbour context the upscaler was given on
+# each held side (H3 Upscale Pad); absent = none, as every earlier profile
+# `hold` = frames of extra parent the junction pins hold (H3 Refine Hold
+# Extend); absent = the recorded window only
+OPTIONAL_CONFIG_KEYS = ("junction", "junction_mode", "drift", "pad", "hold")
 
 
 def profile_folder(base_folder, profile):
@@ -397,7 +401,7 @@ def shift_markers(suffix, shift, drop_enter=False, drop_exit=False,
 
 
 def record(document, source, output, config, hash_value, pinned_to=None,
-           head_shift=0):
+           head_shift=0, extend_head=0):
     """Add or replace one refined clip. Callers write the manifest afterwards.
 
     Keyed by source: refining a clip again replaces its entry (the old
@@ -418,6 +422,10 @@ def record(document, source, output, config, hash_value, pinned_to=None,
              "pinned_to": dict(pinned_to or {})}
     if int(head_shift or 0):
         entry["head_shift"] = int(head_shift)
+    if int(extend_head or 0):
+        # the refined clip's pinned head is this much longer than the
+        # window it mirrors; a later junction against it subtracts it
+        entry["extend_head"] = int(extend_head)
     entries = document.setdefault("entries", [])
     for k, old in enumerate(entries):
         if old.get("source") == source:

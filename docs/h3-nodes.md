@@ -22,6 +22,9 @@ Refining · [H3 Record References](#h3-record-references) ·
 [H3 MCtx Load Conditioning](#h3-mctx-load-conditioning) ·
 [H3 Upscale Loop Start](#h3-upscale-loop-start) ·
 [H3 Upscale Loop End](#h3-upscale-loop-end) ·
+[H3 Upscale Pad](#h3-upscale-pad) ·
+[H3 Upscale Crop](#h3-upscale-crop) ·
+[H3 Refine Hold Extend](#h3-refine-hold-extend) ·
 [H3 Run Mode Gate](#h3-run-mode-gate)
 
 ---
@@ -349,6 +352,109 @@ depends only on where it sits, not on which clip is being refined.
 Output: `noise`, for the sampler's noise input. Off-grid offsets (a plain
 cut upstream) snap to the covering latent step.
 
+## H3 Upscale Pad
+
+Gives the latent upscaler its neighbours' context, so it stops seeing a
+clip edge where the timeline has none.
+
+The refine upscales each clip's raw latent on its own, and the upscaler
+(a stack of temporal convolutions, zero-padded) treats the clip's first
+and last rows as an edge. Measured on a masked extend (2026-09-03): the
+*same* source rows come out 11–15% different upscaled at the end of the
+parent than at the start of the child, against about 4% in the interior.
+The two refines then start from different upscaled content on the very
+rows the junction holds, and each re-derives its own detail there — the
+texture change at a refined seam begins before the sampler runs.
+
+This node extends the clip's raw video latent on each **held** side with
+the neighbour clip's own raw (source) rows from beyond the shared window
+— the frames that really precede and follow this clip on the timeline —
+so the convolutions see the true continuation instead of zeros. [H3
+Upscale Crop](#h3-upscale-crop) takes exactly those rows off again after
+the upscaler. A plain cut is not padded: nothing continues across it. The
+sides padded are the held joins Loop Start pins, so one definition of
+"continuous" serves both.
+
+| Input | Type | Notes |
+|---|---|---|
+| `flow` | LOOP | from Loop Start: which clip this is, and who its neighbours are |
+| `latent` | LATENT | the clip's raw **video** latent, after `LTXVSeparateAVLatent`, as it would go into the upscaler. The audio is not upscaled and is not padded |
+| `pad_steps` | INT | latent steps of neighbour context on each held side; wire from Loop Start's `pad_steps` so the padding and the profile hash agree. 24 covers the upscaler's receptive field (12 temporal convolutions of kernel 5 plus 24 3×3×3 blocks); 0 = pass through |
+
+Outputs: `latent` (padded, for the upscaler) and `pad` (how many rows
+were added on each side, for H3 Upscale Crop). The padding shrinks to
+what the neighbour has when the window sits near its start or end, and
+is logged per clip.
+
+Wire: `LTXVSeparateAVLatent.video_latent → Pad → upscaler → Crop →`
+both `LTXVConcatAVLatent.video_latent` and `H3 MCtx Load Conditioning`'s
+`target_latent`. The padded tensor is longer, so the upscaler's memory
+grows with it (87 → 135 steps for a 294-frame clip padded 24 each side).
+
+## H3 Upscale Crop
+
+Removes the rows [H3 Upscale Pad](#h3-upscale-pad) added, after the
+upscaler, so the clip is back to its own length — upscaled with its real
+continuation in view.
+
+| Input | Type | Notes |
+|---|---|---|
+| `latent` | LATENT | the upscaler's output |
+| `pad` | PAD | from H3 Upscale Pad |
+
+Output: `latent`, the clip's own rows. Refuses to run if the upscaler did
+not keep the temporal length.
+
+## H3 Refine Hold Extend
+
+Gives the refine **more of the parent to hold** than the 39 frames the
+take was generated with.
+
+A masked extend holds 39 frames (12 latent steps) of its parent. That is
+enough for generation, where the free frames start as pure noise and the
+held window is the only appearance in the clip, so the model copies it.
+A refine is different: its free frames start as the upscaled source at
+25% plus noise, which already carries a complete appearance of its own,
+over 75 steps. Measured on refine08–14 (2026-09-04): holding exactly,
+matching the noise level, sharing one noise field, feeding the window as
+a keyframe reference and making the upscaled latents continuous all left
+the seam where it was — and the refine moves each row about 30% away
+from its upscaled prior (74% of the fine texture), which is the same
+distance the parent's refined rows sit from the child's prior on the
+shared frames. Twelve held steps are asking the model to contradict the
+prior the other seventy-five carry.
+
+This node lengthens the argument the parent gets to make. The target AV
+latent is extended on the held side by `extend_frames` (video steps and
+audio ticks on the shared AV grid), Loop Start widens the junction pin
+by the same amount, and Apply Pins writes 39 + `extend_frames` frames of
+the parent's *refined* latent into the head (or tail) and holds them.
+The sampler sees a longer clip whose held part is a much larger share;
+the save's trim removes the whole held window as usual, so the delivered
+clip is unchanged in span. Nothing here touches the free frames — it
+changes who they are outnumbered by.
+
+| Input | Type | Notes |
+|---|---|---|
+| `latent` | LATENT | the upscaled AV target latent, after `LTXVConcatAVLatent`, before Apply Pins |
+| `pin_specs` | PINSPECS | from Loop Start: which side(s) hold a neighbour, so the extension lands there (a before-pin at the head, an after-pin at the tail, both for a bridge) |
+| `extend_frames` | INT | frames of extra held parent, a **multiple of 51** so the window stays on the shared AV grid 39/90/141/192: 102 turns 39 into 141 frames (42 steps). Wire from Loop Start's `hold_extend` so the latent, the pin and the profile hash agree. 0 = pass through |
+
+Outputs: `latent` (extended, for Apply Pins) and `audio_latent` (the
+extended audio stream alone). The second output matters: a refine keeps
+the *source* audio, decoded from the source latent, and the save's trim
+takes the pinned head off that track — so it must be as long as the
+picture, or the trim lands 102 frames wrong. Wire it to the
+`VAEDecodeAudio` that feeds the save node in place of the separator's
+audio latent. The rows this node adds are placeholders; Apply Pins
+overwrites every one of them, picture and sound.
+
+Wire: `LTXVConcatAVLatent → Hold Extend → H3 MCtx Apply Pins (latent)`,
+`Hold Extend.audio_latent → VAEDecodeAudio → save.audio`. The refined
+clip's sidecar records the longer pinned head; Loop End and the next
+junction subtract the extension, so cut markers and later pins are
+unaffected. Sampler cost grows with the clip (87 → 117 steps at 102).
+
 ## H3 MCtx Timeline
 
 The composition hub — see the [widget guide](h3.md#the-timeline-widget)
@@ -617,13 +723,17 @@ where the result goes.
 | `junction_mode` | COMBO | `mirror` pins the way the take was made (held exactly). `both` holds exactly **and** feeds the window as keyframe rows, so the parent's refined texture is a clean *reference* the model can copy appearance from, not only content it may not change. `guided` does not hold at all: the window is the clip's starting point and steering rows, the clip re-draws it and **delivers** it, and the neighbour hands over at the window's start — the neighbour's texture becomes this clip's across 39 frames of one generation rather than switching on one frame, which is the defect a per-clip refine shows at a hard join (each clip invents its own fine detail). The seam becomes a guided, pixel-grade one. Hashed when not `mirror` |
 
 | `drift` | BOOLEAN | drift control for the held window: instead of a clean wall, the held rows are rebuilt every step at the content's own noise level by [H3 MCtx Drift Mask](#h3-mctx-drift-mask) on the refine model path, wired from this node's `drift` output. Removes the level dip a refine shows right after a clean held window. Works with `mirror` and `both`. Hashed when on |
+| `pad_steps` | INT | upscaler padding: latent steps of the neighbour clip's own raw rows added on each held side before the latent upscaler and cropped after it, by [H3 Upscale Pad](#h3-upscale-pad) and [H3 Upscale Crop](#h3-upscale-crop) wired from this node's `pad_steps` output — so the upscaler sees the true continuation instead of a zero-padded clip edge (measured 11–15% different on the shared rows, against ~4% in the interior). 24 covers its receptive field. 0 = off. Hashed when on |
+| `hold_extend` | INT | hold **more of the parent**: the junction pin's window grows by this many frames (a multiple of 51; 102 turns 39 into 141 frames = 42 steps) and [H3 Refine Hold Extend](#h3-refine-hold-extend), wired from this node's `hold_extend` output, lengthens the target latent to make room. The pinned window is trimmed at save as usual, so the delivered clip is unchanged; `noise_offset` moves back by the extension so the chain noise still lines up. Hashed when on |
 
 Outputs: `flow` (to Loop End), `clip_path` (to the path loader),
 `pin_specs` (the junction pin, mirroring the original pin's geometry
 against the previously *refined* clip), `out_folder`, `first_sigma`,
 `index`, `total`, `drift` (the toggle, for H3 MCtx Drift Mask's
-`enabled`), and `noise_offset` (this clip's
-raw-latent start on the timeline, for [H3 Chain Noise](#h3-chain-noise)).
+`enabled`), `noise_offset` (this clip's
+raw-latent start on the timeline, for [H3 Chain Noise](#h3-chain-noise)),
+`pad_steps` (for [H3 Upscale Pad](#h3-upscale-pad)), and `hold_extend`
+(for [H3 Refine Hold Extend](#h3-refine-hold-extend)).
 
 The profile folder is the whole state: the refined clips plus a
 `profile.json` recording what settings produced them, which **source**

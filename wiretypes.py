@@ -47,3 +47,7 @@ REFS = "OBVPM_H3_REFS"
 # the upscale loop's open->close handshake: which node opened it, and the
 # iteration state it carries (see nodes_loop.py)
 LOOP = "OBVPM_H3_LOOP"
+
+# how many rows H3 Upscale Pad added on each side of the upscaler's input,
+# for H3 Upscale Crop to take off again (see nodes_pad.py)
+PAD = "OBVPM_H3_PAD"

@@ -37,6 +37,7 @@ import logging
 import os
 
 from . import mctx
+from . import nodes_extend
 from . import nodes_load
 from . import upscale
 from . import wiretypes as wt
@@ -80,9 +81,10 @@ class H3UpscaleLoopStart:
     CATEGORY = "obvpm/h3"
     FUNCTION = "start"
     RETURN_TYPES = (wt.LOOP, "STRING", wt.PINSPECS, "STRING", "FLOAT",
-                    "INT", "INT", "BOOLEAN", "INT")
+                    "INT", "INT", "BOOLEAN", "INT", "INT", "INT")
     RETURN_NAMES = ("flow", "clip_path", "pin_specs", "out_folder",
-                    "first_sigma", "index", "total", "drift", "noise_offset")
+                    "first_sigma", "index", "total", "drift", "noise_offset",
+                    "pad_steps", "hold_extend")
     DESCRIPTION = (
         "Opens an upscale/refine loop over a timeline. Everything between "
         "this node and H3 Upscale Loop End is the loop body and runs once "
@@ -111,6 +113,12 @@ class H3UpscaleLoopStart:
         "Wire to H3 Chain Noise's frame_offset so every clip samples in "
         "one continuous noise field (the pinned window then carries the "
         "same noise in parent and child).",
+        "Latent steps of neighbour context the upscaler sees on each held "
+        "side, passed through. Wire to H3 Upscale Pad's pad_steps so the "
+        "padding and the profile hash agree.",
+        "Frames of extra parent the junction pin holds, passed through. "
+        "Wire to H3 Refine Hold Extend's extend_frames so the latent, the "
+        "pin and the profile hash agree.",
     )
 
     @classmethod
@@ -225,6 +233,33 @@ class H3UpscaleLoopStart:
                                "output). Removes the level dip a refine "
                                "shows right after a clean held window. "
                                "Works with mirror and both. Hashed when on."}),
+                "pad_steps": ("INT", {
+                    "default": 0, "min": 0, "max": 128,
+                    "tooltip": "Upscaler padding: latent steps of the "
+                               "neighbour clip's own raw rows added on each "
+                               "HELD side before the latent upscaler and "
+                               "cropped after it (H3 Upscale Pad / Crop, "
+                               "wired from this node's pad_steps output), "
+                               "so the upscaler sees the true continuation "
+                               "instead of a zero-padded clip edge -- which "
+                               "measured 11-15% different on the shared "
+                               "rows against ~4% in the interior. 24 covers "
+                               "its receptive field. 0 = off. Hashed when "
+                               "on."}),
+                "hold_extend": ("INT", {
+                    "default": 0, "min": 0, "max": 306,
+                    "step": nodes_extend.GRID_FRAMES,
+                    "tooltip": "Hold MORE of the parent: the junction pin's "
+                               "window grows by this many frames (a multiple "
+                               "of 51: 102 turns 39 into 141 frames = 42 "
+                               "steps) and H3 Refine Hold Extend, wired from "
+                               "this node's hold_extend output, lengthens the "
+                               "target latent to make room. A refine's free "
+                               "frames carry their own upscaled prior, and 12 "
+                               "held steps are a minority against 75 of "
+                               "them; this changes the odds. The save's trim "
+                               "removes the whole held window, so the "
+                               "delivered clip is unchanged. Hashed when on."}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
@@ -238,7 +273,7 @@ class H3UpscaleLoopStart:
     def start(self, sequence, base_folder, profile, first_sigma,
               upscale_note, start_index=-1, junction_ramp=0,
               junction_edge=0.4, junction_mode="mirror", drift=False,
-              unique_id=None, **_):
+              pad_steps=0, hold_extend=0, unique_id=None, **_):
         import folder_paths
 
         clips = upscale.parse_sequence(sequence)
@@ -265,6 +300,12 @@ class H3UpscaleLoopStart:
         drift = bool(drift)
         if drift:
             config["drift"] = True
+        pad_steps = max(0, int(pad_steps or 0))
+        if pad_steps:
+            config["pad"] = pad_steps
+        extend = nodes_extend.check_extend(hold_extend)
+        if extend:
+            config["hold"] = extend
         out_dir = folder_paths.get_output_directory()
         name = str(profile or "").strip()
         if not name:
@@ -324,7 +365,11 @@ class H3UpscaleLoopStart:
                    % ", ".join(str(j) for j, _ in deps[index]))
                   if deps[index] else " (no junction pin)")
         specs = self._junction(index, deps, document, rel_folder, clips,
-                               junction, mode)
+                               junction, mode, extend)
+        # where the extension lands: on the side(s) this clip holds
+        places = {pin.get("place") for _, pin in deps[index]}
+        extend_head = extend if "before" in places else 0
+        extend_tail = extend if "after" in places else 0
         # what this rendering is pinned to, recorded with it so a later
         # timeline can tell whether the join it needs is the join it got
         pinned_to = {clips[j]: valid[j]["output"] for j, _ in deps[index]}
@@ -337,12 +382,17 @@ class H3UpscaleLoopStart:
                 # part of the window, so the refined head is shorter and
                 # the source line's cut markers move by the difference
                 "source_head": int(headers[index].get("pinned_head_frames", 0) or 0),
-                "lines": lines, "profile": profile,
+                "lines": lines, "clips": list(clips), "profile": profile,
                 "folder": folder, "rel_folder": rel_folder, "source": clip,
-                "config": config, "hash": hash_value}
+                "config": config, "hash": hash_value,
+                # frames of held parent ADDED at the head/tail beyond the
+                # recorded window: the refined clip's raw and pinned head
+                # grow by extend_head, its delivered span does not
+                "extend_head": extend_head, "extend_tail": extend_tail}
         return (flow, clip, specs, rel_folder, float(first_sigma),
                 index, len(clips), drift,
-                self._raw_starts(lines, headers)[index])
+                self._raw_starts(lines, headers)[index] - extend_head,
+                pad_steps, extend)
 
     @staticmethod
     def _raw_starts(lines, headers):
@@ -436,7 +486,7 @@ class H3UpscaleLoopStart:
 
     @staticmethod
     def _junction(index, deps, document, rel_folder, clips, junction=None,
-                  mode="mirror"):
+                  mode="mirror", extend=0):
         """The pins that hold this clip to its already-refined neighbours.
 
         MIRRORS THE RECORDED PIN rather than inventing one. The take
@@ -468,9 +518,21 @@ class H3UpscaleLoopStart:
                     % (index, neighbour))
             parent_clip = "%s/%s" % (rel_folder, output)
             parent = nodes_load.load_verified_bundle(parent_clip)
-            head = int(parent["meta"].get("pinned_head_frames", 0) or 0)
+            # The refined parent's delivered frames start at its pinned
+            # head; if ITS head was extended, that head is longer than
+            # the source's by the extension while its delivered span is
+            # the source's. The window is named in source raw frames, so
+            # the delivered cut is taken against the un-extended head.
+            head = (int(parent["meta"].get("pinned_head_frames", 0) or 0)
+                    - int(entry.get("extend_head", 0) or 0))
 
+            # The held window grows by the extension: the target latent
+            # is lengthened by the same amount (H3 Refine Hold Extend),
+            # so the extra frames are parent rows the clip never had --
+            # more of the parent to hold, on the timeline positions
+            # where the parent really is.
             window = int(pin.get("source_frames") or 0)
+            grown = window + int(extend or 0)
             raw_start = int(pin.get("source_start") or 0)
             # The refine's own ramp, when set, replaces the recorded hold:
             # a refine invents detail per clip, and a hard switch between
@@ -498,7 +560,9 @@ class H3UpscaleLoopStart:
             # The recorded window is in the neighbour's RAW frames;
             # `_create_pins` takes a DELIVERED cut, and the two differ by
             # the neighbour's own pinned head. An extend names the frame
-            # the window ENDS at, a prepend the frame it STARTS at.
+            # the window ENDS at, a prepend the frame it STARTS at. The cut
+            # is the RECORDED window's edge facing this clip; the grown
+            # window extends away from it, deeper into the neighbour.
             if pin.get("place") == "before":
                 how, cut = "extend (pin tail)", raw_start + window - head
             else:
@@ -511,7 +575,7 @@ class H3UpscaleLoopStart:
             pin_mode = {"mirror": pin.get("mode") or "masked",
                         "guided": "both"}.get(mode, mode)
             specs.extend(nodes_load._create_pins(
-                parent, parent_clip, how, str(window), at_frame=cut,
+                parent, parent_clip, how, str(grown), at_frame=cut,
                 pin_mode=pin_mode, mask_shape=shape))
         return specs
 
@@ -585,7 +649,10 @@ class H3UpscaleLoopEnd:
                 saved = nodes_load.resolve_clip_path(saved)
             refined_head = int(mctx.read_header(
                 mctx.sidecar_path(saved)).get("pinned_head_frames", 0) or 0)
-            head_shift = int(flow.get("source_head") or 0) - refined_head
+            # an extended hold lengthens the refined head by exactly the
+            # extension without moving the delivered span, so take it off
+            head_shift = int(flow.get("source_head") or 0) - (
+                refined_head - int(flow.get("extend_head") or 0))
             if head_shift > 0 and not flow.get("pinned_to"):
                 _LOG.info("obvpm.h3: %s was refined without a junction pin "
                           "but its source delivered from frame %d; the "
@@ -599,7 +666,8 @@ class H3UpscaleLoopEnd:
         upscale.record(document, flow["source"], os.path.basename(str(after)),
                        flow["config"], flow["hash"],
                        pinned_to=flow.get("pinned_to"),
-                       head_shift=head_shift)
+                       head_shift=head_shift,
+                       extend_head=flow.get("extend_head"))
         # the timeline's own lines, so the assembly can put the cut
         # markers back on clips whose frame counts are unchanged
         document["lines"] = flow.get("lines") or []
