@@ -15,6 +15,8 @@ from .nodes_assemble import H3Assemble, H3AssembleUpscale, H3Timeline
 from .nodes_drift import H3MCtxDriftMask
 from .nodes_encode import H3MCtxFromFrames
 from .nodes_extend import H3RefineHoldExtend
+from .nodes_joint import (H3ContextWindows, H3JointLatent, H3JointSlice,
+                          H3JointStore)
 from .nodes_load import (H3LoadConditioning, H3LoadMCtx, H3LoadMCtxPath,
                          H3LoadVideoWithMCtx)
 from .nodes_loop import H3UpscaleLoopEnd, H3UpscaleLoopStart
@@ -59,6 +61,10 @@ NODE_CLASS_MAPPINGS = {
     "H3UpscalePad": H3UpscalePad,
     "H3UpscaleCrop": H3UpscaleCrop,
     "H3RefineHoldExtend": H3RefineHoldExtend,
+    "H3JointLatent": H3JointLatent,
+    "H3ContextWindows": H3ContextWindows,
+    "H3JointStore": H3JointStore,
+    "H3JointSlice": H3JointSlice,
     "H3Assemble": H3Assemble,
     "H3AssembleUpscale": H3AssembleUpscale,
     "H3Timeline": H3Timeline,
@@ -86,6 +92,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3UpscalePad": "H3 Upscale Pad",
     "H3UpscaleCrop": "H3 Upscale Crop",
     "H3RefineHoldExtend": "H3 Refine Hold Extend",
+    "H3JointLatent": "H3 Joint Latent",
+    "H3ContextWindows": "H3 Context Windows",
+    "H3JointStore": "H3 Joint Store",
+    "H3JointSlice": "H3 Joint Slice",
     "H3Assemble": "H3 MCtx Assemble",
     "H3AssembleUpscale": "H3 Assemble Upscale",
     "H3Timeline": "H3 MCtx Timeline",

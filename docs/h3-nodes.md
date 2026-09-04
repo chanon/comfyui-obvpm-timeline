@@ -25,6 +25,10 @@ Refining · [H3 Record References](#h3-record-references) ·
 [H3 Upscale Pad](#h3-upscale-pad) ·
 [H3 Upscale Crop](#h3-upscale-crop) ·
 [H3 Refine Hold Extend](#h3-refine-hold-extend) ·
+[H3 Joint Latent](#h3-joint-latent) ·
+[H3 Context Windows](#h3-context-windows) ·
+[H3 Joint Store](#h3-joint-store) ·
+[H3 Joint Slice](#h3-joint-slice) ·
 [H3 Run Mode Gate](#h3-run-mode-gate)
 
 ---
@@ -454,6 +458,88 @@ Wire: `LTXVConcatAVLatent → Hold Extend → H3 MCtx Apply Pins (latent)`,
 clip's sidecar records the longer pinned head; Loop End and the next
 junction subtract the extension, so cut markers and later pins are
 unaffected. Sampler cost grows with the clip (87 → 117 steps at 102).
+
+## The joint refine
+
+Every per-clip fix — exact hold, matched noise level, one noise field,
+keyframe reference, continuous upscaled latents, a 27-step hold — left
+the refined seam where it was (refine08–17, 2026-09-04). The
+measurement behind that: a refine moves about 74% of the fine texture
+away from its upscaled prior, per clip and per seed, and no amount of
+held neighbour makes it copy the neighbour's invention. A single long
+clip refines seamlessly because every row is sampled in one pass with
+every other row in view. The four nodes below give a chain the same
+treatment: the timeline becomes one latent, is upscaled as one and
+sampled as one in clip-sized windows that overlap by a third, with the
+model's predictions blended across the overlap at every step
+(MultiDiffusion along time). Texture is then decided across the joins.
+Per step the model runs once per window, so a two-clip chain costs what
+two clips cost, and memory is one window's worth.
+
+The result is sliced back into the clips' own raw spans inside the
+ordinary loop, which decodes, trims and saves each as a refined take and
+keeps the manifest, so H3 Assemble Upscale plays the cut unchanged.
+
+Wire, outside the loop: `H3 Joint Latent → LTXVSeparateAVLatent →
+upscaler → LTXVConcatAVLatent → H3 MCtx Apply Pins (no pins, audio
+frozen) → sampler`, with `H3 Context Windows` on the model, `H3 Chain
+Noise` fed from Joint Latent's `frame_offset`, conditioning loaded from
+Joint Latent's `first_clip`, and the sampler's output into `H3 Joint
+Store`. Inside the loop: `H3 Joint Slice` (Store's path + Loop Start's
+flow) in place of the sampler, feeding decode, Apply Pins' latent and
+the save node. Give Loop Start the same typed `profile` as Joint Store,
+`mirror`, drift off, pad 0, hold 0.
+
+## H3 Joint Latent
+
+Lays every clip of the timeline onto one raw AV latent at its true
+position. Positions come from the same raw-start arithmetic Chain Noise
+uses, so a clip's rows land on exactly the steps its noise did; a held
+window is placed once (the earlier clip's rows, the later copy compared
+and logged). A timeline with a gap between clips is refused.
+
+| Input | Type | Notes |
+|---|---|---|
+| `sequence` | STRING | the timeline text, as Loop Start gets it |
+
+Outputs: `latent` (the joint raw AV latent), `joint` (where each clip
+sits, for Joint Store), `frame_offset` (for Chain Noise), `first_clip`
+(for the conditioning loader: the joint pass samples under one clip's
+prompt and refs), `info`.
+
+## H3 Context Windows
+
+A model patch that samples a long AV latent in windows of
+`context_length` video steps overlapping by `context_overlap`, blending
+predictions across the overlap every step. Core's context windows assume
+every stream keeps time on the same dim; H3's audio latent keeps it
+last, so this is a small handler written for H3's two streams: video
+windows in steps, audio windows in ticks on the shared AV grid (exact,
+never proportional), masks sliced on the dim each keeps time on, and
+each stream blended along its own axis.
+
+| Input | Type | Notes |
+|---|---|---|
+| `context_length` | INT | window in video latent steps. 96 at 1920×1088 is about a clip's cost in tokens and memory |
+| `context_overlap` | INT | steps shared by neighbouring windows; the blend happens here. About a third |
+| `fuse_method` | COMBO | `pyramid` (triangular weights over each window) or `flat` |
+
+A latent no longer than the window samples plainly.
+
+## H3 Joint Store
+
+Writes the sampled joint latent as
+`<base_folder>/_upscale/<profile>/joint.mctx.safetensors` with each
+clip's span recorded in it. Type the same `profile` into Loop Start so
+the sliced clips land in that folder. Outputs `joint_path` and
+`profile_folder`.
+
+## H3 Joint Slice
+
+Inside the loop: this iteration's clip out of the stored joint latent,
+its own raw span (video steps and audio ticks), so the save node trims
+and records it exactly as a per-clip refine would. Refuses a joint latent
+built for a different timeline.
 
 ## H3 MCtx Timeline
 
