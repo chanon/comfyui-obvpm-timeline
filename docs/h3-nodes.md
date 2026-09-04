@@ -8,7 +8,6 @@ Saving · [H3 MCtx Trim and Save Video](#h3-mctx-trim-and-save-video) ·
 [H3 MCtx Save Video](#h3-mctx-save-video) ·
 [H3 MCtx Save](#h3-mctx-save)
 Loading · [H3 MCtx Load](#h3-mctx-load) ·
-[H3 MCtx Load by Path](#h3-mctx-load-by-path) ·
 [H3 MCtx Load Video](#h3-mctx-load-video) ·
 [H3 MCtx From Frames](#h3-mctx-from-frames)
 Pinning · [H3 MCtx Pin Spec](#h3-mctx-pin-spec) ·
@@ -19,16 +18,15 @@ Composing · [H3 MCtx Timeline](#h3-mctx-timeline) ·
 [H3 MCtx Assemble](#h3-mctx-assemble) ·
 [H3 Assemble Upscale](#h3-assemble-upscale)
 Refining · [H3 Record References](#h3-record-references) ·
-[H3 MCtx Load Conditioning](#h3-mctx-load-conditioning) ·
-[H3 Upscale Loop Start](#h3-upscale-loop-start) ·
-[H3 Upscale Loop End](#h3-upscale-loop-end) ·
-[H3 Upscale Pad](#h3-upscale-pad) ·
-[H3 Upscale Crop](#h3-upscale-crop) ·
-[H3 Refine Hold Extend](#h3-refine-hold-extend) ·
+[The joint refine](#the-joint-refine) ·
 [H3 Joint Latent](#h3-joint-latent) ·
+[H3 Joint Conditioning](#h3-joint-conditioning) ·
+[H3 Joint Audio Mask](#h3-joint-audio-mask) ·
 [H3 Context Windows](#h3-context-windows) ·
 [H3 Joint Store](#h3-joint-store) ·
+[H3 Upscale Loop Start](#h3-upscale-loop-start) ·
 [H3 Joint Slice](#h3-joint-slice) ·
+[H3 Upscale Loop End](#h3-upscale-loop-end) ·
 [H3 Run Mode Gate](#h3-run-mode-gate)
 
 ---
@@ -110,30 +108,6 @@ continuation clips to the nearest latent-grade cut and logs where the
 seam will land; the new clip's recipe records the shifted join, so
 assembly needs no extra bookkeeping. For explicit `at_frame` cuts,
 audio windows or multi-pin stacks, use H3 MCtx Pin Spec instead.
-
-## H3 MCtx Load by Path
-
-The same loader addressed by a **path** instead of a picker, for graphs
-where another node chooses the clip — the upscale loop walking a
-timeline. Identical outputs; the video is never decoded and there is no
-preview.
-
-| Input | Type | Notes |
-|---|---|---|
-| `clip_path` | STRING | output-relative path, e.g. `selfie_walk2/clip_00086.mp4`. Usually wired; type one to re-run a single clip |
-| `create_pins` | combo | as H3 MCtx Load |
-| `pin_window` | combo | as H3 MCtx Load |
-
-Separate node rather than an override on H3 MCtx Load, for three
-reasons. The picker's combo rescans the output tree every time the
-node's schema is built, and in a loop that folder is being *written* as
-the run proceeds — so the list is stale by construction. The video
-preview and drag-drop handler attach by class name, and a graph that
-only wants latents should not carry either. And a picker whose value is
-overridden must not decide caching: when `clip_path` is wired,
-`IS_CHANGED` cannot see it (it runs before the graph does), so this
-node reports "unknown" rather than a constant that would let one run
-reuse the previous run's clip.
 
 ## H3 MCtx Load Video
 
@@ -276,270 +250,6 @@ Also truncates the audio tail to exactly `frames/fps`: H3 rounds its
 audio grid up ~8 ms per clip, and the surplus would compound at every
 join in a chain. Use this node when you want the delivered frames
 mid-graph; H3 MCtx Trim and Save Video does the same trim internally.
-
-## H3 MCtx Drift Mask
-
-A model patch for the refine pass's junction pins. Sits on the refine
-sampler's MODEL path and reads the `pins` wire from Apply.
-
-A masked pin holds its window at mask 0, which core labels as clean
-conditioning for the whole run. In a refine the free rows next to it
-already carry content at the pass's small sigma, and a clean wall beside
-noisy content pulls the prediction next to it: measured as a ~2 luma dip
-right after every pinned head that recovers over two to three seconds,
-in every junction mode. This node takes the wall down. Two mixes:
-
-- **`renoise`** (default) rebuilds the held rows at every step from the
-  carried clean latent, noised to the chosen level with the run's own
-  fixed noise — the way ordinary inpainting samplers treat a masked
-  region. The row's noise is then what its label says by construction,
-  whatever the sampler did last step, so it works at any step count and
-  nothing can drift. Core's post-step x0 blend still returns the rows to
-  clean, so the join and the trim geometry are unchanged.
-- **`blend`** is Contex-Loop's Drift-Control rule: core's own mix of the
-  sampler's state with the clean latent, held rows at
-  `sigma_next / sigma_current`. Validated by them at 20 steps; measured
-  here to **fail under a 4–5 step turbo schedule**, where the ratios sit
-  near 1 for every step that matters and then snap to clean for a last
-  step covering 43% of the range. Kept for schedules with a small final
-  step.
-
-The **level** says how noisy the held rows are each step: `matched` is
-the content's own sigma (the context is indistinguishable from content
-at every step — no wall anywhere, the big last step included); `ahead`
-is `sigma_next / sigma_current`; `constant` is `level_value × sigma`.
-The model is handed the levels as its per-row labels, so what it is told
-matches what it is given. Audio is untouched.
-
-| Input | Type | Notes |
-|---|---|---|
-| `model` | MODEL | the MiniMax H3 model the refine samples with |
-| `pins` | PINS | from Apply — which rows are held, and on which side |
-| `enabled` | BOOLEAN | off = pass through. Wire from Loop Start's `drift` so the model patch and the profile hash agree |
-| `mix` | COMBO | `renoise` or `blend`, above |
-| `level` | COMBO | `matched`, `ahead` or `constant`, above |
-| `level_value` | FLOAT | the fraction for `constant`; ignored otherwise |
-| `taper_steps` | INT | latent steps nearest the join that fall from the level to exact (`4` = `.75/.50/.25/0`, Contex-Loop's recipe). `0` keeps the whole window at the level, join row included — the output is returned to clean after every step regardless, so the trim is unaffected |
-
-These settings are not part of the profile hash (the loop cannot see
-them); put a word in Loop Start's `upscale_note` when you change them so
-the run opens its own folder.
-
-Output: `model` (a clone with the hooks installed). With no held pins —
-a root clip, a guide-only pin — the input model passes through. Refuses
-a model that already carries a dynamic denoise-mask patch (Differential
-Diffusion), since the two would fight over the same hook.
-
-## H3 Chain Noise
-
-A NOISE source for the refine sampler that draws noise per **absolute
-timeline position** rather than per clip.
-
-A refine invents its fine texture largely from its noise. With a fixed
-seed, every clip of the same size gets the *identical* noise tensor,
-positionally — so the child's first free frame after a junction carries
-the noise its parent had at frame 39, not a continuation of the noise the
-parent's last frame was refined under, and the two sides of the join
-invent unrelated detail. This node indexes one noise field by timeline
-frame: a clip whose raw latent starts at frame F gets, for its latent
-step k, the noise of absolute step `steps(F) + k`, and each audio tick
-likewise. A pinned window then carries the same noise in the parent and
-the child, and the free frames on both sides of a join sit in one
-continuous field. Each step's draw is independent, so a clip's noise
-depends only on where it sits, not on which clip is being refined.
-
-| Input | Type | Notes |
-|---|---|---|
-| `noise_seed` | INT | the field's seed; same seed = same field for every clip of the chain |
-| `frame_offset` | INT | where this clip's raw latent starts on the timeline, in frames — wire from Loop Start's `noise_offset` (negative for a first clip whose pinned head precedes the timeline) |
-
-Output: `noise`, for the sampler's noise input. Off-grid offsets (a plain
-cut upstream) snap to the covering latent step.
-
-## H3 Upscale Pad
-
-Gives the latent upscaler its neighbours' context, so it stops seeing a
-clip edge where the timeline has none.
-
-The refine upscales each clip's raw latent on its own, and the upscaler
-(a stack of temporal convolutions, zero-padded) treats the clip's first
-and last rows as an edge. Measured on a masked extend (2026-09-03): the
-*same* source rows come out 11–15% different upscaled at the end of the
-parent than at the start of the child, against about 4% in the interior.
-The two refines then start from different upscaled content on the very
-rows the junction holds, and each re-derives its own detail there — the
-texture change at a refined seam begins before the sampler runs.
-
-This node extends the clip's raw video latent on each **held** side with
-the neighbour clip's own raw (source) rows from beyond the shared window
-— the frames that really precede and follow this clip on the timeline —
-so the convolutions see the true continuation instead of zeros. [H3
-Upscale Crop](#h3-upscale-crop) takes exactly those rows off again after
-the upscaler. A plain cut is not padded: nothing continues across it. The
-sides padded are the held joins Loop Start pins, so one definition of
-"continuous" serves both.
-
-| Input | Type | Notes |
-|---|---|---|
-| `flow` | LOOP | from Loop Start: which clip this is, and who its neighbours are |
-| `latent` | LATENT | the clip's raw **video** latent, after `LTXVSeparateAVLatent`, as it would go into the upscaler. The audio is not upscaled and is not padded |
-| `pad_steps` | INT | latent steps of neighbour context on each held side; wire from Loop Start's `pad_steps` so the padding and the profile hash agree. 24 covers the upscaler's receptive field (12 temporal convolutions of kernel 5 plus 24 3×3×3 blocks); 0 = pass through |
-
-Outputs: `latent` (padded, for the upscaler) and `pad` (how many rows
-were added on each side, for H3 Upscale Crop). The padding shrinks to
-what the neighbour has when the window sits near its start or end, and
-is logged per clip.
-
-Wire: `LTXVSeparateAVLatent.video_latent → Pad → upscaler → Crop →`
-both `LTXVConcatAVLatent.video_latent` and `H3 MCtx Load Conditioning`'s
-`target_latent`. The padded tensor is longer, so the upscaler's memory
-grows with it (87 → 135 steps for a 294-frame clip padded 24 each side).
-
-## H3 Upscale Crop
-
-Removes the rows [H3 Upscale Pad](#h3-upscale-pad) added, after the
-upscaler, so the clip is back to its own length — upscaled with its real
-continuation in view.
-
-| Input | Type | Notes |
-|---|---|---|
-| `latent` | LATENT | the upscaler's output |
-| `pad` | PAD | from H3 Upscale Pad |
-
-Output: `latent`, the clip's own rows. Refuses to run if the upscaler did
-not keep the temporal length.
-
-## H3 Refine Hold Extend
-
-Gives the refine **more of the parent to hold** than the 39 frames the
-take was generated with.
-
-A masked extend holds 39 frames (12 latent steps) of its parent. That is
-enough for generation, where the free frames start as pure noise and the
-held window is the only appearance in the clip, so the model copies it.
-A refine is different: its free frames start as the upscaled source at
-25% plus noise, which already carries a complete appearance of its own,
-over 75 steps. Measured on refine08–14 (2026-09-04): holding exactly,
-matching the noise level, sharing one noise field, feeding the window as
-a keyframe reference and making the upscaled latents continuous all left
-the seam where it was — and the refine moves each row about 30% away
-from its upscaled prior (74% of the fine texture), which is the same
-distance the parent's refined rows sit from the child's prior on the
-shared frames. Twelve held steps are asking the model to contradict the
-prior the other seventy-five carry.
-
-This node lengthens the argument the parent gets to make. The target AV
-latent is extended on the held side by `extend_frames` (video steps and
-audio ticks on the shared AV grid), Loop Start widens the junction pin
-by the same amount, and Apply Pins writes 39 + `extend_frames` frames of
-the parent's *refined* latent into the head (or tail) and holds them.
-The sampler sees a longer clip whose held part is a much larger share;
-the save's trim removes the whole held window as usual, so the delivered
-clip is unchanged in span. Nothing here touches the free frames — it
-changes who they are outnumbered by.
-
-| Input | Type | Notes |
-|---|---|---|
-| `latent` | LATENT | the upscaled AV target latent, after `LTXVConcatAVLatent`, before Apply Pins |
-| `pin_specs` | PINSPECS | from Loop Start: which side(s) hold a neighbour, so the extension lands there (a before-pin at the head, an after-pin at the tail, both for a bridge) |
-| `extend_frames` | INT | frames of extra held parent, a **multiple of 51** so the window stays on the shared AV grid 39/90/141/192: 102 turns 39 into 141 frames (42 steps). Wire from Loop Start's `hold_extend` so the latent, the pin and the profile hash agree. 0 = pass through |
-
-Outputs: `latent` (extended, for Apply Pins) and `audio_latent` (the
-extended audio stream alone). The second output matters: a refine keeps
-the *source* audio, decoded from the source latent, and the save's trim
-takes the pinned head off that track — so it must be as long as the
-picture, or the trim lands 102 frames wrong. Wire it to the
-`VAEDecodeAudio` that feeds the save node in place of the separator's
-audio latent. The rows this node adds are placeholders; Apply Pins
-overwrites every one of them, picture and sound.
-
-Wire: `LTXVConcatAVLatent → Hold Extend → H3 MCtx Apply Pins (latent)`,
-`Hold Extend.audio_latent → VAEDecodeAudio → save.audio`. The refined
-clip's sidecar records the longer pinned head; Loop End and the next
-junction subtract the extension, so cut markers and later pins are
-unaffected. Sampler cost grows with the clip (87 → 117 steps at 102).
-
-## The joint refine
-
-Every per-clip fix — exact hold, matched noise level, one noise field,
-keyframe reference, continuous upscaled latents, a 27-step hold — left
-the refined seam where it was (refine08–17, 2026-09-04). The
-measurement behind that: a refine moves about 74% of the fine texture
-away from its upscaled prior, per clip and per seed, and no amount of
-held neighbour makes it copy the neighbour's invention. A single long
-clip refines seamlessly because every row is sampled in one pass with
-every other row in view. The four nodes below give a chain the same
-treatment: the timeline becomes one latent, is upscaled as one and
-sampled as one in clip-sized windows that overlap by a third, with the
-model's predictions blended across the overlap at every step
-(MultiDiffusion along time). Texture is then decided across the joins.
-Per step the model runs once per window, so a two-clip chain costs what
-two clips cost, and memory is one window's worth.
-
-The result is sliced back into the clips' own raw spans inside the
-ordinary loop, which decodes, trims and saves each as a refined take and
-keeps the manifest, so H3 Assemble Upscale plays the cut unchanged.
-
-Wire, outside the loop: `H3 Joint Latent → LTXVSeparateAVLatent →
-upscaler → LTXVConcatAVLatent → H3 MCtx Apply Pins (no pins, audio
-frozen) → sampler`, with `H3 Context Windows` on the model, `H3 Chain
-Noise` fed from Joint Latent's `frame_offset`, conditioning loaded from
-Joint Latent's `first_clip`, and the sampler's output into `H3 Joint
-Store`. Inside the loop: `H3 Joint Slice` (Store's path + Loop Start's
-flow) in place of the sampler, feeding decode, Apply Pins' latent and
-the save node. Give Loop Start the same typed `profile` as Joint Store,
-`mirror`, drift off, pad 0, hold 0.
-
-## H3 Joint Latent
-
-Lays every clip of the timeline onto one raw AV latent at its true
-position. Positions come from the same raw-start arithmetic Chain Noise
-uses, so a clip's rows land on exactly the steps its noise did; a held
-window is placed once (the earlier clip's rows, the later copy compared
-and logged). A timeline with a gap between clips is refused.
-
-| Input | Type | Notes |
-|---|---|---|
-| `sequence` | STRING | the timeline text, as Loop Start gets it |
-
-Outputs: `latent` (the joint raw AV latent), `joint` (where each clip
-sits, for Joint Store), `frame_offset` (for Chain Noise), `first_clip`
-(for the conditioning loader: the joint pass samples under one clip's
-prompt and refs), `info`.
-
-## H3 Context Windows
-
-A model patch that samples a long AV latent in windows of
-`context_length` video steps overlapping by `context_overlap`, blending
-predictions across the overlap every step. Core's context windows assume
-every stream keeps time on the same dim; H3's audio latent keeps it
-last, so this is a small handler written for H3's two streams: video
-windows in steps, audio windows in ticks on the shared AV grid (exact,
-never proportional), masks sliced on the dim each keeps time on, and
-each stream blended along its own axis.
-
-| Input | Type | Notes |
-|---|---|---|
-| `context_length` | INT | window in video latent steps. 96 at 1920×1088 is about a clip's cost in tokens and memory |
-| `context_overlap` | INT | steps shared by neighbouring windows; the blend happens here. About a third |
-| `fuse_method` | COMBO | `pyramid` (triangular weights over each window) or `flat` |
-
-A latent no longer than the window samples plainly.
-
-## H3 Joint Store
-
-Writes the sampled joint latent as
-`<base_folder>/_upscale/<profile>/joint.mctx.safetensors` with each
-clip's span recorded in it. Type the same `profile` into Loop Start so
-the sliced clips land in that folder. Outputs `joint_path` and
-`profile_folder`.
-
-## H3 Joint Slice
-
-Inside the loop: this iteration's clip out of the stored joint latent,
-its own raw span (video steps and audio ticks), so the save node trims
-and records it exactly as a per-clip refine would. Refuses a joint latent
-built for a different timeline.
 
 ## H3 MCtx Timeline
 
@@ -705,14 +415,11 @@ adjust by hand.
 
 Why a node rather than retyping the list: refined clips are numbered in
 the order the loop **worked**, which is not delivery order — a join
-carried by a clip's tail is refined after the clip that plays behind it.
-The profile records each clip's delivery position, so the mapping is
-already written down; this reads it. It also puts the original ` @ N`
-cut markers back — shifted where a soft junction gave a refined clip a
-longer delivered head than its source, and dropped on the side of a
-junction the refine itself made, where the seam is derived from the
-refined sidecars and a copied marker would put the cut back where the
-*source* joined. Markers on plain cuts (no junction) are kept as typed.
+carried by a clip's tail is delivered after the clip that plays behind
+it. The profile records each clip's delivery position, so the mapping is
+already written down; this reads it. The original ` @ N` cut markers
+come back as typed: a refined clip covers its source's raw span and
+carries its pins, so the source's cut is the refined cut.
 
 A half-finished profile assembles its leading run and says so, rather
 than splicing across the gap — a cut with a clip silently missing looks
@@ -761,89 +468,173 @@ reproducing one means keeping all of it. A take with video references
 keeps its `.cond` instead, and the save node says so rather than
 leaving it to be discovered at refine time.
 
-## H3 MCtx Load Conditioning
+## The joint refine
 
-Rebuilds a saved take's conditioning, so a refine pass sees exactly
-what generated the clip.
+A per-clip refine re-invents fine texture from its own prior and noise,
+and every per-clip fix — exact holds, one noise field, keyframe
+references, continuous upscaled latents, a 27-step hold — left the
+refined seam where it was (refine08–17, 2026-09-04; a refine moves about
+74% of the fine texture away from its upscaled prior, per clip and per
+seed). A single long clip refines seamlessly because every row is
+sampled in one pass with every other row in view, so the pass below
+gives a chain the same treatment: the timeline becomes one latent, is
+upscaled as one and sampled as one, in clip-sized windows that overlap
+by about a quarter, with the model's predictions blended across the
+overlap at every step (MultiDiffusion along time) and each window
+conditioned by the clip that owns most of it. Texture is then decided
+across the joins. Per step the model runs once per window, so the pass
+costs one pass over the timeline plus the overlaps; memory is one
+window's worth.
+
+The sampled timeline is stored once. The loop then slices each clip's
+own span back out, decodes it, trims it as the source was trimmed and
+saves it as a refined take with the profile manifest, so H3 Assemble
+Upscale plays the cut unchanged.
+
+Outside the loop:
+
+```
+H3 Joint Latent ─ latent ─> LTXVSeparateAVLatent ─> upscaler ─> LTXVConcatAVLatent ─> H3 Joint Audio Mask ─> sampler.latent_image
+                ─ joint  ─> H3 Joint Conditioning ─────────────────────────────────────────────────────> sampler.conditioning
+                         └> H3 Joint Store.joint
+refine model ─> H3 Context Windows ─> sampler.model        any NOISE ─> sampler.noise
+sampler ─> H3 Joint Store.samples ─ joint_path ─> H3 Upscale Loop Start.joint_path
+```
+
+Inside the loop: `H3 Upscale Loop Start ─ flow ─> H3 Joint Slice ─>
+decode ─> H3 MCtx Trim and Save Video ─ path ─> H3 Upscale Loop End`,
+with the Slice's `pins` on the save node's `pins`, Loop Start's
+`out_folder` on its `base_folder`, and Loop End's `profile_folder` on
+H3 Assemble Upscale. The refine's schedule (`denoise` on the sampler's
+BasicScheduler) is set outside the loop; 0.2 is a refine.
+
+## H3 Joint Latent
+
+Lays every clip of the timeline onto one raw AV latent at its true
+position, from the same raw-start arithmetic the assembly uses; a held
+window is placed once (the earlier clip's rows, the later copy compared
+and logged — identical for a masked chain). A timeline with a gap
+between clips is refused.
 
 | Input | Type | Notes |
 |---|---|---|
-| `mctx` | MCTX | the take's bundle, from either loader — it carries the clip's own path |
-| `prefer` | combo | `cache` (use the `.cond` when there is one) / `rebuild` (re-encode from recorded references) |
-| `canvas` | combo | `source` replays the take's own geometry — right for a same-size refine. `target` rebuilds from the recorded references at the resolution of `target_latent`, so an **upscale** pass's `match` picture refs scale to the pass-2 area instead of describing the small canvas. Forces the rebuild path (a `.cond` is source geometry by definition) and needs `clip` + `vae` |
-| `target_latent` | LATENT (optional) | `canvas='target'` only: the pass-2 latent whose resolution the conditioning is rebuilt for — wire the upscaled video latent |
-| `clip` | CLIP (optional, **lazy**) | text encoder — needed only to rebuild |
-| `vae` / `audio_vae` | VAE (optional, **lazy**) | needed only to rebuild |
+| `sequence` | STRING | the timeline text — the Timeline's `sequence` output through the upscale gate |
 
-The three model inputs are **lazy**: which source will win is a question
-about two filenames beside the clip, so the node answers it before
-asking for anything. Wire them and a take that has a `.cond` still costs
-nothing — the 32B encoder is not even loaded. Leave them wired.
+Outputs: `latent` (the joint raw AV latent, for the upscaler), `joint`
+(where each clip sits, for Joint Conditioning and Joint Store), `info`.
 
-Outputs: `conditioning`, and `source` (`cond`, `refs`, or
-`refs@target`) so the graph can say which route it took.
+## H3 Joint Conditioning
 
-Three ways down, in order: a `.cond` beside the clip loads exactly and
-needs no model at all; recorded references re-encode through the core
-reference node (not a reimplementation of it), reproducing the
-conditioning to within float noise; neither, and it refuses by name
-rather than silently conditioning on something else. A `.cond` is ~65 MB
-per take and 98% of it is one text embedding, which is why recording
-the reference pixels is the cheaper habit.
+Every clip's own conditioning, on the sampler's one CONDITIONING wire.
+Each clip's `.cond` is loaded (or its conditioning rebuilt from its
+recorded references, through the core reference node); the first
+clip's conditioning carries the whole table, and H3 Context Windows
+samples every window under the conditioning of the clip that owns most
+of it — so a timeline of several prompts and reference sets stays
+several. Without Context Windows on the model the sampler simply runs
+under the first clip's.
+
+| Input | Type | Notes |
+|---|---|---|
+| `joint` | JOINT | from Joint Latent |
+| `clip` | CLIP (optional, **lazy**) | text encoder — needed only for a clip with no `.cond` that recorded its references |
+| `vae` / `audio_vae` | VAE (optional, **lazy**) | for the same rebuild |
+
+The model inputs are lazy: with a `.cond` beside every clip nothing is
+loaded. A clip with neither a `.cond` nor recorded references is
+refused by name.
+
+## H3 Joint Audio Mask
+
+Holds the joint latent's soundtrack while the picture is refined. The
+sampler denoises video and audio together, so without this a refine
+re-renders sound that is already finished.
+
+| Input | Type | Notes |
+|---|---|---|
+| `latent` | LATENT | the upscaled joint AV latent |
+| `audio_denoise` | FLOAT | `0` keeps the audio exactly. `~0.5` re-samples it alongside the picture (the model re-derives lip sync from it); save the **source** audio then — H3 Joint Slice's `source_audio`, decoded |
+
+Wire the sampler's `latent_image` from here.
+
+## H3 Context Windows
+
+A model patch that samples a long AV latent in windows of
+`context_length` video steps overlapping by `context_overlap`, blending
+predictions across the overlap every step. Core's context windows assume
+every stream keeps time on the same dim; H3's audio latent keeps it
+last, so this is a small handler written for H3's two streams: video
+windows in steps, audio windows in ticks on the shared AV grid (exact,
+never proportional), masks sliced on the dim each keeps time on, and
+each stream blended along its own axis.
+
+With H3 Joint Conditioning on the sampler, each window is conditioned
+by the clip that owns most of its rows: the clip's stored conditioning
+goes through the model's own conditioning step at the window's shape,
+so its text embedding, reference blocks and packed layout are what that
+clip generated under (content keyframes are moved to where the clip
+sits in the window). Built once per window per run, not per step.
+
+| Input | Type | Notes |
+|---|---|---|
+| `context_length` | INT | window in video latent steps. 92 at 1920×1088 is about a clip's cost in tokens and memory; a two-clip chain of 162 steps is then exactly two windows |
+| `context_overlap` | INT | steps shared by neighbouring windows; the blend happens here. 22 with a window of 92 |
+| `fuse_method` | COMBO | `pyramid` (triangular weights over each window) or `flat` |
+
+A latent no longer than the window samples plainly. The windows and
+which clip conditions each are logged when sampling starts.
+
+## H3 Joint Store
+
+Writes the sampled joint latent as
+`<base_folder>/_upscale/<profile>/joint.mctx.safetensors` with each
+clip's span recorded in it and a stamp naming this sampling. Wire
+`joint_path` to H3 Upscale Loop Start. With `reuse_existing` on, a
+joint file already there for this timeline is kept and the sampler is
+not run again — the Timeline re-runs everything downstream on every
+press, and the sampling is the expensive part. Outputs `joint_path` and
+`profile_folder`.
 
 ## H3 Upscale Loop Start
 
-Opens the refine loop: resolves which clip this iteration refines, and
-where the result goes.
+Opens the loop that turns the joint latent into refined takes: resolves
+which clip this iteration slices, and where it goes.
 
 | Input | Type | Notes |
 |---|---|---|
-| `sequence` | STRING | the timeline, one output-relative clip per line in delivery order — the same text the Timeline holds |
-| `base_folder` | STRING | the project folder the clips live in |
-| `profile` | STRING | **empty = automatic**: the pass resumes the profile whose settings hash matches, otherwise creates the next free `refineNN` — so changing a setting lands in a new folder instead of being refused. A typed name pins one folder. Refined clips land in `<base_folder>/_upscale/<profile>/` |
-| `first_sigma` | FLOAT | how much of the pass re-samples. Wired to a BasicScheduler's `denoise` it is a **fraction of the schedule** (0.24 ≈ entry σ 0.79 at shift 12 — a refine); handed to a manual sigma list it is the entry sigma itself (0.9 keeps ~10% of the source — a restyle that flickers and drops lip sync). Either way it is part of the profile hash, so it lives here |
-| `upscale_note` | STRING | **not read, only hashed**: your declaration of the settings the loop cannot see (upscaler, scale, sampler schedule). Wire it from whatever states them and it stops being an honour system; with an automatic profile it is what makes a changed upscaler setting open a new folder |
-| `start_index` | INT | `-1` resumes where the profile left off; the loop drives this itself after the first iteration |
-| `junction_ramp` | INT | **soft junctions.** `0` mirrors each take's recorded hold (a hard hold for most). `N` ramps the held window's mask over its last `N` frames, from exact up to `junction_edge` at the join, so the two clips' re-derived detail blends across the ramp instead of switching on one frame — a refine invents fine texture (distant people, foliage), each clip invents its own, and a hard handover shows it even where the motion is exact. The ramped frames are re-drawn and delivered by the later clip, so the earlier one exits that much sooner; total length is unchanged. Part of the profile hash |
-| `junction_edge` | FLOAT | with a ramp: the mask value at the join, as a fraction of the pass's own sigma (`0` still exact, `1` fully this clip's refine). `0.4` is the generation side's arriving default |
-| `junction_mode` | COMBO | `mirror` pins the way the take was made (held exactly). `both` holds exactly **and** feeds the window as keyframe rows, so the parent's refined texture is a clean *reference* the model can copy appearance from, not only content it may not change. `guided` does not hold at all: the window is the clip's starting point and steering rows, the clip re-draws it and **delivers** it, and the neighbour hands over at the window's start — the neighbour's texture becomes this clip's across 39 frames of one generation rather than switching on one frame, which is the defect a per-clip refine shows at a hard join (each clip invents its own fine detail). The seam becomes a guided, pixel-grade one. Hashed when not `mirror` |
+| `joint_path` | STRING | from H3 Joint Store. Its folder is the profile folder |
+| `start_index` | INT | `-1` resumes where the profile left off; the loop drives this itself after the first iteration. A number redoes one clip |
 
-| `drift` | BOOLEAN | drift control for the held window: instead of a clean wall, the held rows are rebuilt every step at the content's own noise level by [H3 MCtx Drift Mask](#h3-mctx-drift-mask) on the refine model path, wired from this node's `drift` output. Removes the level dip a refine shows right after a clean held window. Works with `mirror` and `both`. Hashed when on |
-| `pad_steps` | INT | upscaler padding: latent steps of the neighbour clip's own raw rows added on each held side before the latent upscaler and cropped after it, by [H3 Upscale Pad](#h3-upscale-pad) and [H3 Upscale Crop](#h3-upscale-crop) wired from this node's `pad_steps` output — so the upscaler sees the true continuation instead of a zero-padded clip edge (measured 11–15% different on the shared rows, against ~4% in the interior). 24 covers its receptive field. 0 = off. Hashed when on |
-| `hold_extend` | INT | hold **more of the parent**: the junction pin's window grows by this many frames (a multiple of 51; 102 turns 39 into 141 frames = 42 steps) and [H3 Refine Hold Extend](#h3-refine-hold-extend), wired from this node's `hold_extend` output, lengthens the target latent to make room. The pinned window is trimmed at save as usual, so the delivered clip is unchanged; `noise_offset` moves back by the extension so the chain noise still lines up. Hashed when on |
+Outputs: `flow` (to Joint Slice and Loop End), `out_folder` (the
+profile folder, for the save node's `base_folder`), `index`, `total`.
 
-Outputs: `flow` (to Loop End), `clip_path` (to the path loader),
-`pin_specs` (the junction pin, mirroring the original pin's geometry
-against the previously *refined* clip), `out_folder`, `first_sigma`,
-`index`, `total`, `drift` (the toggle, for H3 MCtx Drift Mask's
-`enabled`), `noise_offset` (this clip's
-raw-latent start on the timeline, for [H3 Chain Noise](#h3-chain-noise)),
-`pad_steps` (for [H3 Upscale Pad](#h3-upscale-pad)), and `hold_extend`
-(for [H3 Refine Hold Extend](#h3-refine-hold-extend)).
+The profile folder is the whole state: the joint latent, the refined
+clips and a `profile.json` recording which **source** each came from,
+which sampling it was cut from, and which refined neighbours its
+lineage points at. A clip counts as done only while it was cut from
+the joint file that is there now, so sampling the timeline again
+delivers every clip again. Clips are delivered in dependency order —
+a held join's arriving side after the side it holds — so each refined
+clip's pins can point at the refined neighbour that already exists.
 
-The profile folder is the whole state: the refined clips plus a
-`profile.json` recording what settings produced them, which **source**
-each came from, and which refined neighbours each was pinned to. Sources
-are never touched, so a pass can be re-run or abandoned, and several
-profiles of one project coexist.
+## H3 Joint Slice
 
-A timeline may start on an extension clip. That clip has no neighbour
-to pin to, so it is refined as a root and its rendering keeps the
-source's pinned head untrimmed; the loop records the difference and the
-assembled cut enters the rendering where the source's delivery began, so
-those scaffolding frames are never played.
+Inside the loop: this iteration's clip out of the stored joint latent,
+its own raw span (video steps and audio ticks).
 
-**Editing the timeline does not restart the pass.** A profile is its
-settings, not its sequence; a refined clip is reused wherever the current
-timeline puts it, as long as the junctions it needs are the ones it was
-refined with. Add a clip and only that clip is refined (plus a neighbour,
-if the new clip creates a held join that neighbour was not refined
-against); reorder or re-cut and nothing is redone. Re-refining a clip
-invalidates exactly the clips that were pinned to its old rendering. The
-settings hash is what stops a half-finished profile being completed under
-different settings — a timeline whose first six clips were refined one
-way and last six another is a subtle, expensive kind of broken; with an
-automatic profile, changed settings simply open a new folder.
+| Input | Type | Notes |
+|---|---|---|
+| `flow` | LOOP | from Loop Start |
+
+Outputs: `latent` (the refined raw AV latent — decode it, and wire the
+save node's `samples` from it), `pins` (trim-only pins: the take's
+recorded recipe, with the source ids of held neighbours renamed to
+their refined renderings, so the save node trims exactly what the
+source trimmed and the refined clips carry the same lineage among
+themselves that the sources had), and `source_audio` (the source
+take's audio latent, for the save node's `audio` when the joint pass
+re-sampled sound). Refuses a joint latent built for a different
+timeline.
 
 ## H3 Upscale Loop End
 
@@ -858,17 +649,16 @@ Outputs: `report` and `profile_folder`. This is an output node, so it is
 an execution root. Both outputs are the pass's **done** signal — they only
 become values at the last iteration — so wire `profile_folder` into H3
 Assemble Upscale's `profile_folder` and the refined cut is built the
-moment the last clip lands, from the folder the pass actually used. An
-automatically chosen profile is chosen once, at the first iteration, and
-every later iteration is handed the name.
+moment the last clip lands, from the folder the pass actually used.
 
 ComfyUI graphs are acyclic, so iteration is **node expansion**: on each
 pass the body is cloned with the next clip's index and handed back to
 the executor. The body is what depends on Loop Start *and* reaches Loop
-End — model loaders, VAEs and anything else feeding it from outside are
-shared, loaded once, and not cloned. The manifest is written after the
-clip it describes, so a crash between the two leaves a refined clip the
-manifest does not know about, which the next run simply refines again.
+End — the joint sampling, the VAEs and anything else feeding it from
+outside are shared, run once, and not cloned. The manifest is written
+after the clip it describes, so a crash between the two leaves a refined
+clip the manifest does not know about, which the next run simply slices
+again.
 
 ## H3 Run Mode Gate
 

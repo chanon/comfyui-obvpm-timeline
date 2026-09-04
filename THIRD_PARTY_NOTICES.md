@@ -20,15 +20,12 @@ audio window end-alignment on the shared timeline, and trim behavior.
 Copyright (C) 2026 NikoDemon80
 https://github.com/NikoDemon80/ComfyUI-MiniMaxH3-Contex-Loop
 
-`H3 MCtx Drift Mask` (`nodes_drift.py`) implements that pack's
-Drift-Control AV rule: at every model evaluation the carried context
-rows are held at `sigma_next / sigma_current` rather than at zero, with
-the four rows nearest the generated content tapering .75/.50/.25/0 so
-the boundary stays exact, and an apply-model wrapper hands H3 the same
-mask as its per-row timestep labels. The two-hook structure (sampler
-denoise-mask function plus apply-model wrapper) and the taper are
-theirs; the code is written against this pack's own pin layout, with
-nothing vendored.
+The upscale loop (`nodes_loop.py`) finds its body by reachability
+between an opening and a closing node and re-expands it per iteration,
+the traversal that pack's `chain_nodes.py` uses (itself after Ethanfel's
+SxCP loop nodes in ComfyUI-Prompt-Builder). That pack's Drift-Control AV
+rule was also implemented here for per-clip refines and retired when
+the joint refine replaced them. No code is vendored.
 
 ## ComfyUI-MMH3Tools (MIT)
 

@@ -12,17 +12,13 @@ one pack, so saved workflows keep loading.
 """
 
 from .nodes_assemble import H3Assemble, H3AssembleUpscale, H3Timeline
-from .nodes_drift import H3MCtxDriftMask
 from .nodes_encode import H3MCtxFromFrames
-from .nodes_extend import H3RefineHoldExtend
-from .nodes_joint import (H3ContextWindows, H3JointLatent, H3JointSlice,
+from .nodes_joint import (H3ContextWindows, H3JointAudioMask,
+                          H3JointConditioning, H3JointLatent, H3JointSlice,
                           H3JointStore)
-from .nodes_load import (H3LoadConditioning, H3LoadMCtx, H3LoadMCtxPath,
-                         H3LoadVideoWithMCtx)
+from .nodes_load import H3LoadMCtx, H3LoadVideoWithMCtx
 from .nodes_loop import H3UpscaleLoopEnd, H3UpscaleLoopStart
 from .nodes_mode import H3RunModeGate
-from .nodes_noise import H3ChainNoise
-from .nodes_pad import H3UpscaleCrop, H3UpscalePad
 from .nodes_refs import H3RecordReferences
 from .nodes_result import H3ResultPreview
 from .nodes_pins import (
@@ -50,18 +46,13 @@ NODE_CLASS_MAPPINGS = {
     "H3SaveMCtxForVideo": H3SaveMCtxForVideo,
     "H3LoadVideoWithMCtx": H3LoadVideoWithMCtx,
     "H3LoadMCtx": H3LoadMCtx,
-    "H3LoadMCtxPath": H3LoadMCtxPath,
-    "H3LoadConditioning": H3LoadConditioning,
     "H3MCtxFromFrames": H3MCtxFromFrames,
     "H3MCtxPinSpec": H3MCtxPinSpec,
     "H3MCtxApplyPins": H3MCtxApplyPins,
     "H3TrimPinned": H3TrimPinned,
-    "H3MCtxDriftMask": H3MCtxDriftMask,
-    "H3ChainNoise": H3ChainNoise,
-    "H3UpscalePad": H3UpscalePad,
-    "H3UpscaleCrop": H3UpscaleCrop,
-    "H3RefineHoldExtend": H3RefineHoldExtend,
     "H3JointLatent": H3JointLatent,
+    "H3JointConditioning": H3JointConditioning,
+    "H3JointAudioMask": H3JointAudioMask,
     "H3ContextWindows": H3ContextWindows,
     "H3JointStore": H3JointStore,
     "H3JointSlice": H3JointSlice,
@@ -81,18 +72,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3SaveMCtxForVideo": "H3 MCtx Save",
     "H3LoadVideoWithMCtx": "H3 MCtx Load Video",
     "H3LoadMCtx": "H3 MCtx Load",
-    "H3LoadMCtxPath": "H3 MCtx Load by Path",
-    "H3LoadConditioning": "H3 MCtx Load Conditioning",
     "H3MCtxFromFrames": "H3 MCtx From Frames",
     "H3MCtxPinSpec": "H3 MCtx Pin Spec",
     "H3MCtxApplyPins": "H3 MCtx Apply Pins",
     "H3TrimPinned": "H3 MCtx Trim Pinned",
-    "H3MCtxDriftMask": "H3 MCtx Drift Mask",
-    "H3ChainNoise": "H3 Chain Noise",
-    "H3UpscalePad": "H3 Upscale Pad",
-    "H3UpscaleCrop": "H3 Upscale Crop",
-    "H3RefineHoldExtend": "H3 Refine Hold Extend",
     "H3JointLatent": "H3 Joint Latent",
+    "H3JointConditioning": "H3 Joint Conditioning",
+    "H3JointAudioMask": "H3 Joint Audio Mask",
     "H3ContextWindows": "H3 Context Windows",
     "H3JointStore": "H3 Joint Store",
     "H3JointSlice": "H3 Joint Slice",
