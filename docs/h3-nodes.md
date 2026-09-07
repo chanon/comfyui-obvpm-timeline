@@ -560,8 +560,8 @@ Wire the sampler's `latent_image` from here.
 ## H3 Context Windows
 
 A model patch that samples a long AV latent in windows of
-`context_length` video steps overlapping by `context_overlap`, blending
-predictions across the overlap every step. Core's context windows assume
+`window_seconds` overlapping by `overlap_seconds`, blending predictions
+across the overlap every step. Core's context windows assume
 every stream keeps time on the same dim; H3's audio latent keeps it
 last, so this is a small handler written for H3's two streams: video
 windows in steps, audio windows in ticks on the shared AV grid (exact,
@@ -577,12 +577,68 @@ sits in the window). Built once per window per run, not per step.
 
 | Input | Type | Notes |
 |---|---|---|
-| `context_length` | INT | window in video latent steps. 92 at 1920×1088 is about a clip's cost in tokens and memory; a two-clip chain of 162 steps is then exactly two windows |
-| `context_overlap` | INT | steps shared by neighbouring windows; the blend happens here. 22 with a window of 92 |
+| `window_seconds` | FLOAT | window length in seconds of picture, rounded to a clip-shaped number of latent steps (5j+2, about 3.4 frames a step; the log reports what it became). 5 by default |
+| `overlap_seconds` | FLOAT | seconds shared by neighbouring windows; the blend happens here. About a quarter of the window; 1.25 by default |
 | `fuse_method` | COMBO | `pyramid` (triangular weights over each window) or `flat` |
+| `vram_headroom_gb` | FLOAT | VRAM kept free of model weights for one window's activations. 10 by default, matching the 5 s window |
 
 A latent no longer than the window samples plainly. The windows and
 which clip conditions each are logged when sampling starts.
+
+**Windows sit on the latent grid.** H3's latent runs in cycles of five
+steps covering (1, 4, 4, 4, 4) frames, and every clip latent is 5k+2
+steps starting at cycle phase 0. A window that starts off the cycle
+shows the model a latent whose frame cycle is shifted from anything it
+was trained on, and it paints a periodic artefact: measured 2026-09-06
+as a flicker every 17 frames (one cycle) exactly under a window that
+started at step 356, and absent under windows starting at 0 and 70. So
+every window starts on a multiple of five steps, its length is snapped
+to 5j+2, the gaps between starts are whole cycles no longer than
+window minus overlap (an overlap can only grow), and the last window is
+stretched to the end of the timeline rather than started off the cycle.
+
+**Window size.** The work per step is the same at any window size —
+the overlaps scale with the window, so a 417-step timeline is 552
+window-steps at 13 s and 576 at 5 s. What changes is memory:
+activations scale with the tokens in one call, so a 5 s window at
+1920×1088 needs about 7 GB and a 13 s window more than 17 GB (measured:
+one attention layer's QKV projection alone is 7.8 GB). What a longer
+window buys is direct context — a join in the middle of a 13 s window
+is seen with 6 s on either side, in a 5 s window with 2.5 s, and
+consistency beyond that travels through the chain of overlaps, blended
+at every step. The mechanism that fixed the seams (every row sampled
+together, one step at a time, nothing committed ahead of its
+neighbours) does not depend on the window length; the per-clip refine
+saw a whole clip per call and still failed. Fit the window to the card
+first, then lengthen it if a fast move across a window edge shows.
+
+**Memory.** Core decides how much of the model to keep in VRAM from an
+estimate of the sampling's activations, and it makes that estimate for
+the whole latent in its packed form — for a seven-clip timeline that is
+182 GB, so it loads no weights at all and streams 20 GB from RAM on
+every window. The patch corrects the estimate to one window (plus its
+overlap) in unpacked form, then adds `vram_headroom_gb` on top: core's
+own formula for this model comes out at about 2 GB per window, which is
+far too small, and a window whose activations do not fit spills into
+system RAM and runs ten times slower. Weights that do not fit beside
+the headroom stream from RAM, which costs little. The blended
+prediction accumulates in system RAM, so the card holds one window's
+tensors and the result, not the timeline several times over. The log
+line `VRAM budgeted for one window` shows the numbers; the load line
+after it should read `loaded partially` with most of the model
+resident. The windows of each step are drawn as a console gauge under
+the sampler's step gauge (window range, owning clip, seconds, peak),
+and one line per step then reports what it cost: `sigma S: N window(s)
+in T s, peak +X MB over Y MB resident (reserved R of T MB)` — X is the
+largest window's activations (measured: 9.2 GB for a 5 s window at
+1920×1088), Y the latents and buffers already on the card (the dynamic
+loader's weights are not counted there; `reserved` is the honest
+total), and a `spill is likely` suffix means the card was full. Set the
+headroom a little above X if you use it. Per-window detail is at DEBUG. Raise it if the load line says `loaded completely`
+and windows still crawl; lower it if windows are quick but more weights
+stream than you like. On a smaller card the same X decides the window:
+activations scale with `window_seconds`, so shorten the window until X
+fits beside a few GB of weights.
 
 ## H3 Joint Store
 

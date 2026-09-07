@@ -117,6 +117,23 @@ def steps_for_frames(n):
     return k if covered == n else None
 
 
+def steps_for_seconds(seconds):
+    """Latent steps that come nearest to covering `seconds` of picture.
+
+    For a context window, not a clip: any whole number of steps is a
+    valid window, so this only rounds -- to the step count whose covered
+    frames (from phase 0) are closest to seconds * FPS, ties going up.
+    Never below 1. Off by at most two frames (one step spans 1 or 4).
+    """
+    frames = max(0.0, float(seconds)) * FPS
+    k = 1
+    while pixel_frames(k) < frames:
+        k += 1
+    if k > 1 and frames - pixel_frames(k - 1) < pixel_frames(k) - frames:
+        k -= 1
+    return k
+
+
 def snap_frames_up(n):
     """Snap UP onto the 17k+5 clip-length grid (matches core's alignment)."""
     n = max(FRAME_BASE, int(n))
@@ -254,6 +271,16 @@ def _self_test():
     assert steps_for_frames(56) == 17
     assert steps_for_frames(2) is None
     assert steps_for_frames(10) is None
+
+    # steps_for_seconds: nearest whole-step cover, never below 1
+    assert steps_for_seconds(5.0) == 36             # 120 frames exactly
+    assert steps_for_seconds(1.25) == 9             # 30 frames exactly
+    assert steps_for_seconds(13.0) == 92            # 312 frames -> 311 (92) beats 315 (93)
+    assert steps_for_seconds(12.25) == 87           # a 294-frame clip
+    assert steps_for_seconds(0.0) == 1
+    assert steps_for_seconds(1.0 / FPS) == 1        # one frame
+    assert steps_for_seconds(3.0 / FPS) == 2        # 3 frames: 1 (k=1) vs 5 (k=2) -> tie goes up
+    assert steps_for_seconds(1.625) == 12           # 39 frames
 
     # every ladder window is an exact cover; all but 1 are phase-0
     # tail-sliceable from every on-grid clip long enough to hold them

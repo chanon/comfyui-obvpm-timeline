@@ -429,22 +429,58 @@ class H3JointAudioMask:
 # time axes.
 # ---------------------------------------------------------------------------
 
+def clip_shaped(length):
+    """The nearest window length that looks like a clip latent: 5j+2 steps.
+
+    H3's latent grid runs in cycles of five steps covering (1, 4, 4, 4, 4)
+    frames, and a clip's latent is 5k+2 steps starting at cycle phase 0.
+    The model learned its statistics on exactly that shape, so a window
+    is given the same one.
+    """
+    j = max(1, int(round((int(length) - fr.LATENT_BASE) / float(fr.LATENTS_PER_GROUP))))
+    return j * fr.LATENTS_PER_GROUP + fr.LATENT_BASE
+
+
 def static_windows(total, length, overlap):
-    """Fixed windows of `length`, as few as keep at least `overlap` shared
-    steps, spread evenly so the last is not a near-copy of the one before.
+    """Fixed windows of about `length`, as few as keep at least `overlap`
+    shared steps, spread evenly, every start on the latent grid's 5-step
+    cycle and the last window running to the end.
+
+    Every window must start at cycle phase 0 (a multiple of 5 steps): a
+    window that starts off the cycle shows the model a latent whose frame
+    cycle is shifted from anything it was trained on, and it paints a
+    periodic artefact -- measured 2026-09-06 as a flicker every 17 frames
+    (one 5-step cycle) exactly where a window starting at step 356
+    contributed, and absent under windows starting at 0 and 70. Clips
+    themselves always start on the cycle (the timeline layout puts them
+    there), so aligned windows see clip-shaped latents.
 
     Core's static schedule steps by length-overlap and pulls the final
     window back to the end, which for 162/87/21 makes three windows with
-    the last two nearly coincident. Here the count is the minimum and the
-    starts are spread from 0 to total-length; for a two-clip chain, a
-    window of 92 with overlap 22 is exactly two windows [0:92],[70:162].
+    the last two nearly coincident. Here the starts are multiples of the
+    cycle spread as evenly as the cycle allows, every gap at most
+    length-overlap so no overlap is ever shorter than asked, and the last
+    window is stretched to `total` (up to four extra steps) rather than
+    started off the cycle. For a two-clip chain, 92 steps with overlap
+    22 is exactly two windows [0:92],[70:162].
     """
     import math
+    g = fr.LATENTS_PER_GROUP
     if total <= length:
         return [(0, total)]
-    n = math.ceil((total - length) / max(1, length - overlap)) + 1
-    starts = [round(i * (total - length) / (n - 1)) for i in range(n)]
-    return [(s, s + length) for s in starts]
+    last = ((total - length) // g) * g            # last start, on the cycle
+    stride = max(g, ((length - overlap) // g) * g)   # largest gap that keeps the overlap
+    units = last // g
+    gaps = math.ceil(units / (stride // g))
+    if gaps == 0:
+        return [(0, total)]
+    base, extra = divmod(units, gaps)             # gap sizes in cycles, as even as they get
+    starts = [0]
+    for i in range(gaps):
+        starts.append(starts[-1] + (base + (1 if i < extra else 0)) * g)
+    windows = [(st, st + length) for st in starts]
+    windows[-1] = (starts[-1], total)
+    return windows
 
 
 def pyramid(n):
@@ -469,19 +505,106 @@ def audio_span(step_start, step_end):
 _PER_CLIP_SKIP = ("latent_shapes", "denoise_mask", "audio_denoise_mask")
 
 
+def _log_under_bars():
+    """Context: console log lines go through tqdm.write.
+
+    A tqdm bar (the sampler's step bar, or ours) leaves the cursor at the
+    end of its line; a log line written then starts there. tqdm.write
+    clears every live bar, prints at column 0 and redraws the bars.
+    """
+    from tqdm.contrib.logging import logging_redirect_tqdm
+    return logging_redirect_tqdm()
+
+
+def _hms(seconds):
+    seconds = max(0, int(round(seconds)))
+    h, m, s = seconds // 3600, (seconds % 3600) // 60, seconds % 60
+    return "%d:%02d:%02d" % (h, m, s) if h else "%d:%02d" % (m, s)
+
+
+def _vram_probe(device, reset=False):
+    """Bytes allocated on the card now (None off-CUDA); resets the peak."""
+    if getattr(device, "type", None) != "cuda":
+        return None
+    try:
+        if reset:
+            torch.cuda.reset_peak_memory_stats(device)
+        return torch.cuda.memory_allocated(device)
+    except Exception:
+        # no context on that device yet; the log line just goes without
+        return None
+
+
+def _vram_stats(device, before):
+    """What one window cost on the card, in MB; None off-CUDA.
+
+    peak = allocations above what was resident when the window started
+    (the window's activations); reserved = the allocator's high-water
+    mark, the honest total. Under the dynamic loader the weights it
+    manages are not counted in either, so `resident` is latents and
+    buffers only. `spill` flags the card's limit: Windows never reports
+    out of memory there, it pages the excess to system RAM and the
+    window runs ten times slower.
+    """
+    if before is None:
+        return None
+    mb = 1024.0 * 1024.0
+    try:
+        peak = torch.cuda.max_memory_allocated(device)
+        reserved = torch.cuda.max_memory_reserved(device)
+        free, total = torch.cuda.mem_get_info(device)
+    except Exception:
+        return None
+    return {"peak": (peak - before) / mb, "resident": before / mb,
+            "reserved": reserved / mb, "total": total / mb,
+            "spill": reserved > total * 0.97}
+
+
+def _vram_report(stats):
+    """', peak +X MB ...' for the log."""
+    if not stats:
+        return ""
+    text = (", peak +%.0f MB over %.0f MB resident (reserved %.0f of %.0f MB)"
+            % (stats["peak"], stats["resident"], stats["reserved"], stats["total"]))
+    if stats["spill"]:
+        text += " -- at the card's limit, a spill is likely"
+    return text
+
+
 class H3WindowHandler:
     """Windowed calc_cond_batch for H3's packed video+audio latent."""
 
-    def __init__(self, length, overlap, fuse="pyramid"):
-        self.context_length = int(length)
-        self.context_overlap = int(overlap)
+    def __init__(self, length, overlap, fuse="pyramid", headroom_gb=10.0):
+        self.context_length = clip_shaped(length)
+        self.context_overlap = min(int(overlap), self.context_length - 1)
         self.fuse = fuse
+        self.headroom_mb = max(0.0, float(headroom_gb)) * 1024.0
         self._announced = False
         # per-clip model_conds by (clip, window) -- built once per run,
         # not once per step; keyed on the conditioning table's identity so
         # a cached MODEL output reused by a later run starts clean
         self._table_id = None
         self._cache = {}
+        self._durations = []      # window seconds this run, for the time left
+
+    @staticmethod
+    def _step_position(model_options, sigma):
+        """(step index, total steps) from the sampler's own sigma schedule.
+
+        Core puts the schedule in transformer_options["sample_sigmas"]; the
+        current step is the schedule entry nearest this call's sigma. (None,
+        None) when the sampler did not say (a bare calc_cond_batch).
+        """
+        try:
+            sigmas = (model_options.get("transformer_options") or {}).get("sample_sigmas")
+            if sigmas is None or len(sigmas) < 2:
+                return None, None
+            vals = [float(v) for v in sigmas.flatten().tolist()]
+            steps = len(vals) - 1                   # the last entry is the end sigma
+            idx = min(range(steps), key=lambda i: abs(vals[i] - sigma))
+            return idx, steps
+        except Exception:
+            return None, None
 
     # -- what core calls ----------------------------------------------------
 
@@ -518,22 +641,27 @@ class H3WindowHandler:
             self._announced = True
             windows = (static_windows(total, self.context_length, self.context_overlap)
                        if use else [(0, total)])
-            _LOG.info("obvpm.h3 context windows: %d video steps, window %d, "
-                      "overlap %d -> %s", total, self.context_length,
-                      self.context_overlap,
-                      "windows %s" % windows if use else "one window, plain sampling")
-            if table is None:
-                _LOG.info("obvpm.h3 context windows: no per-clip conditioning "
-                          "on the wire; every window samples under the "
-                          "conditioning given (wire H3 Joint Conditioning "
-                          "for per-clip prompts)")
-            else:
-                for k, (s, e) in enumerate(windows):
-                    j = window_owner(table["spans"], s, e)
-                    _LOG.info("obvpm.h3 context windows: window %d/%d steps "
-                              "%d..%d conditioned by clip %d (%s)", k + 1,
-                              len(windows), s, e, j, table["clips"][j])
+            with _log_under_bars():
+                self._announce(total, use, windows, table)
         return use
+
+    def _announce(self, total, use, windows, table):
+        """The run's windows and their owners, once per conditioning table."""
+        _LOG.info("obvpm.h3 context windows: %d video steps, window %d, "
+                  "overlap %d -> %s", total, self.context_length,
+                  self.context_overlap,
+                  "windows %s" % windows if use else "one window, plain sampling")
+        if table is None:
+            _LOG.info("obvpm.h3 context windows: no per-clip conditioning "
+                      "on the wire; every window samples under the "
+                      "conditioning given (wire H3 Joint Conditioning "
+                      "for per-clip prompts)")
+        else:
+            for k, (s, e) in enumerate(windows):
+                j = window_owner(table["spans"], s, e)
+                _LOG.info("obvpm.h3 context windows: window %d/%d steps "
+                          "%d..%d conditioned by clip %d (%s)", k + 1,
+                          len(windows), s, e, j, table["clips"][j])
 
     def execute(self, calc_cond_batch, model, conds, x_in, timestep, model_options):
         import comfy.utils
@@ -541,44 +669,105 @@ class H3WindowHandler:
         video, audio = comfy.utils.unpack_latents(x_in, shapes)[:2]
         T, A = int(video.shape[2]), int(audio.shape[-1])
         windows = static_windows(T, self.context_length, self.context_overlap)
-        acc_v = [torch.zeros_like(video) for _ in conds]
-        acc_a = [torch.zeros_like(audio) for _ in conds]
-        cnt_v = torch.zeros(T, device=video.device, dtype=torch.float32)
-        cnt_a = torch.zeros(A, device=audio.device, dtype=torch.float32)
-        for k, (s, e) in enumerate(windows):
-            t0 = time.time()
-            ta, tb = audio_span(s, e)
-            tb = min(tb, A)
-            if e == T:
-                tb = A          # the last window owns the grid's last ticks
-            v_win, a_win = video[:, :, s:e], audio[..., ta:tb]
-            sub_x, sub_shapes = comfy.utils.pack_latents([v_win, a_win])
-            sub_conds = [self._window_conds(model, c, s, e, ta, tb, sub_shapes,
-                                            x_in.device)
-                         for c in conds]
-            _LOG.info("obvpm.h3 context windows: sigma %.3f window %d/%d "
-                      "steps %d..%d ticks %d..%d", float(timestep.flatten()[0]),
-                      k + 1, len(windows), s, e, ta, tb)
-            outs = calc_cond_batch(model, sub_conds, sub_x, timestep, model_options)
-            _LOG.info("obvpm.h3 context windows: window %d/%d done in %.0fs",
-                      k + 1, len(windows), time.time() - t0)
-            w_v = self._weights(e - s).to(video.device)
-            w_a = self._weights(tb - ta).to(audio.device)
-            for i, out in enumerate(outs):
-                if out is None:
-                    continue
-                ov, oa = comfy.utils.unpack_latents(out, sub_shapes)[:2]
-                acc_v[i][:, :, s:e] += ov * w_v.view(1, 1, -1, 1, 1).to(ov.dtype)
-                acc_a[i][..., ta:tb] += oa * w_a.view(1, 1, 1, -1).to(oa.dtype)
-            cnt_v[s:e] += w_v
-            cnt_a[ta:tb] += w_a
-            del outs, sub_x, sub_conds
-            # the window's activations are gone; hand the cached blocks
-            # back so the next window does not push the allocator past
-            # the card (Windows spills silently to system RAM, and then
-            # every step crawls)
-            import comfy.model_management
-            comfy.model_management.soft_empty_cache()
+        # the blended prediction accumulates in system RAM: only one
+        # window's slice crosses the bus per window, and the card keeps
+        # the full-timeline copies' worth of room for the window's
+        # activations (a spilled window runs ten times slower)
+        acc_v = [torch.zeros(video.shape, dtype=torch.float32, device="cpu") for _ in conds]
+        acc_a = [torch.zeros(audio.shape, dtype=torch.float32, device="cpu") for _ in conds]
+        cnt_v = torch.zeros(T, dtype=torch.float32)
+        cnt_a = torch.zeros(A, dtype=torch.float32)
+        sigma = float(timestep.flatten()[0])
+        table = self._table(conds)
+        # one console gauge per step for the windows, nested under the
+        # sampler's own step gauge; the per-window detail goes to DEBUG
+        # and one INFO line sums the step up
+        from tqdm.auto import tqdm
+        step_idx, n_steps = self._step_position(model_options, sigma)
+        if step_idx == 0:
+            self._durations = []
+        show = comfy.utils.PROGRESS_BAR_ENABLED
+        bar = tqdm(total=len(windows), desc="obvpm.h3 windows σ%.3f" % sigma,
+                   leave=False, dynamic_ncols=True, disable=not show,
+                   bar_format="{desc}: {percentage:3.0f}%|{bar:50}| {n_fmt}/{total_fmt} "
+                              "[{elapsed}<{remaining}, {rate_inv_fmt}]")
+        # a second line under the bar: this window, and the time left
+        # for the whole sampling (all steps' windows at this run's pace)
+        line = tqdm(total=0, leave=False, dynamic_ncols=True, disable=not show,
+                    bar_format="{desc}")
+        def status(text, k):
+            left = ""
+            if self._durations and n_steps:
+                todo = (n_steps - step_idx - 1) * len(windows) + (len(windows) - k)
+                eta = todo * sum(self._durations) / len(self._durations)
+                left = " | step %d/%d, ~%s left" % (step_idx + 1, n_steps, _hms(eta))
+            elif n_steps:
+                left = " | step %d/%d" % (step_idx + 1, n_steps)
+            line.set_description_str("    " + text + left, refresh=True)
+        t_step, worst, spilled = time.time(), None, False
+        # while the bar is up, log lines from anywhere go through tqdm.write
+        # so they land at column 0 and the bar is redrawn under them
+        try:
+            with _log_under_bars():
+                for k, (s, e) in enumerate(windows):
+                    t0 = time.time()
+                    ta, tb = audio_span(s, e)
+                    tb = min(tb, A)
+                    if e == T:
+                        tb = A          # the last window owns the grid's last ticks
+                    v_win, a_win = video[:, :, s:e], audio[..., ta:tb]
+                    sub_x, sub_shapes = comfy.utils.pack_latents([v_win, a_win])
+                    sub_conds = [self._window_conds(model, c, s, e, ta, tb, sub_shapes,
+                                                    x_in.device)
+                                 for c in conds]
+                    owner = window_owner(table["spans"], s, e) if table else None
+                    status("steps %d..%d%s" % (
+                        s, e, "" if owner is None else ", clip %d" % owner), k)
+                    _LOG.debug("obvpm.h3 context windows: sigma %.3f window %d/%d "
+                               "steps %d..%d ticks %d..%d", sigma, k + 1, len(windows),
+                               s, e, ta, tb)
+                    before = _vram_probe(x_in.device, reset=True)
+                    outs = calc_cond_batch(model, sub_conds, sub_x, timestep, model_options)
+                    stats = _vram_stats(x_in.device, before)
+                    took = time.time() - t0
+                    _LOG.debug("obvpm.h3 context windows: window %d/%d done in %.0fs%s",
+                               k + 1, len(windows), took, _vram_report(stats))
+                    if stats:
+                        worst = stats if worst is None or stats["peak"] > worst["peak"] else worst
+                        spilled = spilled or stats["spill"]
+                    self._durations.append(took)
+                    bar.update(1)
+                    status("steps %d..%d%s, %.0fs%s" % (
+                        s, e, "" if owner is None else ", clip %d" % owner, took,
+                        "" if not stats else ", +%.1f GB" % (stats["peak"] / 1024.0)), k + 1)
+                    w_v = self._weights(e - s)
+                    w_a = self._weights(tb - ta)
+                    for i, out in enumerate(outs):
+                        if out is None:
+                            continue
+                        ov, oa = comfy.utils.unpack_latents(out, sub_shapes)[:2]
+                        acc_v[i][:, :, s:e] += ov.float().cpu() * w_v.view(1, 1, -1, 1, 1)
+                        acc_a[i][..., ta:tb] += oa.float().cpu() * w_a.view(1, 1, 1, -1)
+                    cnt_v[s:e] += w_v
+                    cnt_a[ta:tb] += w_a
+                    del outs, sub_x, sub_conds
+                    # the window's activations are gone; hand the cached blocks
+                    # back so the next window does not push the allocator past
+                    # the card (Windows spills silently to system RAM, and then
+                    # every step crawls)
+                    import comfy.model_management
+                    comfy.model_management.soft_empty_cache()
+        finally:
+            line.close()
+            bar.close()
+        # the sampler's own step bar is still on the line: write under it
+        with _log_under_bars():
+            _LOG.info("obvpm.h3 context windows: sigma %.3f: %d window(s) in %.0fs%s%s",
+                      sigma, len(windows), time.time() - t_step,
+                      "" if worst is None else ", peak +%.0f MB over %.0f MB resident "
+                      "(reserved %.0f of %.0f MB)" % (worst["peak"], worst["resident"],
+                                                      worst["reserved"], worst["total"]),
+                      " -- at the card's limit, a spill is likely" if spilled else "")
         cnt_v = cnt_v.clamp(min=1e-6).view(1, 1, -1, 1, 1)
         cnt_a = cnt_a.clamp(min=1e-6).view(1, 1, 1, -1)
         results = []
@@ -588,8 +777,8 @@ class H3WindowHandler:
                 # computes uncond + (cond - uncond) with it), never None
                 results.append(torch.zeros_like(x_in))
                 continue
-            v = acc_v[i] / cnt_v.to(acc_v[i].dtype)
-            a = acc_a[i] / cnt_a.to(acc_a[i].dtype)
+            v = (acc_v[i] / cnt_v).to(device=x_in.device, dtype=video.dtype)
+            a = (acc_a[i] / cnt_a).to(device=x_in.device, dtype=audio.dtype)
             results.append(comfy.utils.pack_latents([v, a])[0])
         return results
 
@@ -660,8 +849,8 @@ class H3WindowHandler:
         built = model.extra_conds(**params)
         keep = {k: v for k, v in built.items() if k not in _PER_CLIP_SKIP}
         self._cache[key] = keep
-        _LOG.info("obvpm.h3 context windows: steps %d..%d -> conditioning "
-                  "of clip %d (%s)", s, e, j, table["clips"][j])
+        _LOG.debug("obvpm.h3 context windows: steps %d..%d -> conditioning "
+                   "of clip %d (%s)", s, e, j, table["clips"][j])
         return keep
 
 
@@ -673,14 +862,14 @@ class H3ContextWindows:
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     DESCRIPTION = (
-        "Samples a long AV latent in windows of context_length steps that "
-        "overlap by context_overlap, blending the model's predictions across "
-        "the overlap every step (MultiDiffusion along time, for H3's "
-        "video+audio latent). Each window samples under the conditioning of "
-        "the clip that owns most of it when H3 Joint Conditioning is on the "
-        "sampler. One window's worth of memory, one model call per window "
-        "per step. For the joint refine: a clip-sized window over the whole "
-        "timeline."
+        "Samples a long AV latent in windows of window_seconds that overlap "
+        "by overlap_seconds, blending the model's predictions across the "
+        "overlap every step (MultiDiffusion along time, for H3's video+audio "
+        "latent). Each window samples under the conditioning of the clip "
+        "that owns most of it when H3 Joint Conditioning is on the sampler. "
+        "One window's worth of memory, one model call per window per step; "
+        "the work per step is the same at any window size, the memory is "
+        "not. For the joint refine: the longest window the card holds."
     )
 
     @classmethod
@@ -688,15 +877,19 @@ class H3ContextWindows:
         return {
             "required": {
                 "model": ("MODEL",),
-                "context_length": ("INT", {
-                    "default": 92, "min": 2, "max": 4096,
-                    "tooltip": "Window length in VIDEO latent steps (87 = a "
-                               "294-frame clip). Tokens per window are what "
-                               "attention and memory pay for: at 1920x1088, "
-                               "92 steps is about a clip's cost."}),
-                "context_overlap": ("INT", {
-                    "default": 22, "min": 0, "max": 4096,
-                    "tooltip": "Steps shared by neighbouring windows; the "
+                "window_seconds": ("FLOAT", {
+                    "default": 5.0, "min": 0.1, "max": 600.0, "step": 0.25,
+                    "tooltip": "Window length in seconds of picture, rounded "
+                               "to whole latent steps (about 3.4 frames "
+                               "each; the log says what it became). Tokens "
+                               "per window are what attention and memory pay "
+                               "for: at 1920x1088, 5 s needs about 7 GB of "
+                               "activations, 13 s (a clip and a bit) more "
+                               "than 17 GB. Any length is valid; the work per "
+                               "step is the same, only the memory changes."}),
+                "overlap_seconds": ("FLOAT", {
+                    "default": 1.25, "min": 0.0, "max": 600.0, "step": 0.25,
+                    "tooltip": "Seconds shared by neighbouring windows; the "
                                "blend happens here. About a quarter of the "
                                "window."}),
                 "fuse_method": (["pyramid", "flat"], {
@@ -704,19 +897,112 @@ class H3ContextWindows:
                     "tooltip": "How overlapping predictions are weighted: "
                                "pyramid (triangular over the window), flat "
                                "(plain average)."}),
+                "vram_headroom_gb": ("FLOAT", {
+                    "default": 10.0, "min": 0.0, "max": 128.0, "step": 0.5,
+                    "tooltip": "VRAM kept free of model weights for one "
+                               "window's activations. Core's own estimate for "
+                               "this model is a few GB and far too small: at "
+                               "1920x1088 a 5 s window needs about 7 GB, a "
+                               "13 s window more than 17 GB (one attention "
+                               "layer's QKV alone is 7.8 GB), and a window "
+                               "that does not fit either "
+                               "fails with out-of-memory or spills into system "
+                               "RAM and runs ten times slower. Weights that do "
+                               "not fit beside the headroom stream from RAM, "
+                               "which costs about a second per window. Each "
+                               "step's summary log line reports the measured "
+                               "peak; set this a little above it. 0 leaves "
+                               "the budget to core (fine with dynamic VRAM)."}),
             },
         }
 
-    def patch(self, model, context_length, context_overlap, fuse_method):
-        if int(context_overlap) >= int(context_length):
-            raise ValueError("H3 Context Windows: the overlap must be smaller "
-                             "than the window.")
+    def patch(self, model, window_seconds, overlap_seconds, fuse_method,
+              vram_headroom_gb=10.0):
+        length = fr.steps_for_seconds(window_seconds)
+        overlap = fr.steps_for_seconds(overlap_seconds) if float(overlap_seconds) > 0 else 0
+        if overlap >= length:
+            raise ValueError("H3 Context Windows: the overlap (%.2f s = %d "
+                             "steps) must be shorter than the window (%.2f s "
+                             "= %d steps)." % (float(overlap_seconds), overlap,
+                                               float(window_seconds), length))
+        import comfy.patcher_extension
         model = model.clone()
-        model.model_options["context_handler"] = H3WindowHandler(
-            context_length, context_overlap, fuse_method)
-        _LOG.info("obvpm.h3 context windows: %d steps, overlap %d, %s",
-                  int(context_length), int(context_overlap), fuse_method)
+        handler = H3WindowHandler(length, overlap, fuse_method, vram_headroom_gb)
+        model.model_options["context_handler"] = handler
+        model.add_wrapper_with_key(
+            comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING,
+            "obvpm_h3_context_windows", prepare_sampling_for_window)
+        _LOG.info("obvpm.h3 context windows: window %.2f s -> %d steps (%d "
+                  "frames, clip-shaped), overlap %.2f s -> %d steps (%d frames, "
+                  "starts on the 5-step cycle), %s, %.1f GB headroom",
+                  float(window_seconds), handler.context_length,
+                  fr.pixel_frames(handler.context_length), float(overlap_seconds),
+                  handler.context_overlap, fr.pixel_frames(handler.context_overlap),
+                  fuse_method, float(vram_headroom_gb))
         return (model,)
+
+
+def timeline_steps(conds):
+    """Video steps of the joint timeline, read off the conditioning table."""
+    lists = conds.values() if isinstance(conds, dict) else conds
+    for cond_list in lists:
+        for cond in cond_list or []:
+            table = cond.get(COND_KEY) if isinstance(cond, dict) else None
+            if table and table.get("spans"):
+                return max(int(s) + int(n) for s, n in table["spans"])
+    return None
+
+
+def prepare_sampling_for_window(executor, model, noise_shape, conds, *args, **kwargs):
+    """Budget VRAM for one window, not for the whole timeline.
+
+    Core sizes the model load from the noise shape: activations for the
+    full joint latent would not fit next to the weights, so it offloads
+    every weight to RAM and the run crawls (0 MB loaded, 20 GB streamed
+    per window). The handler only ever runs one window at a time, so the
+    estimate is scaled to a window plus its overlap, and the packed AV
+    shape is unpacked enough for core's area formula to stop counting
+    channels. Core's own handler scales the window too, but skips packed
+    AV latents; this one reads the timeline length from the conditioning
+    table instead.
+    """
+    model_options = kwargs.get("model_options") or {}
+    handler = model_options.get("context_handler")
+    total = timeline_steps(conds) if isinstance(handler, H3WindowHandler) else None
+    if total:
+        span = int(handler.context_length + handler.context_overlap)
+        frac = min(1.0, span / float(total))
+        noise_shape = list(noise_shape)
+        if len(noise_shape) == 3 and noise_shape[1] == 1:
+            # packed AV latent [B, 1, N]. Core's estimate multiplies
+            # everything after the batch and channel dims, so the packed
+            # form counts the 24 video channels as area -- a 24x
+            # overestimate (186 GB for this timeline, 51 GB for one
+            # window). Hand it the window's video area with the channels
+            # back in their own dim: [B, C, T*H*W]. The audio rows are
+            # under one percent of N and ride along as margin.
+            import comfy.latent_formats
+            ch = int(comfy.latent_formats.MiniMaxH3Video.latent_channels)
+            noise_shape = [noise_shape[0], ch, max(1, int(noise_shape[2] * frac / ch))]
+        elif frac < 1.0 and len(noise_shape) >= 3:
+            noise_shape[2] = max(1, int(noise_shape[2] * frac))
+        est = None
+        try:
+            est = model.model.memory_required(noise_shape) / (1024 * 1024)
+        except Exception:
+            pass
+        if est and handler.headroom_mb > 0:
+            # core's formula is linear in the area after batch and
+            # channels, so stretching the last dim by (estimate +
+            # headroom) / estimate makes it ask for the headroom too --
+            # the same request whichever attention branch it picks
+            grow = (est + handler.headroom_mb) / est
+            noise_shape[-1] = max(1, int(noise_shape[-1] * grow))
+        _LOG.info("obvpm.h3 context windows: VRAM budgeted for one window "
+                  "(%d of %d steps%s)", span, total,
+                  "" if est is None else ", %.0f MB core estimate + %.0f MB headroom"
+                  % (est, handler.headroom_mb))
+    return executor(model, noise_shape, conds, *args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
