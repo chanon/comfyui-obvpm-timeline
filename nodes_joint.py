@@ -32,6 +32,7 @@ inside the loop H3 Joint Slice (one clip's span back out, with trim-only
 pins mirroring how the take was made).
 """
 
+import contextlib
 import logging
 import os
 import time
@@ -71,16 +72,19 @@ def clip_headers(clips):
     return out
 
 
-def raw_starts(lines, headers):
-    """Each clip's RAW-latent start on the timeline, in frames.
+def marker_starts(lines, headers):
+    """Each clip's RAW-latent start on the timeline from the cut alone.
 
     Delivered frame f of clip i sits at T_i + (f - enter_i), where T_i is
     the delivered duration of everything before it; raw frame r is
     delivered frame r - head_i. So the raw latent starts at
     T_i - enter_i - head_i -- negative for a first clip whose pinned head
-    precedes the timeline, which is fine: it is a coordinate. For a
-    masked extend this puts the child's held window on exactly the
-    parent's frames it was cut from.
+    precedes the timeline, which is fine: it is a coordinate.
+
+    This is only right when every clip is shown in full up to its
+    extension: a parent CUT before extending (clip 5 shown to frame 158,
+    extended from there) makes T_i too large by the discarded tail, so
+    pinned clips are re-placed by their pin in `raw_starts`.
     """
     starts, t = [], 0
     for line, header in zip(lines, headers):
@@ -94,6 +98,89 @@ def raw_starts(lines, headers):
         end = exit_ if exit_ is not None else delivered
         t += max(0, end - enter)
     return starts
+
+
+def timeline_pin(header, ids):
+    """How a clip hangs on another clip OF THE TIMELINE, from its recipe.
+
+    Returns (parent index, offset, junction, kind) or None: the clip's raw
+    frame 0 sits `offset` raw frames into the parent, and the cut changes
+    hands at the parent's raw frame `junction` (the sidecar's
+    parent_join_frame, ramps included). kind is "extends" (parent shown
+    before the junction, this clip after) or "prepends" (the reverse).
+    A single before-pin covers this clip's first frames, so offset is
+    the pin's source_start; an after-pin covers its LAST frames, so the
+    clip starts source_start minus everything before the pin. Pins to
+    clips outside the timeline, pixel sources and multi-pin recipes
+    yield None: such a clip is placed by the cut alone.
+    """
+    pins = mctx.parse_pins(header)
+    if len(pins) != 1:
+        return None
+    p = pins[0]
+    j = ids.get(p.get("source_id"))
+    if j is None or p.get("source_kind") not in mctx.LINEAGE_KINDS:
+        return None
+    start = int(p.get("source_start", 0) or 0)
+    covered = int(p.get("source_frames", 0) or 0)
+    raw = int(header.get("raw_frames", 0) or 0)
+    join = int(header.get("parent_join_frame", 0) or 0)
+    if p.get("place") == "before":
+        return (j, start, join, "extends")
+    if p.get("place") == "after":
+        return (j, start - (raw - covered), join, "prepends")
+    return None
+
+
+def raw_starts(lines, headers):
+    """Each clip's RAW-latent start on the timeline, in frames.
+
+    A pinned clip sits where its pin says: its held frames ARE the
+    parent's frames at source_start, whatever the cut shows of either.
+    Clips without a pin into the timeline sit where the cut puts them
+    (`marker_starts`). Measured 2026-09-07: placing clip 7 by the cut put
+    it 34 frames after its pin because clip 5 was cut at 158 before
+    extending, so the held head sat on the wrong rows (rel diff 1.25 on
+    what must be an exact hold) and the refine flickered at the seam.
+    """
+    starts = marker_starts(lines, headers)
+    ids = {h.get("self_id"): i for i, h in enumerate(headers) if h.get("self_id")}
+    rel = [timeline_pin(h, ids) for h in headers]
+    for _ in range(len(headers)):
+        moved = False
+        for i, r in enumerate(rel):
+            if r is None or r[0] == i:
+                continue
+            want = starts[r[0]] + r[1]
+            if starts[i] != want:
+                starts[i] = want
+                moved = True
+        if not moved:
+            break
+    return starts
+
+
+def owners(spans, junctions, total):
+    """Who owns each unit of the timeline: the clip the cut shows there.
+
+    `spans` are (start, length) per clip, `junctions` (clip, kind, at):
+    an "extends" clip owns its rows from `at` on, a "prepends" clip its
+    rows before `at`; the rest is first come. A parent cut before its
+    extension keeps its discarded tail out of the joint this way, and a
+    child's held head stays the parent's rows (identical for a hard
+    hold, the parent's for a ramp -- what the cut shows).
+    """
+    owner = [-1] * total
+    for i, (s, n) in enumerate(spans):
+        for t in range(max(0, s), min(total, s + n)):
+            if owner[t] < 0:
+                owner[t] = i
+    for i, kind, at in junctions:
+        s, n = spans[i]
+        lo, hi = (max(s, at), s + n) if kind == "extends" else (s, min(at, s + n))
+        for t in range(max(0, lo), min(total, hi)):
+            owner[t] = i
+    return owner
 
 
 def timeline_layout(lines, headers, audio_ticks):
@@ -121,25 +208,59 @@ def timeline_layout(lines, headers, audio_ticks):
     total_steps = max(s + n for s, n in steps)
     total_frames = fr.pixel_frames(total_steps)
     total_ticks = max(fr.audio_total(total_frames), max(t + n for t, n in ticks))
+    # where the cut changes hands between a clip and its parent, so the
+    # joint carries what the cut shows and not a cut-away tail
+    ids = {h.get("self_id"): i for i, h in enumerate(headers) if h.get("self_id")}
+    j_steps, j_ticks = [], []
+    for i, header in enumerate(headers):
+        r = timeline_pin(header, ids)
+        if r is None or r[0] == i:
+            continue
+        j, _, join, kind = r
+        at = starts_frames[j] - first + join
+        js = fr.steps_for_frames(at)
+        if js is None:
+            _LOG.warning("obvpm.h3 joint: clip %d's junction at frame %d is off "
+                         "the latent grid; its overlap stays first come", i, at)
+            continue
+        j_steps.append((i, kind, js))
+        j_ticks.append((i, kind, fr.audio_total(at)))
+    # what each clip holds at its head, and whether that hold is exact
+    # (a masked pin without a ramp), for the placement check in assemble
+    heads, hard = [], []
+    for header in headers:
+        pins = mctx.parse_pins(header)
+        heads.append(int(header.get("pinned_head_frames", 0) or 0))
+        hard.append(len(pins) == 1 and pins[0].get("place") == "before"
+                    and pins[0].get("mode") == "masked"
+                    and not pins[0].get("mask_ramp_frames")
+                    and not pins[0].get("mask_hold"))
     return {"steps": steps, "ticks": ticks,
             "total_steps": int(total_steps), "total_frames": int(total_frames),
-            "total_ticks": int(total_ticks)}
+            "total_ticks": int(total_ticks),
+            "owner_steps": owners(steps, j_steps, int(total_steps)),
+            "owner_ticks": owners(ticks, j_ticks, int(total_ticks)),
+            "heads": heads, "hard_hold": hard}
 
 
 def assemble(videos, audios, layout):
     """Lay the clips' raw latents onto one joint (video, audio) pair.
 
-    First come, first written: an overlap (a held window) keeps the
-    earlier clip's rows, and the later clip's copy is compared and
-    logged -- identical for a masked chain, a measure of the join's
-    fidelity otherwise.
+    Every row goes to the clip the cut shows there (layout["owner_steps"],
+    see `owners`): a held head stays the parent's rows, a parent cut
+    before its extension loses its cut-away tail to the child. Where a
+    clip covers rows it does not own, its copy is compared and logged:
+    an exact hold must match to the bit, so a difference over a masked
+    pin's head is a placement error and is warned about.
     """
     v0, a0 = videos[0], audios[0]
     T, A = layout["total_steps"], layout["total_ticks"]
     video = torch.zeros(v0.shape[:2] + (T,) + v0.shape[3:], dtype=v0.dtype)
     audio = torch.zeros(a0.shape[:-1] + (A,), dtype=a0.dtype)
-    v_written = torch.zeros(T, dtype=torch.bool)
-    a_written = torch.zeros(A, dtype=torch.bool)
+    v_owner = torch.tensor(layout["owner_steps"], dtype=torch.long)
+    a_owner = torch.tensor(layout["owner_ticks"], dtype=torch.long)
+    v_written = v_owner >= 0
+    a_written = a_owner >= 0
     for i, (v, a) in enumerate(zip(videos, audios)):
         s, n = layout["steps"][i]
         if v.shape[2] != n:
@@ -149,27 +270,34 @@ def assemble(videos, audios, layout):
             raise ValueError("H3 Joint Latent: clip %d is %s, clip 0 is %s; "
                              "one timeline needs one size"
                              % (i, tuple(v.shape[3:]), tuple(v0.shape[3:])))
-        overlap = v_written[s:s + n]
-        if overlap.any():
-            k = int(overlap.sum())
-            idx = torch.nonzero(overlap).flatten()
-            have = video[:, :, s + idx].float()
-            new = v[:, :, idx].float()
-            rel = float(((have - new) ** 2).mean().sqrt() / (have ** 2).mean().sqrt().clamp(min=1e-8))
-            _LOG.info("obvpm.h3 joint: clip %d overlaps %d step(s) already "
-                      "placed; keeping the earlier rows (rel diff %.4f)", i, k, rel)
-        free = ~overlap
-        if free.any():
-            fidx = torch.nonzero(free).flatten()
-            video[:, :, s + fidx] = v[:, :, fidx].to(video.dtype)
-            v_written[s + fidx] = True
+        mine = v_owner[s:s + n] == i
+        idx = torch.nonzero(mine).flatten()
+        video[:, :, s + idx] = v[:, :, idx].to(video.dtype)
         t, m = layout["ticks"][i]
         m = min(m, a.shape[-1], A - t)
-        a_free = ~a_written[t:t + m]
-        if a_free.any():
-            aidx = torch.nonzero(a_free).flatten()
-            audio[..., t + aidx] = a[..., aidx].to(audio.dtype)
-            a_written[t + aidx] = True
+        aidx = torch.nonzero(a_owner[t:t + m] == i).flatten()
+        audio[..., t + aidx] = a[..., aidx].to(audio.dtype)
+    for i, v in enumerate(videos):
+        s, n = layout["steps"][i]
+        theirs = torch.nonzero(v_owner[s:s + n] != i).flatten()
+        if len(theirs) == 0:
+            continue
+        have = video[:, :, s + theirs].float()
+        new = v[:, :, theirs].float()
+        rel = float(((have - new) ** 2).mean().sqrt() / (have ** 2).mean().sqrt().clamp(min=1e-8))
+        head = int(fr.frames_to_latents(int(layout.get("heads", [0] * len(videos))[i])))
+        held = int((theirs < head).sum()) if head else 0
+        if held and layout.get("hard_hold", [False] * len(videos))[i]:
+            hv = video[:, :, s + theirs[:held]].float()
+            hn = v[:, :, theirs[:held]].float()
+            hrel = float(((hv - hn) ** 2).mean().sqrt() / (hv ** 2).mean().sqrt().clamp(min=1e-8))
+            if hrel > 1e-3:
+                _LOG.warning("obvpm.h3 joint: clip %d's held head (%d step(s)) differs "
+                             "from the parent rows it sits on (rel diff %.4f); an exact "
+                             "hold must match -- the clip is placed wrong or its parent "
+                             "was regenerated", i, held, hrel)
+        _LOG.info("obvpm.h3 joint: clip %d covers %d step(s) the cut shows from "
+                  "another clip; kept theirs (rel diff %.4f)", i, len(theirs), rel)
     if not v_written.all():
         holes = torch.nonzero(~v_written).flatten().tolist()
         raise ValueError("H3 Joint Latent: the timeline has gaps at latent "
@@ -289,6 +417,15 @@ class H3JointConditioning:
                     "lazy": True,
                     "tooltip": "Audio VAE, for a rebuild with audio "
                                "references. Lazy."}),
+                "single_clip": ("INT", {
+                    "default": 0, "min": 0, "max": 999,
+                    "tooltip": "0: every window samples under the conditioning "
+                               "of the clip that owns it (the per-window "
+                               "table). N: every window samples under clip "
+                               "N's conditioning alone (1 = first clip of the "
+                               "timeline) -- the A/B for artefacts at a "
+                               "window blend where the conditioning changes "
+                               "hands."}),
             },
         }
 
@@ -310,8 +447,23 @@ class H3JointConditioning:
                                          ("audio_vae", audio_vae))
                 if value is None]
 
-    def build(self, joint, clip=None, vae=None, audio_vae=None):
+    def build(self, joint, clip=None, vae=None, audio_vae=None, single_clip=0):
         clips = list(joint["clips"])
+        if single_clip:
+            if single_clip > len(clips):
+                raise ValueError("H3 Joint Conditioning: single_clip %d, but the "
+                                 "timeline has %d clip(s)" % (single_clip, len(clips)))
+            name = clips[single_clip - 1]
+            cond, _source = condload.load_for_clip(
+                nodes_load.resolve_clip_path(name), clip=clip, vae=vae,
+                audio_vae=audio_vae)
+            if not cond:
+                raise ValueError("H3 Joint Conditioning: %s has an empty "
+                                 "conditioning" % name)
+            _LOG.info("obvpm.h3 joint: every window samples under clip %d's "
+                      "conditioning alone (%s); the per-window table is off",
+                      single_clip, name)
+            return ([[entry[0], dict(entry[1])] for entry in cond],)
         conds = []
         for name in clips:
             cond, _source = condload.load_for_clip(
@@ -323,7 +475,10 @@ class H3JointConditioning:
             conds.append(cond)
         table = {"clips": clips,
                  "spans": [[int(s), int(n)] for s, n in joint["steps"]],
-                 "conds": conds}
+                 "conds": conds,
+                 # who the cut shows at each step: the window handler
+                 # anchors its windows per clip on this
+                 "owners": [int(o) for o in (joint.get("owner_steps") or [])]}
         # the first clip's entries carry the table; without a window
         # handler the sampler simply runs under the first clip
         out = []
@@ -483,6 +638,63 @@ def static_windows(total, length, overlap):
     return windows
 
 
+def anchored_windows(total, length, overlap, spans, owners):
+    """Windows anchored per clip, so conditioning changes hands only over
+    a held head. Returns [(start, end, clip index)].
+
+    Measured 2026-09-07 (joint_all3 vs joint_single A/B): windows laid on
+    one grid across the whole timeline blend two clips' conditionings
+    wherever adjacent windows happen to belong to different clips, and
+    two of five such blends painted artefacts (glyphs on dark hair, marks
+    on a face); sampling every window under one conditioning removed
+    them. So each clip gets its own run of windows over the rows the cut
+    shows from it, from its raw start (on the 5-step cycle) to the step
+    where the next clip takes over (its junction). Adjacent runs overlap
+    exactly over the next clip's held head -- rows both clips agree on --
+    and that is the only place two conditionings blend. Inside a run the
+    windows are `static_windows` of `length`/`overlap`. A run shorter
+    than `overlap` steps at the hand-over (no held head) is stretched to
+    keep at least that much blend, clip-shaped, within the next clip.
+    """
+    order = sorted(range(len(spans)), key=lambda i: (int(spans[i][0]), i))
+    first_owned = {}
+    for t, j in enumerate(owners):
+        if j >= 0 and j not in first_owned:
+            first_owned[j] = t
+    out = []
+    for pos, i in enumerate(order):
+        a = int(spans[i][0])
+        later = [first_owned[j] for j in order[pos + 1:]
+                 if j in first_owned and first_owned[j] > a]
+        b = min(later) if later else total
+        nxt = order[pos + 1] if pos + 1 < len(order) else None
+        if nxt is not None and b - int(spans[nxt][0]) < overlap:
+            k = max(overlap, b - int(spans[nxt][0]))
+            while (int(spans[nxt][0]) + k - a) % fr.LATENTS_PER_GROUP != fr.LATENT_BASE:
+                k += 1
+            b = min(int(spans[nxt][0]) + k, int(spans[nxt][0]) + int(spans[nxt][1]), total)
+        b = min(b, total)
+        if b <= a:
+            continue
+        for s, e in static_windows(b - a, length, overlap):
+            out.append((a + s, a + e, i))
+    return out
+
+
+def layout_windows(total, length, overlap, table):
+    """The run's windows with their conditioning owner: anchored per clip
+    when the table carries the cut's ownership, else one grid over the
+    timeline with each window owned by the clip holding most of it (or
+    None without a table)."""
+    owners = (table or {}).get("owners")
+    if table and owners and len(owners) == total and table.get("spans"):
+        return anchored_windows(total, length, overlap, table["spans"], owners)
+    grid = static_windows(total, length, overlap)
+    if not table:
+        return [(s, e, None) for s, e in grid]
+    return [(s, e, window_owner(table["spans"], s, e)) for s, e in grid]
+
+
 def pyramid(n):
     """Triangular weights over n positions (FreeNoise's weighted average)."""
     if n % 2 == 0:
@@ -505,15 +717,52 @@ def audio_span(step_start, step_end):
 _PER_CLIP_SKIP = ("latent_shapes", "denoise_mask", "audio_denoise_mask")
 
 
+class _TqdmHandler(logging.Handler):
+    """A console handler's twin that prints through tqdm.write."""
+
+    def __init__(self, orig):
+        super().__init__(orig.level)
+        self.setFormatter(orig.formatter)
+        for f in orig.filters:
+            self.addFilter(f)
+
+    def emit(self, record):
+        try:
+            from tqdm import tqdm
+            import sys
+            # the live sys.stderr, whatever wraps it right now: that is
+            # the stream the bars write to, so tqdm can clear them first
+            tqdm.write(self.format(record), file=sys.stderr)
+        except Exception:
+            self.handleError(record)
+
+
+@contextlib.contextmanager
 def _log_under_bars():
     """Context: console log lines go through tqdm.write.
 
     A tqdm bar (the sampler's step bar, or ours) leaves the cursor at the
     end of its line; a log line written then starts there. tqdm.write
     clears every live bar, prints at column 0 and redraws the bars.
+
+    Done by hand rather than with tqdm.contrib.logging: that one only
+    recognises a console handler whose stream IS sys.stderr, and under
+    ComfyUI the manager wraps sys.stderr again after core's handler was
+    made, so it ADDED a bare second handler (every line printed twice,
+    the first glued to the sampler's bar). Plain StreamHandlers on the
+    root are the console; FileHandlers and other packs' handlers stay.
     """
-    from tqdm.contrib.logging import logging_redirect_tqdm
-    return logging_redirect_tqdm()
+    root = logging.getLogger()
+    orig = list(root.handlers)
+    console = [h for h in orig if type(h) is logging.StreamHandler]
+    if not console:
+        yield
+        return
+    root.handlers = [h for h in orig if h not in console] + [_TqdmHandler(h) for h in console]
+    try:
+        yield
+    finally:
+        root.handlers = orig
 
 
 def _hms(seconds):
@@ -639,27 +888,31 @@ class H3WindowHandler:
             self._announced = False
         if not self._announced:
             self._announced = True
-            windows = (static_windows(total, self.context_length, self.context_overlap)
-                       if use else [(0, total)])
+            windows = (layout_windows(total, self.context_length, self.context_overlap, table)
+                       if use else [(0, total, None)])
             with _log_under_bars():
                 self._announce(total, use, windows, table)
         return use
 
     def _announce(self, total, use, windows, table):
         """The run's windows and their owners, once per conditioning table."""
+        anchored = bool(table and table.get("owners"))
         _LOG.info("obvpm.h3 context windows: %d video steps, window %d, "
                   "overlap %d -> %s", total, self.context_length,
                   self.context_overlap,
-                  "windows %s" % windows if use else "one window, plain sampling")
+                  ("%d windows%s %s" % (len(windows),
+                                        " anchored per clip (conditioning changes"
+                                        " hands only over a held head):" if anchored else ":",
+                                        [(s, e) if j is None else (s, e, j) for s, e, j in windows]))
+                  if use else "one window, plain sampling")
         if table is None:
             _LOG.info("obvpm.h3 context windows: no per-clip conditioning "
                       "on the wire; every window samples under the "
                       "conditioning given (wire H3 Joint Conditioning "
                       "for per-clip prompts)")
         else:
-            for k, (s, e) in enumerate(windows):
-                j = window_owner(table["spans"], s, e)
-                _LOG.info("obvpm.h3 context windows: window %d/%d steps "
+            for k, (s, e, j) in enumerate(windows):
+                _LOG.debug("obvpm.h3 context windows: window %d/%d steps "
                           "%d..%d conditioned by clip %d (%s)", k + 1,
                           len(windows), s, e, j, table["clips"][j])
 
@@ -668,7 +921,8 @@ class H3WindowHandler:
         shapes = self._shapes(conds)
         video, audio = comfy.utils.unpack_latents(x_in, shapes)[:2]
         T, A = int(video.shape[2]), int(audio.shape[-1])
-        windows = static_windows(T, self.context_length, self.context_overlap)
+        windows = layout_windows(T, self.context_length, self.context_overlap,
+                                 self._table(conds))
         # the blended prediction accumulates in system RAM: only one
         # window's slice crosses the bus per window, and the card keeps
         # the full-timeline copies' worth of room for the window's
@@ -689,7 +943,7 @@ class H3WindowHandler:
         show = comfy.utils.PROGRESS_BAR_ENABLED
         bar = tqdm(total=len(windows), desc="obvpm.h3 windows σ%.3f" % sigma,
                    leave=False, dynamic_ncols=True, disable=not show,
-                   bar_format="{desc}: {percentage:3.0f}%|{bar:50}| {n_fmt}/{total_fmt} "
+                   bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
                               "[{elapsed}<{remaining}, {rate_inv_fmt}]")
         # a second line under the bar: this window, and the time left
         # for the whole sampling (all steps' windows at this run's pace)
@@ -703,13 +957,13 @@ class H3WindowHandler:
                 left = " | step %d/%d, ~%s left" % (step_idx + 1, n_steps, _hms(eta))
             elif n_steps:
                 left = " | step %d/%d" % (step_idx + 1, n_steps)
-            line.set_description_str("    " + text + left, refresh=True)
+            line.set_description_str(text + left, refresh=True)
         t_step, worst, spilled = time.time(), None, False
         # while the bar is up, log lines from anywhere go through tqdm.write
         # so they land at column 0 and the bar is redrawn under them
         try:
             with _log_under_bars():
-                for k, (s, e) in enumerate(windows):
+                for k, (s, e, owner) in enumerate(windows):
                     t0 = time.time()
                     ta, tb = audio_span(s, e)
                     tb = min(tb, A)
@@ -718,9 +972,8 @@ class H3WindowHandler:
                     v_win, a_win = video[:, :, s:e], audio[..., ta:tb]
                     sub_x, sub_shapes = comfy.utils.pack_latents([v_win, a_win])
                     sub_conds = [self._window_conds(model, c, s, e, ta, tb, sub_shapes,
-                                                    x_in.device)
+                                                    x_in.device, owner)
                                  for c in conds]
-                    owner = window_owner(table["spans"], s, e) if table else None
                     status("steps %d..%d%s" % (
                         s, e, "" if owner is None else ", clip %d" % owner), k)
                     _LOG.debug("obvpm.h3 context windows: sigma %.3f window %d/%d "
@@ -789,7 +1042,7 @@ class H3WindowHandler:
             return torch.ones(n)
         return pyramid(n)
 
-    def _window_conds(self, model, cond_list, s, e, ta, tb, sub_shapes, device):
+    def _window_conds(self, model, cond_list, s, e, ta, tb, sub_shapes, device, owner=None):
         """One window's cond list: masks sliced, conditioning its owner's."""
         import comfy.conds
         if cond_list is None:
@@ -809,13 +1062,13 @@ class H3WindowHandler:
             table = cond.get(COND_KEY)
             if table:
                 mc.update(self._clip_conds(model, table, s, e, sub_shapes,
-                                           device, mc))
+                                           device, mc, owner))
                 new.pop(COND_KEY, None)
             new["model_conds"] = mc
             out.append(new)
         return out
 
-    def _clip_conds(self, model, table, s, e, sub_shapes, device, base_mc):
+    def _clip_conds(self, model, table, s, e, sub_shapes, device, base_mc, owner=None):
         """The owning clip's model_conds for window [s, e), cached per run.
 
         Runs the model's own `extra_conds` on the clip's stored
@@ -825,7 +1078,7 @@ class H3WindowHandler:
         generated under. Content keyframes recorded against the clip's
         own frame 0 are moved to where the clip sits in the window.
         """
-        j = window_owner(table["spans"], s, e)
+        j = owner if owner is not None else window_owner(table["spans"], s, e)
         key = (j, s, e)
         hit = self._cache.get(key)
         if hit is not None:

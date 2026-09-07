@@ -506,15 +506,36 @@ decode ─> H3 MCtx Trim and Save Video ─ path ─> H3 Upscale Loop End`,
 with the Slice's `pins` on the save node's `pins`, Loop Start's
 `out_folder` on its `base_folder`, and Loop End's `profile_folder` on
 H3 Assemble Upscale. The refine's schedule (`denoise` on the sampler's
-BasicScheduler) is set outside the loop; 0.2 is a refine.
+BasicScheduler) is set outside the loop. Mind the model's timestep
+shift (12 for H3): `denoise` is a fraction of the schedule, and the
+noise level the model actually starts from is 12d/(1+11d) — 0.2 starts
+at 75 % noise, 0.075 at 49 %. Measured 2026-09-08 on footage with
+dappled sunlight on dark hair: at 0.2 the refine renders the light
+patches as hard white points (with or without the turbo LoRA, at 4 or 5
+steps), at 0.08 faint ones, from 0.075 down clean, while 0.05 leaves
+foliage too soft. 0.075 is the default in the shipped workflows.
 
 ## H3 Joint Latent
 
 Lays every clip of the timeline onto one raw AV latent at its true
-position, from the same raw-start arithmetic the assembly uses; a held
-window is placed once (the earlier clip's rows, the later copy compared
-and logged — identical for a masked chain). A timeline with a gap
-between clips is refused.
+position. A pinned clip sits where its recipe says: its held frames
+are the parent's frames at the pin's `source_start`, whatever the cut
+shows of either clip — so a parent cut before it was extended (shown
+to frame 158, extended from there) still gets its child on the rows
+the child was made from. Only a clip with no pin into the timeline is
+placed by the cut's arithmetic. Where clips overlap, each row goes to
+the clip the cut shows there: the parent up to the junction recorded
+in the child's sidecar, the child from it on. A held head therefore
+stays the parent's rows and a cut-away tail never enters the joint.
+Every clip's copy of rows it does not own is compared and logged; a
+masked hard hold must match to the bit, and a difference there is
+warned about as a placement error. A timeline with a gap between
+clips is refused.
+
+Measured 2026-09-07 (joint_all2): placing clips by the cut alone put
+clip 7 34 frames after its pin (held head rel diff 1.25) and let clip
+10's cut-away tail win 102 frames of clip 14's span — a flicker at the
+first seam and four seconds of the wrong clip under the right audio.
 
 | Input | Type | Notes |
 |---|---|---|
@@ -528,15 +549,17 @@ Outputs: `latent` (the joint raw AV latent, for the upscaler), `joint`
 Every clip's own conditioning, on the sampler's one CONDITIONING wire.
 Each clip's `.cond` is loaded (or its conditioning rebuilt from its
 recorded references, through the core reference node); the first
-clip's conditioning carries the whole table, and H3 Context Windows
-samples every window under the conditioning of the clip that owns most
-of it — so a timeline of several prompts and reference sets stays
-several. Without Context Windows on the model the sampler simply runs
-under the first clip's.
+clip's conditioning carries the whole table together with the cut's
+ownership of every step, and H3 Context Windows lays each clip its own
+run of windows and samples them under that clip's conditioning — so a
+timeline of several prompts and reference sets stays several. Without
+Context Windows on the model the sampler simply runs under the first
+clip's.
 
 | Input | Type | Notes |
 |---|---|---|
 | `joint` | JOINT | from Joint Latent |
+| `single_clip` | INT, default 0 | 0: per-window conditioning (the table). N: every window samples under clip N's conditioning alone (1 = first clip) — the A/B for artefacts at a window blend where the conditioning changes hands (seen 2026-09-07 at two of five such blends, on flat dark hair) |
 | `clip` | CLIP (optional, **lazy**) | text encoder — needed only for a clip with no `.cond` that recorded its references |
 | `vae` / `audio_vae` | VAE (optional, **lazy**) | for the same rebuild |
 
@@ -584,6 +607,21 @@ sits in the window). Built once per window per run, not per step.
 
 A latent no longer than the window samples plainly. The windows and
 which clip conditions each are logged when sampling starts.
+
+**Windows are anchored per clip.** With H3 Joint Conditioning on the
+wire, each clip gets its own run of windows over the rows the cut shows
+from it: from its raw start to the step where the next clip takes over.
+Adjacent runs overlap exactly over the next clip's held head — the rows
+both clips agree on — and that is the only place two conditionings
+blend. Measured 2026-09-07: windows on one grid across the timeline
+blended two clips' conditionings wherever neighbouring windows happened
+to belong to different clips, and two of five such blends painted
+artefacts (glyphs on dark hair, marks on a face); sampling everything
+under one conditioning removed them (`single_clip` on Joint
+Conditioning is that A/B). Inside a run the windows follow
+`window_seconds`/`overlap_seconds`; a clip shorter than a window gets
+one window its own length. Without the table the windows fall back to
+one grid over the timeline.
 
 **Windows sit on the latent grid.** H3's latent runs in cycles of five
 steps covering (1, 4, 4, 4, 4) frames, and every clip latent is 5k+2
