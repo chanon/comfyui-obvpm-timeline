@@ -580,6 +580,42 @@ re-renders sound that is already finished.
 
 Wire the sampler's `latent_image` from here.
 
+## H3 Joint Sequential Refine
+
+The joint refine as a sequence of complete samplings joined by frozen
+context, in place of H3 Context Windows plus the sampler. Each window
+is sampled to the end before the next begins; the rows it shares with
+the finished window before it are frozen through the noise mask, so the
+model sees the finished texture at every step and continues it. With
+H3 Joint Conditioning on `conditioning` the windows are anchored per
+clip and each samples under its clip's conditioning; the noise is one
+field over the timeline, sliced per window; the audio hold from Joint
+Audio Mask is kept.
+
+Why it exists (measured 2026-09-08, one timeline, one prior, one noise
+field, one window length): the per-step windows of H3 Context Windows
+hallucinated — a wireframe rectangle on a forehead, hard points on
+dappled sunlit hair, shimmering eyes — at every noise level tried, with
+and without the turbo LoRA, with prediction averaging or a hard cut,
+with and without a frame-0 keyframe anchor; the per-clip refine and
+MMH3 Ultimate Upscale's sequential chunks, each one complete
+trajectory, did not. What both clean methods share is that no row's
+trajectory is ever advanced by another window's prediction. This node
+keeps that property and joins windows with 1.25 s of frozen finished
+context, a stronger join than a one-frame anchor plus a cross-fade.
+
+| Input | Type | Notes |
+|---|---|---|
+| `model` | MODEL | with the sigma shift applied (MiniMaxH3SigmaShift 12 / 3) |
+| `conditioning` | CONDITIONING | H3 Joint Conditioning's output, or one conditioning |
+| `latent` | LATENT | the upscaled joint AV latent from H3 Joint Audio Mask |
+| `noise`, `sampler`, `sigmas` | NOISE, SAMPLER, SIGMAS | as for SamplerCustomAdvanced; `sigmas` from BasicScheduler with denoise = the first sigma |
+| `window_seconds` | FLOAT | window length, rounded to a clip-shaped number of steps (default 5) |
+| `overlap_seconds` | FLOAT | rows shared with the finished window before, frozen as context (default 1.25) |
+| `negative`, `cfg` | optional | a CFG guider when `negative` is wired |
+
+Output: the refined joint AV latent, for H3 Joint Store.
+
 ## H3 Context Windows
 
 A model patch that samples a long AV latent in windows of
@@ -602,7 +638,8 @@ sits in the window). Built once per window per run, not per step.
 |---|---|---|
 | `window_seconds` | FLOAT | window length in seconds of picture, rounded to a clip-shaped number of latent steps (5j+2, about 3.4 frames a step; the log reports what it became). 5 by default |
 | `overlap_seconds` | FLOAT | seconds shared by neighbouring windows; the blend happens here. About a quarter of the window; 1.25 by default |
-| `fuse_method` | COMBO | `pyramid` (triangular weights over each window) or `flat` |
+| `prior` | LATENT (optional) | the upscaled joint AV latent the sampler refines (Joint Audio Mask's output). With it wired, every window that starts mid-timeline gets the prior's frame at its start as a frame-0 keyframe at `anchor_strength` (default 0.999, 0 = off), the way a sequential chunk refine anchors each chunk. Measured 2026-09-08: the same model, prior, noise field and chunk length hallucinated under unanchored per-step windows (a wireframe rectangle on a forehead, hard points on dappled hair, shimmering eyes) and not under anchored sequential chunks. The anchored row itself is taken from the neighbouring window |
+| `fuse_method` | COMBO | `pyramid` (triangular weights over each window), `flat` (plain average) or `cut` (no averaging: every row goes to the window whose centre is nearest, hand-over at the overlap's midpoint; both windows still see across it). Averaging superposes two placements of fine detail — measured 2026-09-08: hair strands became a mesh, dappled sunlight hard points, and every such artefact sat inside an overlap while the per-clip refine (one window, no blend) never showed them — so `cut` is the fix for that; what it can leave is a subtle texture change at the hand-over |
 | `vram_headroom_gb` | FLOAT | VRAM kept free of model weights for one window's activations. 10 by default, matching the 5 s window |
 
 A latent no longer than the window samples plainly. The windows and
