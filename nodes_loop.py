@@ -79,8 +79,8 @@ class H3UpscaleLoopStart:
 
     CATEGORY = "obvpm/h3"
     FUNCTION = "start"
-    RETURN_TYPES = (wt.LOOP, "STRING", "INT", "INT")
-    RETURN_NAMES = ("flow", "out_folder", "index", "total")
+    RETURN_TYPES = (wt.LOOP, "STRING")
+    RETURN_NAMES = ("flow", "out_folder")
     DESCRIPTION = (
         "Opens the loop that turns a jointly refined timeline into refined "
         "takes. Everything between this node and H3 Upscale Loop End is the "
@@ -94,8 +94,6 @@ class H3UpscaleLoopStart:
         "the loop and which clip this iteration is.",
         "The profile folder the joint latent sits in (<base_folder>/_upscale/"
         "<profile>). Wire to the save node's base_folder.",
-        "0-based position in the timeline.",
-        "How many clips the timeline holds.",
     )
 
     @classmethod
@@ -197,7 +195,7 @@ class H3UpscaleLoopStart:
                 "lines": lines, "clips": clips, "source": clip,
                 "folder": folder, "rel_folder": rel_folder,
                 "joint_path": path, "stamp": stamp}
-        return (flow, rel_folder, index, len(clips))
+        return (flow, rel_folder)
 
     @staticmethod
     def _joins(headers):

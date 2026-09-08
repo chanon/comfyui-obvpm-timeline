@@ -124,7 +124,9 @@ at full refine strength once the prior is upscaled in chunks.
 Stays: pin-based placement and cut ownership, grid-aligned windows,
 anchored-per-clip windows, the estimate wrapper, the log handler swap.
 
-Optional, kept as switches: `fuse_method = cut`, the `prior` /
-`anchor_strength` frame-0 keyframe on Context Windows, and the
-`H3 Joint Sequential Refine` node. None of them fixed the hallucination;
-each may still be useful once the prior is right.
+Removed once the cause was confirmed (2026-09-08, after commit
+744fc88): `fuse_method = cut`, the `prior` / `anchor_strength` frame-0
+keyframe on Context Windows, `single_clip` on Joint Conditioning, and
+the `H3 Joint Sequential Refine` node. None of them changed the
+hallucination; they only existed to test theories this record closes.
+The code is in the history if a theory is ever reopened.

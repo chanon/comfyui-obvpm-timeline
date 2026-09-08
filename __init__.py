@@ -15,7 +15,7 @@ from .nodes_assemble import H3Assemble, H3AssembleUpscale, H3Timeline
 from .nodes_encode import H3MCtxFromFrames
 from .nodes_joint import (H3ContextWindows, H3JointAudioMask,
                           H3JointConditioning, H3JointLatent, H3JointSlice,
-                          H3JointSequentialRefine, H3JointStore)
+                          H3JointStore)
 from .nodes_load import H3LoadMCtx, H3LoadVideoWithMCtx
 from .nodes_loop import H3UpscaleLoopEnd, H3UpscaleLoopStart
 from .nodes_mode import H3RunModeGate
@@ -54,7 +54,6 @@ NODE_CLASS_MAPPINGS = {
     "H3JointConditioning": H3JointConditioning,
     "H3JointAudioMask": H3JointAudioMask,
     "H3ContextWindows": H3ContextWindows,
-    "H3JointSequentialRefine": H3JointSequentialRefine,
     "H3JointStore": H3JointStore,
     "H3JointSlice": H3JointSlice,
     "H3Assemble": H3Assemble,
@@ -81,7 +80,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3JointConditioning": "H3 Joint Conditioning",
     "H3JointAudioMask": "H3 Joint Audio Mask",
     "H3ContextWindows": "H3 Context Windows",
-    "H3JointSequentialRefine": "H3 Joint Sequential Refine",
     "H3JointStore": "H3 Joint Store",
     "H3JointSlice": "H3 Joint Slice",
     "H3Assemble": "H3 MCtx Assemble",

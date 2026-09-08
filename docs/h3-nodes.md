@@ -478,7 +478,7 @@ refined seam where it was (refine08–17, 2026-09-04; a refine moves about
 seed). A single long clip refines seamlessly because every row is
 sampled in one pass with every other row in view, so the pass below
 gives a chain the same treatment: the timeline becomes one latent, is
-upscaled as one and sampled as one, in clip-sized windows that overlap
+upscaled (in short chunks along time, see below) and sampled as one, in clip-sized windows that overlap
 by about a quarter, with the model's predictions blended across the
 overlap at every step (MultiDiffusion along time) and each window
 conditioned by the clip that owns most of it. Texture is then decided
@@ -494,7 +494,7 @@ Upscale plays the cut unchanged.
 Outside the loop:
 
 ```
-H3 Joint Latent ─ latent ─> LTXVSeparateAVLatent ─> upscaler ─> LTXVConcatAVLatent ─> H3 Joint Audio Mask ─> sampler.latent_image
+H3 Joint Latent ─ latent ─> LTXVSeparateAVLatent ─> upscaler (temporal chunking ON) ─> LTXVConcatAVLatent ─> H3 Joint Audio Mask ─> sampler.latent_image
                 ─ joint  ─> H3 Joint Conditioning ─────────────────────────────────────────────────────> sampler.conditioning
                          └> H3 Joint Store.joint
 refine model ─> H3 Context Windows ─> sampler.model        any NOISE ─> sampler.noise
@@ -509,11 +509,21 @@ H3 Assemble Upscale. The refine's schedule (`denoise` on the sampler's
 BasicScheduler) is set outside the loop. Mind the model's timestep
 shift (12 for H3): `denoise` is a fraction of the schedule, and the
 noise level the model actually starts from is 12d/(1+11d) — 0.2 starts
-at 75 % noise, 0.075 at 49 %. Measured 2026-09-08 on footage with
-dappled sunlight on dark hair: at 0.2 the refine renders the light
-patches as hard white points (with or without the turbo LoRA, at 4 or 5
-steps), at 0.08 faint ones, from 0.075 down clean, while 0.05 leaves
-foliage too soft. 0.075 is the default in the shipped workflows.
+at 75 % noise, 0.075 at 49 %. 0.2 is the working value.
+
+**The upscaler must chunk along time.** The H3 3D latent upscaler
+normalises over channels, time, height and width together, and it was
+trained on short clips. Handed the whole joint in one pass it
+normalises every frame against the statistics of the entire video and
+its output drifts everywhere (about 6 % on interior rows against the
+same clip upscaled alone); the refine then reads that drift as detail
+and hallucinates on it — hard white points on dappled hair, marks on a
+face, shimmering eyes — at every noise level, under every sampling
+scheme, in positions that follow the noise seed. Leave the upscaler
+node's `enable_temporal_chunking` on (32-step chunks, 5-step overlap
+blended inside the network); with it on, the joint refines cleanly at
+0.2 with no seam (measured 2026-09-08, seven clips; the full record is
+in [joint-refine-investigation.md](joint-refine-investigation.md)).
 
 ## H3 Joint Latent
 
@@ -542,7 +552,8 @@ first seam and four seconds of the wrong clip under the right audio.
 | `sequence` | STRING | the timeline text — the Timeline's `sequence` output through the upscale gate |
 
 Outputs: `latent` (the joint raw AV latent, for the upscaler), `joint`
-(where each clip sits, for Joint Conditioning and Joint Store), `info`.
+(where each clip sits, for Joint Conditioning and Joint Store). The
+layout is logged when the node runs.
 
 ## H3 Joint Conditioning
 
@@ -559,7 +570,6 @@ clip's.
 | Input | Type | Notes |
 |---|---|---|
 | `joint` | JOINT | from Joint Latent |
-| `single_clip` | INT, default 0 | 0: per-window conditioning (the table). N: every window samples under clip N's conditioning alone (1 = first clip) — the A/B for artefacts at a window blend where the conditioning changes hands (seen 2026-09-07 at two of five such blends, on flat dark hair) |
 | `clip` | CLIP (optional, **lazy**) | text encoder — needed only for a clip with no `.cond` that recorded its references |
 | `vae` / `audio_vae` | VAE (optional, **lazy**) | for the same rebuild |
 
@@ -579,42 +589,6 @@ re-renders sound that is already finished.
 | `audio_denoise` | FLOAT | `0` keeps the audio exactly. `~0.5` re-samples it alongside the picture (the model re-derives lip sync from it); save the **source** audio then — H3 Joint Slice's `source_audio`, decoded |
 
 Wire the sampler's `latent_image` from here.
-
-## H3 Joint Sequential Refine
-
-The joint refine as a sequence of complete samplings joined by frozen
-context, in place of H3 Context Windows plus the sampler. Each window
-is sampled to the end before the next begins; the rows it shares with
-the finished window before it are frozen through the noise mask, so the
-model sees the finished texture at every step and continues it. With
-H3 Joint Conditioning on `conditioning` the windows are anchored per
-clip and each samples under its clip's conditioning; the noise is one
-field over the timeline, sliced per window; the audio hold from Joint
-Audio Mask is kept.
-
-Why it exists (measured 2026-09-08, one timeline, one prior, one noise
-field, one window length): the per-step windows of H3 Context Windows
-hallucinated — a wireframe rectangle on a forehead, hard points on
-dappled sunlit hair, shimmering eyes — at every noise level tried, with
-and without the turbo LoRA, with prediction averaging or a hard cut,
-with and without a frame-0 keyframe anchor; the per-clip refine and
-MMH3 Ultimate Upscale's sequential chunks, each one complete
-trajectory, did not. What both clean methods share is that no row's
-trajectory is ever advanced by another window's prediction. This node
-keeps that property and joins windows with 1.25 s of frozen finished
-context, a stronger join than a one-frame anchor plus a cross-fade.
-
-| Input | Type | Notes |
-|---|---|---|
-| `model` | MODEL | with the sigma shift applied (MiniMaxH3SigmaShift 12 / 3) |
-| `conditioning` | CONDITIONING | H3 Joint Conditioning's output, or one conditioning |
-| `latent` | LATENT | the upscaled joint AV latent from H3 Joint Audio Mask |
-| `noise`, `sampler`, `sigmas` | NOISE, SAMPLER, SIGMAS | as for SamplerCustomAdvanced; `sigmas` from BasicScheduler with denoise = the first sigma |
-| `window_seconds` | FLOAT | window length, rounded to a clip-shaped number of steps (default 5) |
-| `overlap_seconds` | FLOAT | rows shared with the finished window before, frozen as context (default 1.25) |
-| `negative`, `cfg` | optional | a CFG guider when `negative` is wired |
-
-Output: the refined joint AV latent, for H3 Joint Store.
 
 ## H3 Context Windows
 
@@ -638,8 +612,7 @@ sits in the window). Built once per window per run, not per step.
 |---|---|---|
 | `window_seconds` | FLOAT | window length in seconds of picture, rounded to a clip-shaped number of latent steps (5j+2, about 3.4 frames a step; the log reports what it became). 5 by default |
 | `overlap_seconds` | FLOAT | seconds shared by neighbouring windows; the blend happens here. About a quarter of the window; 1.25 by default |
-| `prior` | LATENT (optional) | the upscaled joint AV latent the sampler refines (Joint Audio Mask's output). With it wired, every window that starts mid-timeline gets the prior's frame at its start as a frame-0 keyframe at `anchor_strength` (default 0.999, 0 = off), the way a sequential chunk refine anchors each chunk. Measured 2026-09-08: the same model, prior, noise field and chunk length hallucinated under unanchored per-step windows (a wireframe rectangle on a forehead, hard points on dappled hair, shimmering eyes) and not under anchored sequential chunks. The anchored row itself is taken from the neighbouring window |
-| `fuse_method` | COMBO | `pyramid` (triangular weights over each window), `flat` (plain average) or `cut` (no averaging: every row goes to the window whose centre is nearest, hand-over at the overlap's midpoint; both windows still see across it). Averaging superposes two placements of fine detail — measured 2026-09-08: hair strands became a mesh, dappled sunlight hard points, and every such artefact sat inside an overlap while the per-clip refine (one window, no blend) never showed them — so `cut` is the fix for that; what it can leave is a subtle texture change at the hand-over |
+| `fuse_method` | COMBO | `pyramid` (triangular weights over each window, the default and the working choice) or `flat` (plain average) |
 | `vram_headroom_gb` | FLOAT | VRAM kept free of model weights for one window's activations. 10 by default, matching the 5 s window |
 
 A latent no longer than the window samples plainly. The windows and
@@ -650,12 +623,11 @@ wire, each clip gets its own run of windows over the rows the cut shows
 from it: from its raw start to the step where the next clip takes over.
 Adjacent runs overlap exactly over the next clip's held head — the rows
 both clips agree on — and that is the only place two conditionings
-blend. Measured 2026-09-07: windows on one grid across the timeline
-blended two clips' conditionings wherever neighbouring windows happened
-to belong to different clips, and two of five such blends painted
-artefacts (glyphs on dark hair, marks on a face); sampling everything
-under one conditioning removed them (`single_clip` on Joint
-Conditioning is that A/B). Inside a run the windows follow
+blend. Windows on one grid across the timeline blended two clips'
+conditionings wherever neighbouring windows happened to belong to
+different clips, mid-body, where the clips' prompts and references may
+disagree; anchoring the runs keeps each clip's body under its own
+conditioning. Inside a run the windows follow
 `window_seconds`/`overlap_seconds`; a clip shorter than a window gets
 one window its own length. Without the table the windows fall back to
 one grid over the timeline.
@@ -723,8 +695,8 @@ clip's span recorded in it and a stamp naming this sampling. Wire
 `joint_path` to H3 Upscale Loop Start. With `reuse_existing` on, a
 joint file already there for this timeline is kept and the sampler is
 not run again — the Timeline re-runs everything downstream on every
-press, and the sampling is the expensive part. Outputs `joint_path` and
-`profile_folder`.
+press, and the sampling is the expensive part. Output: `joint_path`;
+the profile folder comes out of Loop End.
 
 ## H3 Upscale Loop Start
 
@@ -737,7 +709,7 @@ which clip this iteration slices, and where it goes.
 | `start_index` | INT | `-1` resumes where the profile left off; the loop drives this itself after the first iteration. A number redoes one clip |
 
 Outputs: `flow` (to Joint Slice and Loop End), `out_folder` (the
-profile folder, for the save node's `base_folder`), `index`, `total`.
+profile folder, for the save node's `base_folder`).
 
 The profile folder is the whole state: the joint latent, the refined
 clips and a `profile.json` recording which **source** each came from,

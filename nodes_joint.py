@@ -318,8 +318,8 @@ class H3JointLatent:
 
     CATEGORY = "obvpm/h3"
     FUNCTION = "build"
-    RETURN_TYPES = ("LATENT", wt.JOINT, "STRING")
-    RETURN_NAMES = ("latent", "joint", "info")
+    RETURN_TYPES = ("LATENT", wt.JOINT)
+    RETURN_NAMES = ("latent", "joint")
     DESCRIPTION = (
         "Lays every clip of the timeline onto ONE raw AV latent at its true "
         "position (held windows coincide), for the joint refine: upscale it "
@@ -331,7 +331,6 @@ class H3JointLatent:
         "The joint raw AV latent (video + audio), for the upscaler.",
         "Where each clip sits on it. Wire to H3 Joint Conditioning and H3 "
         "Joint Store.",
-        "One line per clip: its span.",
     )
 
     @classmethod
@@ -373,7 +372,7 @@ class H3JointLatent:
         _LOG.info("obvpm.h3 joint: %d clip(s) -> %d steps (%d frames), %d "
                   "audio ticks\n%s", len(clips), layout["total_steps"],
                   layout["total_frames"], layout["total_ticks"], info)
-        return (avpack.pack_av(video, audio, name="joint"), record, info)
+        return (avpack.pack_av(video, audio, name="joint"), record)
 
 
 # ---------------------------------------------------------------------------
@@ -417,15 +416,6 @@ class H3JointConditioning:
                     "lazy": True,
                     "tooltip": "Audio VAE, for a rebuild with audio "
                                "references. Lazy."}),
-                "single_clip": ("INT", {
-                    "default": 0, "min": 0, "max": 999,
-                    "tooltip": "0: every window samples under the conditioning "
-                               "of the clip that owns it (the per-window "
-                               "table). N: every window samples under clip "
-                               "N's conditioning alone (1 = first clip of the "
-                               "timeline) -- the A/B for artefacts at a "
-                               "window blend where the conditioning changes "
-                               "hands."}),
             },
         }
 
@@ -447,23 +437,8 @@ class H3JointConditioning:
                                          ("audio_vae", audio_vae))
                 if value is None]
 
-    def build(self, joint, clip=None, vae=None, audio_vae=None, single_clip=0):
+    def build(self, joint, clip=None, vae=None, audio_vae=None):
         clips = list(joint["clips"])
-        if single_clip:
-            if single_clip > len(clips):
-                raise ValueError("H3 Joint Conditioning: single_clip %d, but the "
-                                 "timeline has %d clip(s)" % (single_clip, len(clips)))
-            name = clips[single_clip - 1]
-            cond, _source = condload.load_for_clip(
-                nodes_load.resolve_clip_path(name), clip=clip, vae=vae,
-                audio_vae=audio_vae)
-            if not cond:
-                raise ValueError("H3 Joint Conditioning: %s has an empty "
-                                 "conditioning" % name)
-            _LOG.info("obvpm.h3 joint: every window samples under clip %d's "
-                      "conditioning alone (%s); the per-window table is off",
-                      single_clip, name)
-            return ([[entry[0], dict(entry[1])] for entry in cond],)
         conds = []
         for name in clips:
             cond, _source = condload.load_for_clip(
@@ -706,40 +681,6 @@ def pyramid(n):
     return torch.tensor(seq, dtype=torch.float32)
 
 
-def cut_weights(spans, total):
-    """One window per unit: weight 1 where this window's centre is the
-    nearest of all windows (ties to the earlier window), else 0.
-
-    The blend alternative to averaging. Averaging two windows' predictions
-    over an overlap superposes two placements of every fine structure --
-    hair strands twice a few pixels apart make a mesh, two soft light
-    patches sharpen into points at the next step -- and every artefact
-    located in the joint refine sat inside an overlap (measured 2026-09-08;
-    the per-clip refine, one window per clip and no blending, never showed
-    them). With a hard hand-over at the overlap's midpoint every row is
-    predicted by exactly one window, still with context on both sides of
-    the hand-over, and nothing is ever mixed.
-    """
-    centres = [(s + e) / 2.0 for s, e in spans]
-    owner = [-1] * total
-    for t in range(total):
-        best = None
-        for k, c in enumerate(centres):
-            s, e = spans[k]
-            if not (s <= t < e):
-                continue
-            d = abs(t - c)
-            if best is None or d < best[0]:
-                best = (d, k)
-        owner[t] = best[1] if best else -1
-    out = []
-    for k, (s, e) in enumerate(spans):
-        w = torch.tensor([1.0 if owner[t] == k else 0.0 for t in range(s, e)],
-                         dtype=torch.float32)
-        out.append(w)
-    return out
-
-
 def audio_span(step_start, step_end):
     """Audio ticks [a, b) covering video steps [step_start, step_end)."""
     return (fr.audio_total(fr.frame_at_latent(step_start)),
@@ -857,16 +798,11 @@ def _vram_report(stats):
 class H3WindowHandler:
     """Windowed calc_cond_batch for H3's packed video+audio latent."""
 
-    def __init__(self, length, overlap, fuse="pyramid", headroom_gb=10.0,
-                 prior=None, anchor=0.0):
+    def __init__(self, length, overlap, fuse="pyramid", headroom_gb=10.0):
         self.context_length = clip_shaped(length)
         self.context_overlap = min(int(overlap), self.context_length - 1)
         self.fuse = fuse
         self.headroom_mb = max(0.0, float(headroom_gb)) * 1024.0
-        # the upscaled prior's video rows [1, C, T, H, W] on the CPU and the
-        # strength of the frame-0 keyframe each window gets from it (0 = none)
-        self.prior_video = prior
-        self.anchor = max(0.0, min(1.0, float(anchor)))
         self._announced = False
         # per-clip model_conds by (clip, window) -- built once per run,
         # not once per step; keyed on the conditioning table's identity so
@@ -936,16 +872,6 @@ class H3WindowHandler:
     def _announce(self, total, use, windows, table):
         """The run's windows and their owners, once per conditioning table."""
         anchored = bool(table and table.get("owners"))
-        if self.prior_video is not None and self.anchor > 0:
-            if int(self.prior_video.shape[2]) != int(total):
-                raise ValueError("H3 Context Windows: the prior has %d steps but the "
-                                 "timeline being sampled has %d; wire the upscaled "
-                                 "joint latent the sampler refines"
-                                 % (int(self.prior_video.shape[2]), int(total)))
-            _LOG.info("obvpm.h3 context windows: %d of %d windows anchored to the "
-                      "prior's frame at their start (strength %.3f)",
-                      sum(1 for s, _e, _j in windows if self.anchors(s)),
-                      len(windows), self.anchor)
         _LOG.info("obvpm.h3 context windows: %d video steps, window %d, "
                   "overlap %d -> %s", total, self.context_length,
                   self.context_overlap,
@@ -1008,15 +934,6 @@ class H3WindowHandler:
                 left = " | step %d/%d" % (step_idx + 1, n_steps)
             line.set_description_str(text + left, refresh=True)
         t_step, worst, spilled = time.time(), None, False
-        cut = self.fuse == "cut"
-        if cut:
-            spans_a = []
-            for s, e, _o in windows:
-                ta, tb = audio_span(s, e)
-                tb = A if e == T else min(tb, A)
-                spans_a.append((ta, tb))
-            cut_v = cut_weights([(s, e) for s, e, _o in windows], T)
-            cut_a = cut_weights(spans_a, A)
         # while the bar is up, log lines from anywhere go through tqdm.write
         # so they land at column 0 and the bar is redrawn under them
         try:
@@ -1051,13 +968,8 @@ class H3WindowHandler:
                     status("steps %d..%d%s, %.0fs%s" % (
                         s, e, "" if owner is None else ", clip %d" % owner, took,
                         "" if not stats else ", +%.1f GB" % (stats["peak"] / 1024.0)), k + 1)
-                    w_v = cut_v[k] if cut else self._weights(e - s)
-                    w_a = cut_a[k] if cut else self._weights(tb - ta)
-                    if self.anchors(s) and float(cnt_v[s]) > 0:
-                        # the anchored row comes back as the keyframe, not a
-                        # refinement; an earlier window already owns it
-                        w_v = w_v.clone()
-                        w_v[0] = 0.0
+                    w_v = self._weights(e - s)
+                    w_a = self._weights(tb - ta)
                     for i, out in enumerate(outs):
                         if out is None:
                             continue
@@ -1127,38 +1039,9 @@ class H3WindowHandler:
                 mc.update(self._clip_conds(model, table, s, e, sub_shapes,
                                            device, mc, owner))
                 new.pop(COND_KEY, None)
-            elif self.anchors(s) and cond.get("cross_attn") is not None:
-                # no per-clip table (one conditioning for the run): the
-                # anchor still needs the model's extra_conds rebuilt at
-                # this window from the conditioning's own extras
-                extras = {k: v for k, v in cond.items()
-                          if k not in ("cross_attn", "model_conds")}
-                mc.update(self._build_conds(model, ("base", s, e), cond["cross_attn"],
-                                            extras, 0, s, e, sub_shapes, device, mc))
             new["model_conds"] = mc
             out.append(new)
         return out
-
-    def anchors(self, s):
-        """True when window [s, ...) gets a frame-0 keyframe from the prior."""
-        return self.prior_video is not None and self.anchor > 0 and s > 0
-
-    def _anchor_keyframe(self, s):
-        """The prior's row at the window start as a frame-0 keyframe.
-
-        Measured 2026-09-08: the same model, prior, noise field and chunk
-        length hallucinated (a wireframe rectangle on a forehead, hard
-        points on dappled hair, shimmering eyes) under our per-step
-        windows and not under MMH3 Ultimate Upscale's sequential chunks;
-        the one thing every clean chunk had that our windows lacked is a
-        clean keyframe at its frame 0 (H3 packs it as a cond row at the
-        target's time origin, `minimax_visual_cond_noise_aug` its
-        strength). A window that starts mid-clip gets the upscaled
-        prior's own row there: the content the window is refining anyway,
-        presented the way the model expects a sequence to begin.
-        """
-        return {"resolved_frame_index": 0,
-                "latent": self.prior_video[:, :, s:s + 1].contiguous()}
 
     def _build_conds(self, model, key, cross_attn, extras, clip_start, s, e,
                      sub_shapes, device, base_mc):
@@ -1169,7 +1052,7 @@ class H3WindowHandler:
         text embedding, the reference blocks and the packed layout are
         exactly what that clip generated under. Content keyframes recorded
         against the clip's own frame 0 are moved to where the clip sits in
-        the window; the frame-0 anchor from the prior goes in front.
+        the window.
         """
         hit = self._cache.get(key)
         if hit is not None:
@@ -1187,12 +1070,6 @@ class H3WindowHandler:
             keyframes = [
                 dict(kf, resolved_frame_index=kf.get("resolved_frame_index", 0) + shift)
                 if isinstance(kf, dict) else kf for kf in keyframes]
-        if self.anchors(s):
-            kept = [kf for kf in (keyframes or [])
-                    if not (isinstance(kf, dict) and kf.get("resolved_frame_index") == 0
-                            and kf.get("latent") is not None)]
-            keyframes = [self._anchor_keyframe(s)] + kept
-            params["minimax_visual_cond_noise_aug"] = self.anchor
         if keyframes is not None:
             params["minimax_keyframes"] = keyframes
         built = model.extra_conds(**params)
@@ -1250,19 +1127,11 @@ class H3ContextWindows:
                     "tooltip": "Seconds shared by neighbouring windows; the "
                                "blend happens here. About a quarter of the "
                                "window."}),
-                "fuse_method": (["pyramid", "flat", "cut"], {
+                "fuse_method": (["pyramid", "flat"], {
                     "default": "pyramid",
-                    "tooltip": "What happens where windows overlap: pyramid "
-                               "averages the two predictions with triangular "
-                               "weights, flat averages them plainly, cut hands "
-                               "every row to the window whose centre is "
-                               "nearest and mixes nothing. Averaging "
-                               "superposes two placements of fine detail "
-                               "(hair strands become a mesh, soft light "
-                               "patches hard points); cut avoids that and "
-                               "leaves at most a subtle texture change at "
-                               "the hand-over. Both windows still see across "
-                               "it."}),
+                    "tooltip": "How the two predictions are averaged where "
+                               "windows overlap: pyramid with triangular "
+                               "weights (the working choice), flat plainly."}),
                 "vram_headroom_gb": ("FLOAT", {
                     "default": 10.0, "min": 0.0, "max": 128.0, "step": 0.5,
                     "tooltip": "VRAM kept free of model weights for one "
@@ -1279,30 +1148,11 @@ class H3ContextWindows:
                                "step's summary log line reports the measured "
                                "peak; set this a little above it. 0 leaves "
                                "the budget to core (fine with dynamic VRAM)."}),
-                "anchor_strength": ("FLOAT", {
-                    "default": 0.999, "min": 0.0, "max": 1.0, "step": 0.001,
-                    "tooltip": "With `prior` wired: every window that starts "
-                               "mid-timeline gets the prior's frame at its "
-                               "start as a frame-0 keyframe at this strength "
-                               "(1 = exact, 0.999 = the model's default, 0 = "
-                               "off). Sequential chunk refines (MMH3 Ultimate "
-                               "Upscale) anchor every chunk this way and do "
-                               "not hallucinate where our unanchored windows "
-                               "did; the anchored row itself is taken from "
-                               "the neighbouring window."}),
-            },
-            "optional": {
-                "prior": ("LATENT", {
-                    "tooltip": "The upscaled joint AV latent the sampler "
-                               "refines (H3 Joint Audio Mask's output). With "
-                               "it wired, each window starting mid-timeline "
-                               "gets the prior's frame at its start as a "
-                               "frame-0 keyframe (anchor_strength)."}),
             },
         }
 
     def patch(self, model, window_seconds, overlap_seconds, fuse_method,
-              vram_headroom_gb=10.0, anchor_strength=0.999, prior=None):
+              vram_headroom_gb=10.0):
         length = fr.steps_for_seconds(window_seconds)
         overlap = fr.steps_for_seconds(overlap_seconds) if float(overlap_seconds) > 0 else 0
         if overlap >= length:
@@ -1312,16 +1162,8 @@ class H3ContextWindows:
                                                float(window_seconds), length))
         import comfy.patcher_extension
         model = model.clone()
-        prior_video = None
-        if prior is not None:
-            prior_video = avpack.unpack_av(prior, name="prior")[0].detach().to("cpu")
-        handler = H3WindowHandler(length, overlap, fuse_method, vram_headroom_gb,
-                                  prior=prior_video, anchor=anchor_strength)
+        handler = H3WindowHandler(length, overlap, fuse_method, vram_headroom_gb)
         model.model_options["context_handler"] = handler
-        if prior_video is not None and handler.anchor > 0:
-            _LOG.info("obvpm.h3 context windows: windows starting mid-timeline get "
-                      "the prior's frame as a frame-0 keyframe at strength %.3f",
-                      handler.anchor)
         model.add_wrapper_with_key(
             comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING,
             "obvpm_h3_context_windows", prepare_sampling_for_window)
@@ -1344,18 +1186,6 @@ def timeline_steps(conds):
             if table and table.get("spans"):
                 return max(int(s) + int(n) for s, n in table["spans"])
     return None
-
-
-def prepare_sampling_unpacked(executor, model, noise_shape, conds, *args, **kwargs):
-    """Core's VRAM estimate for a packed AV latent, with the channels back
-    in their own dim (see prepare_sampling_for_window; here the latent
-    already is one window, so no timeline scaling)."""
-    noise_shape = list(noise_shape)
-    if len(noise_shape) == 3 and noise_shape[1] == 1:
-        import comfy.latent_formats
-        ch = int(comfy.latent_formats.MiniMaxH3Video.latent_channels)
-        noise_shape = [noise_shape[0], ch, max(1, int(noise_shape[2] // ch))]
-    return executor(model, noise_shape, conds, *args, **kwargs)
 
 
 def prepare_sampling_for_window(executor, model, noise_shape, conds, *args, **kwargs):
@@ -1411,201 +1241,6 @@ def prepare_sampling_for_window(executor, model, noise_shape, conds, *args, **kw
 
 
 # ---------------------------------------------------------------------------
-# sequential windows: each a complete sampling, joined by frozen context
-# ---------------------------------------------------------------------------
-
-def sequence_plan(windows, total):
-    """Per window (start, end, owner, frozen): frozen[i] is True where row
-    start+i was finished by an earlier window and is held as context."""
-    done = [False] * total
-    plan = []
-    for s, e, j in windows:
-        frozen = [done[t] for t in range(s, e)]
-        plan.append((s, e, j, frozen))
-        for t in range(s, e):
-            done[t] = True
-    return plan
-
-
-def window_conditioning(conditioning, table, owner, s):
-    """The CONDITIONING one window samples under: the owner clip's stored
-    entries (or the given conditioning without the table), content
-    keyframes moved from the clip's frame 0 to the window's origin."""
-    if table and owner is not None:
-        entries, clip_start = table["conds"][owner], int(table["spans"][owner][0])
-    else:
-        entries, clip_start = conditioning, 0
-    shift = fr.frame_at_latent(clip_start) - fr.frame_at_latent(s)
-    out = []
-    for cross_attn, extras in entries:
-        ex = {k: v for k, v in extras.items() if k != COND_KEY}
-        kfs = ex.get("minimax_keyframes")
-        if kfs:
-            ex["minimax_keyframes"] = [
-                dict(kf, resolved_frame_index=kf.get("resolved_frame_index", 0) + shift)
-                if isinstance(kf, dict) else kf for kf in kfs]
-        out.append([cross_attn, ex])
-    return out
-
-
-class H3JointSequentialRefine:
-    """The joint refine as a sequence of complete samplings, joined by
-    frozen context rather than by blending predictions.
-
-    Measured 2026-09-08 on one timeline, one prior, one noise field and one
-    window length: our per-step windows (the model's prediction blended or
-    cut across windows at every step) hallucinated -- a wireframe rectangle
-    on a forehead, hard points on dappled hair, shimmering eyes -- at any
-    noise level, with or without the turbo LoRA, with a frame-0 keyframe
-    anchor or without; the per-clip refine and MMH3 Ultimate Upscale's
-    sequential chunks, each one complete trajectory, did not. Here every
-    window is sampled to the end before the next begins, and the rows it
-    shares with the finished window before it are held frozen through the
-    noise mask: the model sees the finished texture at every step and
-    continues it (MMH3 joins its spatial tiles the same way), which is a
-    stronger join than a one-frame anchor plus a cross-fade. The noise is
-    one field over the timeline, sliced per window.
-    """
-
-    CATEGORY = "obvpm/h3"
-    FUNCTION = "refine"
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("latent",)
-    DESCRIPTION = (
-        "Refines the upscaled joint latent window by window, each window a "
-        "complete sampling run, the rows shared with the finished window "
-        "before it frozen as context (noise mask). With H3 Joint "
-        "Conditioning on `conditioning`, windows are anchored per clip and "
-        "each samples under its clip's conditioning. Replaces H3 Context "
-        "Windows + the sampler: wire model (with the sigma shift), sampler "
-        "and sigmas as for SamplerCustomAdvanced, the latent from H3 Joint "
-        "Audio Mask, and the output to H3 Joint Store."
-    )
-    OUTPUT_TOOLTIPS = ("The refined joint AV latent. Wire to H3 Joint Store.",)
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("MODEL", {"tooltip": "The H3 model with its sigma shift applied."}),
-                "conditioning": ("CONDITIONING", {"tooltip": "From H3 Joint Conditioning (per-clip table) or any single conditioning."}),
-                "latent": ("LATENT", {"tooltip": "The upscaled joint AV latent from H3 Joint Audio Mask (its audio hold is kept)."}),
-                "noise": ("NOISE", {"tooltip": "One noise field for the whole timeline, sliced per window."}),
-                "sampler": ("SAMPLER",),
-                "sigmas": ("SIGMAS", {"tooltip": "The refine schedule (BasicScheduler with denoise = first sigma)."}),
-                "window_seconds": ("FLOAT", {
-                    "default": 5.0, "min": 0.1, "max": 600.0, "step": 0.25,
-                    "tooltip": "Window length in seconds of picture, rounded to a clip-shaped number of latent steps."}),
-                "overlap_seconds": ("FLOAT", {
-                    "default": 1.25, "min": 0.0, "max": 600.0, "step": 0.25,
-                    "tooltip": "Seconds a window shares with the finished one before it; those rows are frozen context, not resampled."}),
-            },
-            "optional": {
-                "negative": ("CONDITIONING", {"tooltip": "With it, a CFG guider at `cfg`; without, positive only."}),
-                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1}),
-            },
-        }
-
-    def refine(self, model, conditioning, latent, noise, sampler, sigmas,
-               window_seconds, overlap_seconds, negative=None, cfg=1.0):
-        import comfy.samplers
-        import comfy.utils
-        import comfy.model_management
-        import comfy.nested_tensor
-        import latent_preview
-        from tqdm import tqdm
-        video, audio = avpack.unpack_av(latent, name="latent")
-        T, A = int(video.shape[2]), int(audio.shape[-1])
-        length = clip_shaped(fr.steps_for_seconds(window_seconds))
-        overlap = fr.steps_for_seconds(overlap_seconds) if float(overlap_seconds) > 0 else 0
-        overlap = min(int(overlap), length - 1)
-        table = None
-        for entry in conditioning or []:
-            if isinstance(entry[1], dict) and entry[1].get(COND_KEY):
-                table = entry[1][COND_KEY]
-                break
-        windows = layout_windows(T, length, overlap, table)
-        plan = sequence_plan(windows, T)
-        # the given mask (Joint Audio Mask): video all open, audio held
-        mv_all = ma_all = None
-        if latent.get("noise_mask") is not None:
-            mv_all, ma_all = latent["noise_mask"].unbind()
-        full_noise = noise.generate_noise({"samples": latent["samples"]})
-        nv, na = full_noise.unbind()
-        acc = video.clone()
-        # core sizes the model load from the packed [B, 1, N] window shape,
-        # counting the 24 video channels as area (a 24x overestimate that
-        # made it offload every weight and crawl); hand it the window's
-        # area with the channels in their own dim
-        import comfy.patcher_extension
-        model = model.clone()
-        model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING,
-                                   "obvpm_h3_sequential_refine", prepare_sampling_unpacked)
-        with _log_under_bars():
-            _LOG.info("obvpm.h3 sequential refine: %d steps in %d window(s) of %d "
-                      "(overlap %d frozen as context)%s: %s", T, len(windows), length,
-                      overlap, " anchored per clip" if table and table.get("owners") else "",
-                      [(s, e) if j is None else (s, e, j) for s, e, j in windows])
-        show = comfy.utils.PROGRESS_BAR_ENABLED
-        bar = tqdm(total=len(plan), desc="obvpm.h3 sequential refine", leave=False,
-                   dynamic_ncols=True, disable=not show,
-                   bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
-                              "[{elapsed}<{remaining}, {rate_inv_fmt}]")
-        t_all = time.time()
-        try:
-            with _log_under_bars():
-                for k, (s, e, j, frozen) in enumerate(plan):
-                    t0 = time.time()
-                    ta, tb = audio_span(s, e)
-                    tb = A if e == T else min(tb, A)
-                    frozen_t = torch.tensor(frozen, dtype=torch.bool)
-                    mv = torch.ones((1, 1, e - s) + tuple(video.shape[3:]), dtype=torch.float32)
-                    mv[:, :, frozen_t] = 0.0
-                    if mv_all is not None:
-                        mv = mv * mv_all[:, :, s:e].to(mv.dtype)
-                    if ma_all is not None:
-                        ma = ma_all[..., ta:tb].clone().float()
-                    else:
-                        ma = torch.zeros((1, 1) + tuple(audio.shape[2:-1]) + (tb - ta,), dtype=torch.float32)
-                    latent_image = comfy.nested_tensor.NestedTensor(
-                        (acc[:, :, s:e].clone(), audio[..., ta:tb].clone()))
-                    win_noise = comfy.nested_tensor.NestedTensor(
-                        (nv[:, :, s:e].clone(), na[..., ta:tb].clone()))
-                    dm = comfy.nested_tensor.NestedTensor((mv, ma))
-                    cond = window_conditioning(conditioning, table, j, s)
-                    guider = comfy.samplers.CFGGuider(model)
-                    if negative is not None:
-                        guider.set_conds(cond, negative)
-                        guider.set_cfg(cfg)
-                    else:
-                        guider.inner_set_conds({"positive": cond})
-                    callback = latent_preview.prepare_callback(model, int(sigmas.shape[-1]) - 1)
-                    _LOG.debug("obvpm.h3 sequential refine: window %d/%d steps %d..%d, "
-                               "%d frozen row(s)%s", k + 1, len(plan), s, e,
-                               int(frozen_t.sum()), "" if j is None else ", clip %d" % j)
-                    out = guider.sample(win_noise, latent_image, sampler, sigmas,
-                                        denoise_mask=dm, callback=callback,
-                                        disable_pbar=not show, seed=noise.seed)
-                    out = out.to(comfy.model_management.intermediate_device())
-                    ov = out.unbind()[0] if getattr(out, "is_nested", False) else out
-                    free = ~frozen_t
-                    idx = torch.nonzero(free).flatten()
-                    acc[:, :, s + idx] = ov[:, :, idx].to(device=acc.device, dtype=acc.dtype)
-                    bar.set_description_str("obvpm.h3 sequential refine (steps %d..%d%s, %.0fs)"
-                                            % (s, e, "" if j is None else ", clip %d" % j,
-                                               time.time() - t0), refresh=False)
-                    bar.update(1)
-                    del out, latent_image, win_noise, guider
-                    comfy.model_management.soft_empty_cache()
-        finally:
-            bar.close()
-        with _log_under_bars():
-            _LOG.info("obvpm.h3 sequential refine: %d window(s) in %s",
-                      len(plan), _hms(time.time() - t_all))
-        return (avpack.pack_av(acc, audio, name="joint"),)
-
-
-# ---------------------------------------------------------------------------
 # store and slice
 # ---------------------------------------------------------------------------
 
@@ -1614,8 +1249,8 @@ class H3JointStore:
 
     CATEGORY = "obvpm/h3"
     FUNCTION = "store"
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("joint_path", "profile_folder")
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("joint_path",)
     OUTPUT_NODE = True
     DESCRIPTION = (
         "Saves the jointly refined timeline latent as <base_folder>/_upscale/"
@@ -1700,7 +1335,7 @@ class H3JointStore:
                                    "joint file -- this should not happen.")
             _LOG.info("obvpm.h3 joint: reusing %s (same timeline); the "
                       "sampler was not run", path)
-            return ("%s/%s" % (rel, JOINT_FILE), rel)
+            return ("%s/%s" % (rel, JOINT_FILE),)
         video, audio = avpack.unpack_av(samples, name="samples")
         if video.shape[2] != joint["total_steps"]:
             raise ValueError("H3 Joint Store: the sampled latent has %d steps "
@@ -1726,7 +1361,7 @@ class H3JointStore:
         mctx.write_sidecar(path, video, audio, meta, blobs={JOINT_BLOB: record})
         _LOG.info("obvpm.h3 joint: stored %d steps for %d clip(s) -> %s",
                   video.shape[2], len(joint["clips"]), path)
-        return ("%s/%s" % (rel, JOINT_FILE), rel)
+        return ("%s/%s" % (rel, JOINT_FILE),)
 
 
 _CACHE = {}
