@@ -1,4 +1,4 @@
-"""comfyui-obvpm-h3: non-linear MiniMax H3 clip composition.
+"""comfyui-obvpm-timeline: non-linear clip composition, MiniMax H3 today.
 
 Takes are clip pairs (MP4 + .mctx.safetensors latent sidecar) with
 content-addressed lineage; continuation runs through the pins pipeline

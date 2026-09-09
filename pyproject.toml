@@ -1,6 +1,6 @@
 [project]
-name = "comfyui-obvpm-h3"
-description = "Non-linear clip composition for MiniMax H3: takes carry their latents in a sidecar, so a generation can continue an earlier one exactly (extend, prepend, bridge), and a timeline assembles them by smart-cut. Companion to comfyui-obvpm."
+name = "comfyui-obvpm-timeline"
+description = "Non-linear clip composition on a timeline (MiniMax H3 today): takes carry their latents in a sidecar, so a generation can continue an earlier one exactly (extend, prepend, bridge), and a timeline assembles them by smart-cut. Companion to comfyui-obvpm."
 version = "0.1.0"
 license = { file = "LICENSE" }
 readme = "README.md"
@@ -13,10 +13,10 @@ requires-python = ">=3.9"
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/chanon/comfyui-obvpm-h3"
+Repository = "https://github.com/chanon/comfyui-obvpm-timeline"
 #  Used by Comfy Registry https://comfyregistry.org
 
 [tool.comfy]
 PublisherId = "chanon"
-DisplayName = "comfyui-obvpm-h3"
+DisplayName = "comfyui-obvpm-timeline"
 Icon = ""

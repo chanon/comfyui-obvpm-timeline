@@ -1,7 +1,12 @@
-# comfyui-obvpm-h3
+# comfyui-obvpm-timeline
 
-Non-linear clip composition for **MiniMax H3** in ComfyUI. Build a long
-piece out of several generations, without the joins showing.
+Non-linear clip composition in ComfyUI: build a long piece out of
+several generations, without the joins showing. The model supported
+today is **MiniMax H3**; the timeline, the assembler and the refine loop
+are model-independent, and the H3-specific parts (the frame grid, the
+latent anchoring, the sidecar fields) are the ones a second model would
+bring its own version of. Node names and wire types keep their `H3`
+prefix for compatibility with saved workflows and sidecars.
 
 Every take is saved as a **clip pair** — the MP4 plus a
 `.mctx.safetensors` sidecar holding its full latents and its lineage.
@@ -25,6 +30,14 @@ Seams are **measured and repairable**: each join reports whether motion
 actually flows through it, and level lock / crossfade / audio de-click
 can be set per join.
 
+A finished cut can be **upscaled and refined as one piece**. The
+timeline's clips are laid onto a single latent at their true positions,
+upscaled, and re-sampled together in overlapping windows, each under the
+conditioning its clip was generated with, so fine texture is decided
+across the joins rather than per clip and the refined cut has no seams.
+The result is sliced back into refined takes, the run resumes where it
+stopped, and the same timeline plays it.
+
 Full guide: **[docs/h3.md](docs/h3.md)** · per-node reference:
 **[docs/h3-nodes.md](docs/h3-nodes.md)**
 
@@ -34,7 +47,7 @@ Clone (or copy) this folder into `ComfyUI/custom_nodes`:
 
 ```
 cd ComfyUI/custom_nodes
-git clone https://github.com/chanon/comfyui-obvpm-h3
+git clone https://github.com/chanon/comfyui-obvpm-timeline
 ```
 
 Restart ComfyUI. No extra Python dependencies are required. A ComfyUI
@@ -47,6 +60,14 @@ The example workflows also use the companion pack
 reference-image loader (Load Images & Compose), Value Presets, gates,
 lazy switches and bundles. Install both for the full experience; this
 pack's nodes run without it.
+
+The upscale-and-refine workflow also needs a latent upscaler for H3. The
+example uses
+**[Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler)**
+(the 3D node) with its temporal chunking left **on**: the upscaler
+normalises over time and was trained on short clips, so upscaling a
+whole timeline in one pass gives the refine a prior it hallucinates on.
+See [the joint refine](docs/h3-nodes.md#the-joint-refine).
 
 Every node in this pack is listed with **(obvpm)** after its name, so
 searching the node menu for `obvpm` finds all of them. The names used

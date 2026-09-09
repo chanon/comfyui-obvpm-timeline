@@ -41,3 +41,15 @@ adopted here (primarily `frames.py`), with thanks:
   its rationale (round(frames/24*40) does not distribute over addition).
 - The trim-dilemma rationale (latent-domain concatenation is unsound),
   which is why trimming here happens on decoded frames.
+
+## Comfyui-MMH3-UltimateUpscale (MIT)
+
+Copyright (c) 2026 bbaudio-2025
+https://github.com/bbaudio-2025/Comfyui-MMH3-UltimateUpscale
+
+A sequential chunked upscale-and-refine for H3. No code is vendored. It
+served as the control in the 2026-09-08 investigation recorded in
+`docs/joint-refine-investigation.md`: refining the same pair of clips
+with the same conditioning and seed, it hallucinated on our
+whole-timeline upscaled prior and was clean with its own per-chunk
+upscale, which is what located the fault in the upscaling stage.
