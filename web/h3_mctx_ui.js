@@ -8386,6 +8386,71 @@ function buildResultPreview(node) {
         background: "#000",
     });
 
+    // The LIVE picture while a run this preview owns is sampling: KJ's
+    // Model Preview Override pushes each step's preview over the
+    // websocket as a `kj_preview_override` event (a JPEG, an animated
+    // WebP, or an MP4 when NVENC is available), tagged with ITS node id
+    // and painted on that node by its own script. Listening here as
+    // well puts the same picture in the box the result will take over,
+    // so the two previews read as one panel and the KJ node can be
+    // collapsed. No KJ node in the graph -> no events -> nothing here
+    // changes. An <img> plays an animated WebP by itself; MP4 needs
+    // the <video>.
+    const liveImg = document.createElement("img");
+    const liveVideo = document.createElement("video");
+    liveVideo.muted = true;
+    liveVideo.loop = true;
+    liveVideo.autoplay = true;
+    liveVideo.playsInline = true;
+    for (const el of [liveImg, liveVideo]) {
+        Object.assign(el.style, {
+            width: "100%", flex: "1", minHeight: "0",
+            objectFit: "contain", borderRadius: "4px", display: "none",
+            background: "#000",
+        });
+    }
+    let liveUrl = null;          // the object URL on screen, if any
+    let liveStep = null;         // {step, total} of the last frame
+    function liveClear() {
+        liveImg.style.display = "none";
+        liveVideo.style.display = "none";
+        liveVideo.pause();
+        liveImg.removeAttribute("src");
+        liveVideo.removeAttribute("src");
+        if (liveUrl) URL.revokeObjectURL(liveUrl);
+        liveUrl = null;
+        liveStep = null;
+    }
+    function liveShow(data) {
+        const mime = typeof data.mime === "string" ? data.mime : "image/jpeg";
+        let blob;
+        try {
+            const bin = atob(data.image);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            blob = new Blob([bytes], { type: mime });
+        } catch (err) {
+            return;
+        }
+        const url = URL.createObjectURL(blob);
+        const old = liveUrl;
+        liveUrl = url;
+        // the result of the previous run gives way to the live picture;
+        // stopClock() brings it back if this run leaves no result
+        video.style.display = "none";
+        if (mime === "video/mp4") {
+            liveImg.style.display = "none";
+            liveVideo.src = url;
+            liveVideo.style.display = "block";
+            void liveVideo.play?.().catch?.(() => {});
+        } else {
+            liveVideo.style.display = "none";
+            liveImg.src = url;
+            liveImg.style.display = "block";
+        }
+        if (old) URL.revokeObjectURL(old);
+    }
+
     const strip = document.createElement("div");
     Object.assign(strip.style, {
         display: "none", gap: "4px", alignItems: "stretch",
@@ -8438,7 +8503,7 @@ function buildResultPreview(node) {
 
     const rpProgress = tlProgressBar();
     const dropRpProgress = tlOnProgress(() => RP_PREVIEW_NAME, rpProgress);
-    container.append(video, strip, rpProgress.el, btnRow, status);
+    container.append(liveImg, liveVideo, video, strip, rpProgress.el, btnRow, status);
     const widget = node.addDOMWidget("mctx_result", "div", container,
                                      { hideOnZoom: false });
     widget.serialize = false;
@@ -8696,6 +8761,9 @@ function buildResultPreview(node) {
         }
         updateActionBtns(); // owns btnRow visibility too
         video.style.display = "none";
+        // the result arrives while the run is still finishing: the live
+        // picture has served its purpose the moment there is a take
+        liveClear();
         status.style.color = PAL.sub;
         status.textContent = "building preview…";
 
@@ -8930,8 +8998,21 @@ function buildResultPreview(node) {
         const s = Math.floor((Date.now() - runStartedAt) / 1000);
         status.textContent = "new generation running… " +
             Math.floor(s / 60) + ":" +
-            String(s % 60).padStart(2, "0");
+            String(s % 60).padStart(2, "0") +
+            (liveStep && liveStep.total
+                ? " · step " + liveStep.step + "/" + liveStep.total : "");
     }
+    // a live frame is shown only for the run being timed: the event is
+    // global, and another workflow's sampling must not paint here
+    const onLivePreview = (e) => {
+        const data = e?.detail;
+        if (!data || runStartedAt === null) return;
+        if (typeof data.step === "number" && typeof data.total === "number") {
+            liveStep = { step: data.step, total: data.total };
+            runTick();
+        }
+        if (typeof data.image === "string" && data.image) liveShow(data);
+    };
     function startClock(promptId, elapsedKnown) {
         runPromptId = promptId;
         runElapsedKnown = elapsedKnown;
@@ -8971,6 +9052,12 @@ function buildResultPreview(node) {
             status.textContent.startsWith("generation running")) {
             status.textContent = "";
         }
+        // the live picture goes with the run; the previous result comes
+        // back until (and unless) a new one renders over it
+        if (liveUrl) {
+            liveClear();
+            if (video.getAttribute("src")) video.style.display = "block";
+        }
     }
     const onRunEnd = (e) => {
         const id = e?.detail?.prompt_id ?? null;
@@ -8997,6 +9084,7 @@ function buildResultPreview(node) {
     api.addEventListener("execution_error", onRunEnd);
     api.addEventListener("execution_interrupted", onRunEnd);
     api.addEventListener("status", onQueueStatus);
+    api.addEventListener("kj_preview_override", onLivePreview);
 
     // The Result Preview plays the take with the SAME seam repair the
     // export will apply, taken from the Timeline that owns this folder.
@@ -9249,6 +9337,8 @@ function buildResultPreview(node) {
         api.removeEventListener("execution_error", onRunEnd);
         api.removeEventListener("execution_interrupted", onRunEnd);
         api.removeEventListener("status", onQueueStatus);
+        api.removeEventListener("kj_preview_override", onLivePreview);
+        liveClear();
         dropRpProgress();
         video.pause();
         video.removeAttribute("src");

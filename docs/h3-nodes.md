@@ -376,6 +376,15 @@ lineage-derived position), **✕ delete** (removes the take's MP4 and
 sidecar from disk, after confirmation), **dismiss** (hides the
 buttons).
 
+**Live preview while sampling.** With KJNodes' Model Preview Override
+on the sampler's model, the frames it pushes each step are shown in
+this panel too, in the box the result takes over when the take lands,
+with the step count on the status line. That node can then be
+collapsed: it stays the place where the preview's frame count and
+resolution are set, but nothing needs to be looked at there. Only the
+run this preview owns is shown, and without the KJ node the panel
+behaves exactly as before.
+
 ## H3 MCtx Assemble
 
 The in-graph assembler: same sequence format as the Timeline, but an
