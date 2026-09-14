@@ -40,13 +40,5 @@ PINSPECS = "OBVPM_H3_PINSPECS"
 # the RESOLVED pins Apply produces: what was actually sliced
 PINS = "OBVPM_H3_PINS"
 
-# the reference PIXELS a take was conditioned on, on their way past
-# H3RecordReferences to the save node -- see refstore.py
-REFS = "OBVPM_H3_REFS"
-
-# the upscale loop's open->close handshake: which node opened it, and the
-# iteration state it carries (see nodes_loop.py)
-LOOP = "OBVPM_H3_LOOP"
-
 # where each clip sits on a jointly refined timeline latent (nodes_joint.py)
 JOINT = "OBVPM_H3_JOINT"

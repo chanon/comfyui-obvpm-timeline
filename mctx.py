@@ -360,9 +360,8 @@ def make_mctx(self_id, video, audio, meta, origin="sampled", clip=None):
     into a file by accident.
 
     It is here because everything a take owns is derived from its clip
-    path -- the sidecar, the `.cond`, the recorded references -- so a
-    node holding an MCTX can reach all of them without a second wire that
-    might name a different clip.
+    path -- the sidecar, the `.cond` -- so a node holding an MCTX can
+    reach both without a second wire that might name a different clip.
     """
     return {
         "self_id": self_id,

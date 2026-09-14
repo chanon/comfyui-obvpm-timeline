@@ -22,10 +22,7 @@ import tempfile
 
 import folder_paths
 
-from . import condload
 from . import condstore
-from . import nodes_refs
-from . import refstore
 from . import frames as fr
 from . import wiretypes as wt
 from . import mctx
@@ -95,8 +92,38 @@ def _write_audio_raw(audio, frames):
     return path, sample_rate, int(wf.shape[0])
 
 
-def _encode_with_ffmpeg(exe, path, images, audio, crf, metadata=None):
+def encode_mp4_stream(path, blocks, frames, height, width, audio, crf,
+                      metadata=None):
+    """Encode `frames` frames that arrive as an iterable of [n, H, W, 3]
+    float blocks, without ever holding them all.
+
+    The streaming entry for anything that decodes more picture than fits
+    in memory (H3 Joint VAE Decode and Save decodes a whole timeline a few seconds at
+    a time). ffmpeg reads the blocks off a pipe as they come; without an
+    ffmpeg binary the in-process encoder needs the tensor whole, so the
+    blocks are gathered first -- correct, and a warning says what it
+    costs.
+    """
+    exe = _ffmpeg_exe()
+    if exe:
+        _encode_with_ffmpeg(exe, path, blocks, audio, crf, metadata=metadata,
+                            frames=frames, height=height, width=width)
+        return
+    import torch
+    _LOG.warning("obvpm.h3: no ffmpeg binary, so %d frames are gathered in "
+                 "memory for the in-process encoder (%.1f GB); install ffmpeg "
+                 "or set OBVPM_FFMPEG_PATH to stream instead", frames,
+                 frames * height * width * 3 * 4 / 1e9)
+    _encode_with_pyav(path, torch.cat([b for b in blocks], 0), audio, crf,
+                      metadata=metadata)
+
+
+def _encode_with_ffmpeg(exe, path, images, audio, crf, metadata=None,
+                        frames=None, height=None, width=None):
     """Pipe raw frames to ffmpeg (the mechanism VHS Video Combine uses).
+
+    `images` is one [F, H, W, 3] tensor, or -- with `frames`, `height`
+    and `width` given -- any iterable of such blocks, written in order.
 
     Encoder settings are kept identical to the in-process path -- libx264,
     default preset, same crf, yuv420p -- so the two produce the same
@@ -105,8 +132,10 @@ def _encode_with_ffmpeg(exe, path, images, audio, crf, metadata=None):
     differs, so clips saved before and after this change must remain
     interchangeable (verified byte-identical extradata).
     """
-    frames = int(images.shape[0])
-    height, width = int(images.shape[1]), int(images.shape[2])
+    if frames is None:
+        frames = int(images.shape[0])
+        height, width = int(images.shape[1]), int(images.shape[2])
+        images = [images]
     head = [exe, "-v", "error", "-nostdin", "-y"]
     meta_path = _ffmetadata_file(metadata) if metadata else None
     if meta_path:
@@ -135,19 +164,23 @@ def _encode_with_ffmpeg(exe, path, images, audio, crf, metadata=None):
 
         proc = subprocess.Popen(args, stdin=subprocess.PIPE,
                                 stderr=subprocess.PIPE)
+        written = 0
         try:
-            for lo in range(0, frames, _ENCODE_CHUNK):
-                block = images[lo:lo + _ENCODE_CHUNK]
-                # ROUND, not truncate. .byte() truncates toward zero, so
-                # every pixel lost an average half level and a
-                # decode->encode->decode round trip came out a full luma
-                # darker than its source. Copied packets do not go
-                # through this, so a re-encoded bridge sat visibly below
-                # the stream-copied frames on either side of it -- the
-                # same class of artefact the level lock exists to remove.
-                block = (block * 255).round().clamp(0, 255).byte()
-                block = block.cpu().numpy()
-                proc.stdin.write(block.tobytes())
+            for part in images:
+                for lo in range(0, int(part.shape[0]), _ENCODE_CHUNK):
+                    block = part[lo:lo + _ENCODE_CHUNK]
+                    # ROUND, not truncate. .byte() truncates toward zero,
+                    # so every pixel lost an average half level and a
+                    # decode->encode->decode round trip came out a full
+                    # luma darker than its source. Copied packets do not
+                    # go through this, so a re-encoded bridge sat visibly
+                    # below the stream-copied frames on either side of it
+                    # -- the same class of artefact the level lock exists
+                    # to remove.
+                    block = (block * 255).round().clamp(0, 255).byte()
+                    block = block.cpu().numpy()
+                    proc.stdin.write(block.tobytes())
+                    written += int(block.shape[0])
         except (BrokenPipeError, OSError):
             pass  # ffmpeg died early; its stderr says why
         finally:
@@ -162,6 +195,9 @@ def _encode_with_ffmpeg(exe, path, images, audio, crf, metadata=None):
                                % (proc.returncode, err[:400]))
         if err:
             _LOG.warning("obvpm.h3: ffmpeg: %s", err[:400])
+        if written != frames:
+            raise RuntimeError("obvpm.h3: %d frames were written to %s but "
+                               "%d were promised" % (written, path, frames))
     finally:
         for tmp in (audio_path, meta_path):
             if not tmp:
@@ -349,6 +385,14 @@ def _save_conditioning(video_path, conditioning, self_id, enabled=True):
     latents in size, it is scaffolding that can be deleted once a
     timeline has been refined, and folding it in would widen the crash
     window of the write that makes a take real.
+
+    It is also the ONLY record of what the take was conditioned on. An
+    earlier design kept the reference pixels beside it as a recipe to
+    re-encode from, and was dropped when reference adapters ("refmods",
+    pooled or trained latents with no pixel origin) arrived: once part
+    of the conditioning has no recipe, the artefact is the only faithful
+    copy, and a partial recipe rebuilds something that looks right and
+    is missing a block.
     """
     if not conditioning:
         return None
@@ -357,8 +401,9 @@ def _save_conditioning(video_path, conditioning, self_id, enabled=True):
         # otherwise, and the consequence only shows up much later, when
         # an upscale pass refuses a clip the user thought was covered.
         _LOG.info("obvpm.h3: %s -- conditioning is wired but "
-                  "save_conditioning is off, so this take will NOT be "
-                  "refinable", os.path.basename(video_path))
+                  "save_conditioning is off, so this take can NOT be "
+                  "refined later; the .cond is the only record of its "
+                  "conditioning", os.path.basename(video_path))
         return None
     clean, dropped = _strip_lineage(conditioning)
     path = condstore.cond_path(video_path)
@@ -371,61 +416,15 @@ def _save_conditioning(video_path, conditioning, self_id, enabled=True):
     return path
 
 
-def _save_references(video_path, refs, conditioning, prompt=None, meta=None):
-    """Write the take's recorded reference pixels, or say why we did not.
-
-    A MISMATCH WARNS AND STILL SAVES. Refusing here would throw away a
-    render that is otherwise perfectly good, to punish a wiring slip that
-    only costs the take its refinability -- a far worse trade than the
-    one it prevents. The message has to be enough to fix the graph.
-    """
-    if not refs or not (refs.get("items")):
-        return None
-    problems = nodes_refs.verify(refs, conditioning)
-    if problems:
-        _LOG.warning("obvpm.h3: %s -- NOT recording references: %s. The take "
-                     "saves normally; keep its .cond to refine it",
-                     os.path.basename(video_path), "; ".join(problems))
-        return None
-    # the prompt text and sizing are read HERE, while the graph that
-    # made them is still in front of the user, rather than at refine
-    # time when a failure would be months old and unfixable
-    recipe = condload.recipe_from_prompt(prompt, meta)
-    if not recipe.get("prompt"):
-        _LOG.warning("obvpm.h3: %s -- recorded references, but the prompt "
-                     "text could not be read from the graph, so they cannot "
-                     "rebuild a conditioning on their own. Keep this take's "
-                     ".cond", os.path.basename(video_path))
-    path = refstore.save_bundle(video_path, refs, meta=recipe)
-    if path is None:
-        return None
-    count, size = refstore.store_size(os.path.dirname(os.path.abspath(video_path)))
-    _LOG.info("obvpm.h3: recorded %s beside %s (reference store: %d file(s), "
-              "%.1f MB) -- this take can be refined without its .cond",
-              nodes_refs.describe(refs), os.path.basename(video_path),
-              count, size / 1e6)
-    return path
-
-
-REFS_TOOLTIP = (
-    "Optional: the reference pixels from H3 Record References. Recorded "
-    "beside the clip so an upscale/refine pass can rebuild the same "
-    "conditioning at a larger size. Unlike the conditioning itself this "
-    "is a few megabytes, shared across every take using the same "
-    "references, and it does not decay -- rebuilding references from the "
-    "prompt graph instead depends on the source files still being there "
-    "and on the loader nodes still behaving the same way."
-)
-
-
 COND_TOOLTIP = (
     "Optional: the CONDITIONING this take was sampled with, stored "
     "beside the clip as .cond.safetensors. An upscale/refine pass has "
     "to sample the same clip again at a larger size, and it needs the "
-    "same conditioning to do it -- rebuilding that from the prompt "
-    "graph would mean re-running the reference images through whatever "
-    "made them, which can silently differ. Unwired = the take saves "
-    "normally and simply cannot be refined later."
+    "same conditioning to do it -- text, reference images and audio, "
+    "and any refmods applied on top. Rebuilding that from the prompt "
+    "graph would mean re-running everything that made it, which can "
+    "silently differ. Unwired = the take saves normally and simply "
+    "cannot be refined later."
 )
 
 COND_SAVE_TOOLTIP = (
@@ -677,7 +676,6 @@ class H3SaveVideoWithMCtx:
                                "the crossfade covers sound as well as "
                                "picture."}),
                 "conditioning": ("CONDITIONING", {"tooltip": COND_TOOLTIP}),
-                "refs": (wt.REFS, {"tooltip": REFS_TOOLTIP}),
             },
             # Stored as sidecar blobs, not in the header -- see mctx.py.
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
@@ -687,7 +685,7 @@ class H3SaveVideoWithMCtx:
              save_conditioning=True,
              audio=None, pins=None, metadata="", prompt=None,
              extra_pnginfo=None, untrimmed_images=None,
-             untrimmed_audio=None, conditioning=None, refs=None):
+             untrimmed_audio=None, conditioning=None):
         video_lat, audio_lat = unpack_av(samples, name="samples")
         raw_steps = int(video_lat.shape[2])
         raw_frames = fr.pixel_frames(raw_steps)
@@ -779,7 +777,6 @@ class H3SaveVideoWithMCtx:
             blobs=sidecar_blobs)
         _save_conditioning(video_path, conditioning, self_id,
                            save_conditioning)
-        _save_references(video_path, refs, conditioning, prompt, meta)
         _LOG.info("obvpm.h3: saved take %s (+ sidecar %s): %d delivered of "
                   "%d raw frames, %s%s%s", video_path,
                   os.path.basename(sidecar),
@@ -881,15 +878,13 @@ class H3SaveMCtxForVideo:
                     "tooltip": "Optional provenance JSON, stored verbatim "
                                "as user_meta (see the all-in-one Save)."}),
                 "conditioning": ("CONDITIONING", {"tooltip": COND_TOOLTIP}),
-                "refs": (wt.REFS, {"tooltip": REFS_TOOLTIP}),
             },
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
 
     def save_sidecar(self, video_path, samples, save_conditioning=True,
                      pins=None, metadata="",
-                     prompt=None, extra_pnginfo=None, conditioning=None,
-                     refs=None):
+                     prompt=None, extra_pnginfo=None, conditioning=None):
         path = self._resolve_path(video_path)
         video_lat, audio_lat = unpack_av(samples, name="samples")
         raw_steps = int(video_lat.shape[2])
@@ -953,7 +948,6 @@ class H3SaveMCtxForVideo:
             blobs=_workflow_blobs(prompt, extra_pnginfo))
         _save_conditioning(path, conditioning, self_id,
                            save_conditioning)
-        _save_references(path, refs, conditioning, prompt, meta)
         _LOG.info("obvpm.h3: paired sidecar %s to externally saved %s (%s)",
                   os.path.basename(sidecar), path, relation or "root")
         return (sidecar,)
@@ -1046,7 +1040,7 @@ class H3TrimAndSaveVideoWithMCtx:
     def trim_and_save(self, images, samples, base_folder, filename_prefix,
                       crf, save_conditioning=True,
                       audio=None, pins=None, metadata="", prompt=None,
-                      extra_pnginfo=None, conditioning=None, refs=None):
+                      extra_pnginfo=None, conditioning=None):
         from .nodes_pins import H3TrimPinned
         raw_images, raw_audio = images, audio
         if pins:
@@ -1057,5 +1051,5 @@ class H3TrimAndSaveVideoWithMCtx:
             audio=audio, pins=pins, metadata=metadata, prompt=prompt,
             extra_pnginfo=extra_pnginfo,
             untrimmed_images=raw_images, untrimmed_audio=raw_audio,
-            conditioning=conditioning, refs=refs)
+            conditioning=conditioning)
         return (path, images, audio)

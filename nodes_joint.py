@@ -19,22 +19,22 @@ several prompts. Texture decisions are shared across every join. Per
 step the model runs once per window, so a chain costs one pass over its
 length plus the overlaps; memory is one window's worth.
 
-The sampled timeline is written to disk once and then sliced back into
-the clips' own raw spans inside the upscale loop, which decodes, trims
-and saves each as a refined take and keeps the profile manifest, so H3
-Assemble Upscale plays the cut unchanged.
+The sampled timeline IS the cut -- every row is the clip the cut shows
+there -- so it is decoded straight into one finished video by H3 Joint
+VAE Decode and Save (nodes_render.py), a few seconds at a time, and
+saved as a take of its own that can go back on a timeline and be
+refined again.
 
-Nodes, in wiring order: H3 Joint Latent (timeline -> one latent), H3
+Nodes, in wiring order: H3 Join Latents (timeline -> one latent), H3
 Joint Conditioning (every clip's conditioning, for the window handler),
-H3 Joint Audio Mask (hold the finished soundtrack), H3 Context Windows
-(the model patch), H3 Joint Store (the sampled timeline -> disk), and
-inside the loop H3 Joint Slice (one clip's span back out, with trim-only
-pins mirroring how the take was made).
+H3 Joint Audio Mask (hold the finished soundtrack), H3 Context Windowing
+(the model patch), and H3 Joint VAE Decode and Save (the sampled timeline -> MP4).
 """
 
 import contextlib
 import logging
 import os
+import re
 import time
 
 import torch
@@ -44,13 +44,10 @@ from . import condload
 from . import frames as fr
 from . import mctx
 from . import nodes_load
-from . import upscale
 from . import wiretypes as wt
 
 _LOG = logging.getLogger("obvpm.h3")
 
-JOINT_FILE = "joint.mctx.safetensors"
-JOINT_BLOB = "joint"
 # The key under which the sampler's CONDITIONING carries every clip's own
 # conditioning for the window handler. Core copies every key of a
 # conditioning entry's extras into the cond dict and hands only
@@ -58,6 +55,45 @@ JOINT_BLOB = "joint"
 # sampler already has and never reaches the model itself.
 COND_KEY = "obvpm_h3_joint"
 
+
+# ---------------------------------------------------------------------------
+# the timeline text
+# ---------------------------------------------------------------------------
+
+# a sequence line's tail: ` @ enter`, ` @ enter..exit`, ` @ ..exit`
+_MARKER = re.compile(r"^(\s*@\s*)(\d*)(\.\.)?(\d*)(?=\s|\[|$)")
+
+
+def parse_sequence(text):
+    """The timeline's `sequence` widget -> clip paths, in delivery order.
+
+    The same shape H3Assemble reads: one output-relative clip per line,
+    `# ...` ignored, and an optional ` @ N` cut marker which is about
+    where a clip ENTERS the cut and is not part of its identity.
+    """
+    clips = []
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        clips.append(line.split("@")[0].strip())
+    return [c for c in clips if c]
+
+
+def parse_sequence_lines(text):
+    """The same lines `parse_sequence` reads, markers still attached.
+
+    Aligned with it by construction -- same filter, same order -- so
+    position N in one is position N in the other.
+    """
+    out = []
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.split("@")[0].strip():
+            out.append(line)
+    return out
 
 # ---------------------------------------------------------------------------
 # the timeline as one latent
@@ -89,7 +125,7 @@ def marker_starts(lines, headers):
     starts, t = [], 0
     for line, header in zip(lines, headers):
         suffix = line[len(line.split("@")[0].rstrip()):]
-        m = upscale._MARKER.match(suffix)
+        m = _MARKER.match(suffix)
         enter = int(m.group(2)) if m and m.group(2) else 0
         exit_ = int(m.group(4)) if m and m.group(3) and m.group(4) else None
         delivered = int(header.get("delivered_frames", 0) or 0)
@@ -199,7 +235,7 @@ def timeline_layout(lines, headers, audio_ticks):
         s = fr.steps_for_frames(rel)
         if s is None:
             raise ValueError(
-                "H3 Joint Latent: a clip starts %d frames into the timeline, "
+                "H3 Join Latents: a clip starts %d frames into the timeline, "
                 "which is not on the latent grid; the joint latent needs "
                 "every clip on one grid (masked/both chains are)." % rel)
         n = fr.frames_to_latents(int(header.get("raw_frames", 0) or 0))
@@ -264,10 +300,10 @@ def assemble(videos, audios, layout):
     for i, (v, a) in enumerate(zip(videos, audios)):
         s, n = layout["steps"][i]
         if v.shape[2] != n:
-            raise ValueError("H3 Joint Latent: clip %d's latent has %d steps "
+            raise ValueError("H3 Join Latents: clip %d's latent has %d steps "
                              "but its header says %d" % (i, v.shape[2], n))
         if tuple(v.shape[3:]) != tuple(v0.shape[3:]):
-            raise ValueError("H3 Joint Latent: clip %d is %s, clip 0 is %s; "
+            raise ValueError("H3 Join Latents: clip %d is %s, clip 0 is %s; "
                              "one timeline needs one size"
                              % (i, tuple(v.shape[3:]), tuple(v0.shape[3:])))
         mine = v_owner[s:s + n] == i
@@ -300,7 +336,7 @@ def assemble(videos, audios, layout):
                   "another clip; kept theirs (rel diff %.4f)", i, len(theirs), rel)
     if not v_written.all():
         holes = torch.nonzero(~v_written).flatten().tolist()
-        raise ValueError("H3 Joint Latent: the timeline has gaps at latent "
+        raise ValueError("H3 Join Latents: the timeline has gaps at latent "
                          "step(s) %s -- clips that do not touch cannot be "
                          "refined as one. Refine such a timeline in runs, "
                          "or bridge the gap." % holes[:12])
@@ -319,18 +355,19 @@ class H3JointLatent:
     CATEGORY = "obvpm/h3"
     FUNCTION = "build"
     RETURN_TYPES = ("LATENT", wt.JOINT)
-    RETURN_NAMES = ("latent", "joint")
+    RETURN_NAMES = ("latent", "layout")
     DESCRIPTION = (
         "Lays every clip of the timeline onto ONE raw AV latent at its true "
         "position (held windows coincide), for the joint refine: upscale it "
-        "as one, sample it as one under H3 Context Windows, store it with H3 "
-        "Joint Store, and let the loop slice each clip's span back out. "
-        "Texture is then decided across the joins, not per clip."
+        "as one, sample it as one under H3 Context Windowing, and render it "
+        "as one finished video with H3 Joint VAE Decode and Save. Texture is then "
+        "decided across the joins, not per clip."
     )
     OUTPUT_TOOLTIPS = (
-        "The joint raw AV latent (video + audio), for the upscaler.",
+        "The joint raw AV latent (video + audio), for the upscaler -- and "
+        "for H3 Joint VAE Decode and Save's source_audio when the sound is re-sampled.",
         "Where each clip sits on it. Wire to H3 Joint Conditioning and H3 "
-        "Joint Store.",
+        "Joint VAE Decode and Save.",
     )
 
     @classmethod
@@ -351,10 +388,10 @@ class H3JointLatent:
         return float("nan")
 
     def build(self, sequence):
-        clips = upscale.parse_sequence(sequence)
-        lines = upscale.parse_sequence_lines(sequence)
+        clips = parse_sequence(sequence)
+        lines = parse_sequence_lines(sequence)
         if not clips:
-            raise ValueError("H3 Joint Latent: the sequence is empty.")
+            raise ValueError("H3 Join Latents: the sequence is empty.")
         headers = clip_headers(clips)
         videos, audios = [], []
         for clip in clips:
@@ -388,8 +425,8 @@ class H3JointConditioning:
     RETURN_NAMES = ("conditioning",)
     DESCRIPTION = (
         "Loads the conditioning each clip of the timeline was generated "
-        "with (its .cond, or a rebuild from its recorded references) and "
-        "hands them to the sampler as one CONDITIONING: H3 Context Windows "
+        "with (its saved .cond) and hands them to the sampler as one "
+        "CONDITIONING: H3 Context Windowing "
         "samples every window under the conditioning of the clip that owns "
         "most of it, so a timeline of several prompts and reference sets "
         "stays several. Wire to the guider/sampler."
@@ -400,69 +437,100 @@ class H3JointConditioning:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "joint": (wt.JOINT, {"tooltip": "From H3 Joint Latent."}),
-            },
-            "optional": {
-                "clip": ("CLIP", {
-                    "lazy": True,
-                    "tooltip": "Needed only for a clip with no .cond that "
-                               "recorded its references. Must be the text "
-                               "encoder the takes were generated with. Lazy: "
-                               "not loaded when every clip has a .cond."}),
-                "vae": ("VAE", {
-                    "lazy": True,
-                    "tooltip": "Video VAE, for the same rebuild. Lazy."}),
-                "audio_vae": ("VAE", {
-                    "lazy": True,
-                    "tooltip": "Audio VAE, for a rebuild with audio "
-                               "references. Lazy."}),
+                "layout": (wt.JOINT, {"tooltip": "From H3 Join Latents."}),
             },
         }
 
-    @staticmethod
-    def _needs_models(joint):
-        for clip in joint["clips"]:
-            try:
-                have = condload.describe_sources(nodes_load.resolve_clip_path(clip))
-            except Exception:
-                return False
-            if not have["cond"] and have["refs"]:
-                return True
-        return False
-
-    def check_lazy_status(self, joint, clip=None, vae=None, audio_vae=None, **_):
-        if not self._needs_models(joint):
-            return []
-        return [name for name, value in (("clip", clip), ("vae", vae),
-                                         ("audio_vae", audio_vae))
-                if value is None]
-
-    def build(self, joint, clip=None, vae=None, audio_vae=None):
-        clips = list(joint["clips"])
-        conds = []
-        for name in clips:
-            cond, _source = condload.load_for_clip(
-                nodes_load.resolve_clip_path(name), clip=clip, vae=vae,
-                audio_vae=audio_vae)
-            if not cond:
-                raise ValueError("H3 Joint Conditioning: %s has an empty "
-                                 "conditioning" % name)
-            conds.append(cond)
-        table = {"clips": clips,
-                 "spans": [[int(s), int(n)] for s, n in joint["steps"]],
-                 "conds": conds,
-                 # who the cut shows at each step: the window handler
-                 # anchors its windows per clip on this
-                 "owners": [int(o) for o in (joint.get("owner_steps") or [])]}
+    def build(self, layout):
+        table = build_table(layout, condload.load_for_clip)
         # the first clip's entries carry the table; without a window
         # handler the sampler simply runs under the first clip
         out = []
-        for entry in conds[0]:
+        for entry in table["conds"][0]:
             extras = dict(entry[1])
             extras[COND_KEY] = table
             out.append([entry[0], extras])
-        _LOG.info("obvpm.h3 joint: conditioning for %d clip(s) packed", len(clips))
+        _LOG.info("obvpm.h3 joint: conditioning for %d clip(s) packed",
+                  len(table["clips"]))
         return (out,)
+
+
+def _without_table(cond):
+    """A conditioning's entries with any joint table of their own removed."""
+    out = []
+    for entry in cond:
+        if isinstance(entry, (list, tuple)) and len(entry) == 2 \
+                and isinstance(entry[1], dict) and COND_KEY in entry[1]:
+            extras = dict(entry[1])
+            extras.pop(COND_KEY, None)
+            out.append([entry[0], extras])
+        else:
+            out.append(entry)
+    return out
+
+
+def build_table(layout, load):
+    """The window handler's table for a joint layout: {clips, spans, conds,
+    owners}, one row per conditioning.
+
+    A clip whose saved conditioning carries a table of its own -- a cut
+    rendered by H3 Joint VAE Decode and Save, put back on a timeline to be refined
+    again -- is SPLICED IN rather than treated as one clip: its inner
+    rows are offset to where the clip sits on this joint, and the steps
+    this clip owns are handed to whichever inner clip owned them there.
+    So a second refine pass still samples each stretch of the rendered
+    cut under the prompt and references it was made with, instead of
+    running the whole cut under its first clip's.
+    """
+    clips, spans, conds = [], [], []
+    # `outer` is read, `owners` written: the new indices must never be
+    # mistaken for outer ones on a later pass
+    outer = [int(o) for o in (layout.get("owner_steps") or [])]
+    owners = list(outer)
+    for i, name in enumerate(layout["clips"]):
+        cond = load(nodes_load.resolve_clip_path(name))
+        if not cond:
+            raise ValueError("H3 Joint Conditioning: %s has an empty "
+                             "conditioning" % name)
+        s, n = int(layout["steps"][i][0]), int(layout["steps"][i][1])
+        inner = None
+        try:
+            inner = cond[0][1].get(COND_KEY)
+        except (IndexError, TypeError, AttributeError):
+            inner = None
+        if not (inner and inner.get("conds") and inner.get("spans")):
+            index = len(clips)
+            clips.append(name)
+            spans.append([s, n])
+            conds.append(_without_table(cond))
+            for t, o in enumerate(outer):
+                if o == i:
+                    owners[t] = index
+            continue
+        base = len(clips)
+        inner_names = list(inner.get("clips") or [])
+        for j, (c2, (s2, n2)) in enumerate(zip(inner["conds"], inner["spans"])):
+            clips.append("%s: %s" % (name, inner_names[j] if j < len(inner_names) else j))
+            spans.append([s + int(s2), int(n2)])
+            conds.append(_without_table(c2))
+        inner_owners = [int(o) for o in (inner.get("owners") or [])]
+        for t, o in enumerate(outer):
+            if o != i:
+                continue
+            rel = t - s
+            o2 = inner_owners[rel] if 0 <= rel < len(inner_owners) else -1
+            # a row the inner cut left unowned goes to the inner clip
+            # whose span holds it, else to the first inner clip
+            if o2 < 0:
+                o2 = next((j for j, (s2, n2) in enumerate(inner["spans"])
+                           if int(s2) <= rel < int(s2) + int(n2)), 0)
+            owners[t] = base + o2
+        _LOG.info("obvpm.h3 joint: %s carries a joint conditioning of its own "
+                  "(%d clip(s)); spliced in at step %d", name, len(inner["conds"]), s)
+    return {"clips": clips, "spans": spans, "conds": conds,
+            # who the cut shows at each step: the window handler
+            # anchors its windows per clip on this
+            "owners": owners}
 
 
 def window_owner(spans, s, e):
@@ -485,8 +553,8 @@ def hold_audio(latent, audio_denoise=0.0):
     The sampler denoises the nested AV pair together, so a refine would
     re-render sound that is already finished. 0 keeps it exactly; a
     value like 0.5 lets it re-sample alongside the picture (the model
-    re-derives lip sync from it), and the save then takes the SOURCE
-    audio back (H3 Joint Slice's source_audio). Video is fully open.
+    re-derives lip sync from it), and the render then takes the SOURCE
+    audio back (H3 Joint VAE Decode and Save's source_audio). Video is fully open.
     """
     import comfy.nested_tensor
     if latent.get("noise_mask") is not None:
@@ -515,9 +583,9 @@ class H3JointAudioMask:
         "the sampler denoises video and audio together, so without a mask "
         "a refine re-renders sound that was already finished. 0 keeps the "
         "audio exactly; ~0.5 re-samples it alongside the picture for lip "
-        "sync, in which case save the SOURCE audio (H3 Joint Slice's "
-        "source_audio) rather than the resample. Wire the sampler's "
-        "latent_image from here."
+        "sync, in which case render the SOURCE audio (wire H3 Joint "
+        "Latent's latent to H3 Joint VAE Decode and Save's source_audio) rather than "
+        "the resample. Wire the sampler's latent_image from here."
     )
     OUTPUT_TOOLTIPS = ("The same latent with the audio hold. Wire to the "
                        "sampler's latent_image.",)
@@ -798,11 +866,10 @@ def _vram_report(stats):
 class H3WindowHandler:
     """Windowed calc_cond_batch for H3's packed video+audio latent."""
 
-    def __init__(self, length, overlap, fuse="pyramid", headroom_gb=10.0):
+    def __init__(self, length, overlap, fuse="pyramid"):
         self.context_length = clip_shaped(length)
         self.context_overlap = min(int(overlap), self.context_length - 1)
         self.fuse = fuse
-        self.headroom_mb = max(0.0, float(headroom_gb)) * 1024.0
         self._announced = False
         # per-clip model_conds by (clip, window) -- built once per run,
         # not once per step; keyed on the conditioning table's identity so
@@ -1127,53 +1194,35 @@ class H3ContextWindows:
                     "tooltip": "Seconds shared by neighbouring windows; the "
                                "blend happens here. About a quarter of the "
                                "window."}),
-                "fuse_method": (["pyramid", "flat"], {
-                    "default": "pyramid",
-                    "tooltip": "How the two predictions are averaged where "
-                               "windows overlap: pyramid with triangular "
-                               "weights (the working choice), flat plainly."}),
-                "vram_headroom_gb": ("FLOAT", {
-                    "default": 10.0, "min": 0.0, "max": 128.0, "step": 0.5,
-                    "tooltip": "VRAM kept free of model weights for one "
-                               "window's activations. Core's own estimate for "
-                               "this model is a few GB and far too small: at "
-                               "1920x1088 a 5 s window needs about 7 GB, a "
-                               "13 s window more than 17 GB (one attention "
-                               "layer's QKV alone is 7.8 GB), and a window "
-                               "that does not fit either "
-                               "fails with out-of-memory or spills into system "
-                               "RAM and runs ten times slower. Weights that do "
-                               "not fit beside the headroom stream from RAM, "
-                               "which costs about a second per window. Each "
-                               "step's summary log line reports the measured "
-                               "peak; set this a little above it. 0 leaves "
-                               "the budget to core (fine with dynamic VRAM)."}),
             },
         }
 
-    def patch(self, model, window_seconds, overlap_seconds, fuse_method,
-              vram_headroom_gb=10.0):
+    # `fuse_method` is no longer a widget: pyramid (triangular weights
+    # over each window) was the working choice throughout, and flat --
+    # a plain average, what core does with fusion off -- stays in the
+    # handler only as the control for an A/B.
+    def patch(self, model, window_seconds, overlap_seconds, fuse_method="pyramid"):
         length = fr.steps_for_seconds(window_seconds)
         overlap = fr.steps_for_seconds(overlap_seconds) if float(overlap_seconds) > 0 else 0
         if overlap >= length:
-            raise ValueError("H3 Context Windows: the overlap (%.2f s = %d "
+            raise ValueError("H3 Context Windowing: the overlap (%.2f s = %d "
                              "steps) must be shorter than the window (%.2f s "
                              "= %d steps)." % (float(overlap_seconds), overlap,
                                                float(window_seconds), length))
         import comfy.patcher_extension
         model = model.clone()
-        handler = H3WindowHandler(length, overlap, fuse_method, vram_headroom_gb)
+        handler = H3WindowHandler(length, overlap, fuse_method)
         model.model_options["context_handler"] = handler
         model.add_wrapper_with_key(
             comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING,
             "obvpm_h3_context_windows", prepare_sampling_for_window)
         _LOG.info("obvpm.h3 context windows: window %.2f s -> %d steps (%d "
                   "frames, clip-shaped), overlap %.2f s -> %d steps (%d frames, "
-                  "starts on the 5-step cycle), %s, %.1f GB headroom",
+                  "starts on the 5-step cycle), %s",
                   float(window_seconds), handler.context_length,
                   fr.pixel_frames(handler.context_length), float(overlap_seconds),
                   handler.context_overlap, fr.pixel_frames(handler.context_overlap),
-                  fuse_method, float(vram_headroom_gb))
+                  fuse_method)
         return (model,)
 
 
@@ -1226,259 +1275,11 @@ def prepare_sampling_for_window(executor, model, noise_shape, conds, *args, **kw
             est = model.model.memory_required(noise_shape) / (1024 * 1024)
         except Exception:
             pass
-        if est and handler.headroom_mb > 0:
-            # core's formula is linear in the area after batch and
-            # channels, so stretching the last dim by (estimate +
-            # headroom) / estimate makes it ask for the headroom too --
-            # the same request whichever attention branch it picks
-            grow = (est + handler.headroom_mb) / est
-            noise_shape[-1] = max(1, int(noise_shape[-1] * grow))
+        # (Until 2026-09-14 a vram_headroom_gb widget stretched this
+        # estimate so core kept extra VRAM free of weights; the budget is
+        # left to core now, and each step's summary line still reports
+        # the measured peak so a spill shows in the log.)
         _LOG.info("obvpm.h3 context windows: VRAM budgeted for one window "
                   "(%d of %d steps%s)", span, total,
-                  "" if est is None else ", %.0f MB core estimate + %.0f MB headroom"
-                  % (est, handler.headroom_mb))
+                  "" if est is None else ", %.0f MB core estimate" % est)
     return executor(model, noise_shape, conds, *args, **kwargs)
-
-
-# ---------------------------------------------------------------------------
-# store and slice
-# ---------------------------------------------------------------------------
-
-class H3JointStore:
-    """Writes the sampled joint latent next to the profile it belongs to."""
-
-    CATEGORY = "obvpm/h3"
-    FUNCTION = "store"
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("joint_path",)
-    OUTPUT_NODE = True
-    DESCRIPTION = (
-        "Saves the jointly refined timeline latent as <base_folder>/_upscale/"
-        "<profile>/joint.mctx.safetensors, with each clip's span recorded in "
-        "it. Wire joint_path to H3 Upscale Loop Start: the loop slices the "
-        "clips out of it into the same folder. With reuse_existing on, a "
-        "joint file already there for this timeline is kept and the sampler "
-        "is NOT run again -- the Timeline re-runs everything downstream on "
-        "every press, and 20 minutes of sampling is not something to repeat "
-        "because a save step failed. Off = sample again (a new joint file, "
-        "and the loop delivers every clip again)."
-    )
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "samples": ("LATENT", {
-                    "lazy": True,
-                    "tooltip": "The sampler's output. Only asked for when "
-                               "there is no reusable joint file."}),
-                "joint": (wt.JOINT, {"tooltip": "From H3 Joint Latent."}),
-                "base_folder": ("STRING", {"default": "project1"}),
-                "profile": ("STRING", {
-                    "default": "joint01",
-                    "tooltip": "Profile folder name under "
-                               "<base_folder>/_upscale/."}),
-                "reuse_existing": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Keep a joint file already stored for this "
-                               "timeline instead of sampling again. Off = "
-                               "always resample and overwrite."}),
-            },
-        }
-
-    @staticmethod
-    def _target(base_folder, profile):
-        import folder_paths
-        name = str(profile or "").strip()
-        if not name:
-            raise ValueError("H3 Joint Store: profile must be a name.")
-        rel = upscale.profile_folder(base_folder, name)
-        folder = os.path.join(folder_paths.get_output_directory(), *rel.split("/"))
-        return rel, folder, os.path.join(folder, JOINT_FILE)
-
-    @staticmethod
-    def _reusable(path, joint):
-        """True when the stored joint was built for exactly this timeline."""
-        if not os.path.isfile(path):
-            return False
-        try:
-            record = mctx.read_blob(path, JOINT_BLOB) or {}
-        except Exception:
-            return False
-        return (record.get("clips") == list(joint["clips"])
-                and record.get("total_steps") == joint["total_steps"]
-                and [list(x) for x in record.get("steps", [])]
-                == [list(x) for x in joint["steps"]])
-
-    @classmethod
-    def IS_CHANGED(cls, **kwargs):
-        # whether the file stands is a fact about the disk, not the inputs:
-        # served from cache, a deleted profile folder would hand the loop a
-        # path to nothing. Re-running is cheap -- `samples` is lazy, so the
-        # sampler is only asked for when there is no reusable file.
-        return float("nan")
-
-    def check_lazy_status(self, joint, base_folder, profile, reuse_existing=True,
-                          samples=None, **_):
-        if samples is not None:
-            return []
-        _rel, _folder, path = self._target(base_folder, profile)
-        if reuse_existing and self._reusable(path, joint):
-            return []          # nothing to sample: the file stands
-        return ["samples"]
-
-    def store(self, joint, base_folder, profile, reuse_existing=True, samples=None):
-        rel, folder, path = self._target(base_folder, profile)
-        if samples is None:
-            if not (reuse_existing and self._reusable(path, joint)):
-                raise RuntimeError("H3 Joint Store: no samples and no reusable "
-                                   "joint file -- this should not happen.")
-            _LOG.info("obvpm.h3 joint: reusing %s (same timeline); the "
-                      "sampler was not run", path)
-            return ("%s/%s" % (rel, JOINT_FILE),)
-        video, audio = avpack.unpack_av(samples, name="samples")
-        if video.shape[2] != joint["total_steps"]:
-            raise ValueError("H3 Joint Store: the sampled latent has %d steps "
-                             "but the joint layout expects %d"
-                             % (video.shape[2], joint["total_steps"]))
-        os.makedirs(folder, exist_ok=True)
-        meta = {
-            "format": mctx.FORMAT, "self_id": "", "parent_id": "",
-            "relation": "joint", "parent_join_frame": "",
-            "width": str(int(video.shape[4]) * 16),
-            "height": str(int(video.shape[3]) * 16),
-            "fps": str(fr.FPS), "raw_frames": str(joint["total_frames"]),
-            "pinned_head_frames": "0", "pinned_tail_frames": "0",
-            "delivered_frames": str(joint["total_frames"]), "pins": "[]",
-            "parent_grade": "latent", "user_meta": "{}",
-        }
-        record = {k: (list(map(list, v)) if k in ("steps", "ticks") else v)
-                  for k, v in joint.items()}
-        # which sampling this is: a clip sliced from an earlier joint file
-        # in the same folder must not pass for one sliced from this one
-        record["stamp"] = "%s-%s" % (time.strftime("%Y%m%d-%H%M%S"),
-                                     os.urandom(4).hex())
-        mctx.write_sidecar(path, video, audio, meta, blobs={JOINT_BLOB: record})
-        _LOG.info("obvpm.h3 joint: stored %d steps for %d clip(s) -> %s",
-                  video.shape[2], len(joint["clips"]), path)
-        return ("%s/%s" % (rel, JOINT_FILE),)
-
-
-_CACHE = {}
-
-
-def load_joint(path):
-    """(video, audio, record) for a joint file, cached by path + mtime."""
-    key = (path, os.path.getmtime(path))
-    hit = _CACHE.get(key)
-    if hit is None:
-        _CACHE.clear()
-        video, audio, _ = mctx.load_sidecar(path)
-        record = mctx.read_blob(path, JOINT_BLOB)
-        if not record:
-            raise ValueError("%s carries no joint layout" % path)
-        hit = _CACHE[key] = (video, audio, record)
-    return hit
-
-
-def read_record(path):
-    """The joint layout alone (no latents read)."""
-    record = mctx.read_blob(path, JOINT_BLOB)
-    if not record or not record.get("clips"):
-        raise ValueError("%s is not a joint latent file (no layout in it)"
-                         % path)
-    return record
-
-
-def mirror_pins(header, id_map=None):
-    """Trim-only PINS from a take's recorded recipe.
-
-    The refined clip covers the source's raw span exactly, so the rows to
-    trim off, the lineage to record and the mask shape the assembly reads
-    are the source's own -- no slicing, no keyframes, nothing sampled.
-    `id_map` renames pin sources from the ORIGINAL neighbour's id to its
-    refined rendering's, so the refined clips carry the same lineage among
-    themselves that the sources had, and H3 Assemble derives the same cut.
-    """
-    pins = []
-    for spec in mctx.parse_pins(header):
-        spec = dict(spec)
-        sid = spec.get("source_id")
-        if id_map and sid in id_map:
-            spec["source_id"] = id_map[sid]
-        pins.append({"place": spec.get("place"),
-                     "covered": int(spec.get("source_frames", 0) or 0),
-                     "spec": spec})
-    return pins
-
-
-class H3JointSlice:
-    """One clip's span of the jointly refined latent, for decode and save."""
-
-    CATEGORY = "obvpm/h3"
-    FUNCTION = "slice"
-    RETURN_TYPES = ("LATENT", wt.PINS, "LATENT")
-    RETURN_NAMES = ("latent", "pins", "source_audio")
-    DESCRIPTION = (
-        "Inside the loop: takes this iteration's clip out of the stored "
-        "joint latent -- the clip's own raw span -- and mirrors the take's "
-        "recorded pins as trim-only pins, so the save node trims and records "
-        "it exactly as the source was, pointing at the refined neighbours. "
-        "source_audio is the clip's original audio latent, for a save that "
-        "keeps the finished soundtrack."
-    )
-    OUTPUT_TOOLTIPS = (
-        "The refined raw AV latent of this clip. Wire to decode and to the "
-        "save node's samples.",
-        "Trim-only pins. Wire to the save node's pins.",
-        "The source take's audio latent. Decode it for the save node's audio "
-        "when the joint pass re-sampled sound.",
-    )
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "flow": (wt.LOOP, {"tooltip": "From H3 Upscale Loop Start."}),
-            },
-        }
-
-    def slice(self, flow):
-        if not isinstance(flow, dict) or "index" not in flow or not flow.get("joint_path"):
-            raise ValueError("H3 Joint Slice: the flow must come from Loop Start.")
-        video, audio, record = load_joint(flow["joint_path"])
-        index = int(flow["index"])
-        clips = record.get("clips") or []
-        if index >= len(clips) or clips[index] != flow.get("source"):
-            raise ValueError(
-                "H3 Joint Slice: the loop is on %r (position %d) but the joint "
-                "latent was built for %s. Rebuild the joint latent for this "
-                "timeline." % (flow.get("source"), index, clips))
-        s, n = record["steps"][index]
-        t, m = record["ticks"][index]
-        v = video[:, :, s:s + n].clone()
-        a = audio[..., t:t + m].clone()
-
-        source = mctx.sidecar_path(nodes_load.resolve_clip_path(clips[index]))
-        _sv, source_audio, header = mctx.load_sidecar(source)
-        id_map = {}
-        for neighbour, output in (flow.get("pinned_to") or {}).items():
-            try:
-                sid = mctx.read_header(mctx.sidecar_path(
-                    nodes_load.resolve_clip_path(neighbour))).get("self_id")
-                rid = mctx.read_header(mctx.sidecar_path(
-                    nodes_load.resolve_clip_path(
-                        "%s/%s" % (flow["rel_folder"], output)))).get("self_id")
-            except Exception:
-                _LOG.exception("obvpm.h3 joint: could not read %s / %s for "
-                               "the refined lineage", neighbour, output)
-                continue
-            if sid and rid:
-                id_map[sid] = rid
-        pins = mirror_pins(header, id_map)
-        _LOG.info("obvpm.h3 joint: slice %d -> steps %d..%d, ticks %d..%d; "
-                  "%d pin(s) mirrored%s", index, s, s + n, t, t + m, len(pins),
-                  (", lineage -> refined %s" % ", ".join(
-                      (flow.get("pinned_to") or {}).values())) if id_map else "")
-        return (avpack.pack_av(v, a, name="joint"), pins,
-                {"samples": source_audio})

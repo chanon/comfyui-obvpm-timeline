@@ -20,12 +20,14 @@ audio window end-alignment on the shared timeline, and trim behavior.
 Copyright (C) 2026 NikoDemon80
 https://github.com/NikoDemon80/ComfyUI-MiniMaxH3-Contex-Loop
 
-The upscale loop (`nodes_loop.py`) finds its body by reachability
-between an opening and a closing node and re-expands it per iteration,
+An earlier upscale loop in this pack found its body by reachability
+between an opening and a closing node and re-expanded it per iteration,
 the traversal that pack's `chain_nodes.py` uses (itself after Ethanfel's
-SxCP loop nodes in ComfyUI-Prompt-Builder). That pack's Drift-Control AV
-rule was also implemented here for per-clip refines and retired when
-the joint refine replaced them. No code is vendored.
+SxCP loop nodes in ComfyUI-Prompt-Builder); it was retired on
+2026-09-14 when the joint refine began rendering the timeline as one
+video. That pack's Drift-Control AV rule was also implemented here for
+per-clip refines and retired when the joint refine replaced them. No
+code is vendored.
 
 ## ComfyUI-MMH3Tools (MIT)
 

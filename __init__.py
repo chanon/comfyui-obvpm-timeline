@@ -11,15 +11,12 @@ installs alone; node class names are unchanged from when both lived in
 one pack, so saved workflows keep loading.
 """
 
-from .nodes_assemble import H3Assemble, H3AssembleUpscale, H3Timeline
+from .nodes_assemble import H3Assemble, H3Timeline
 from .nodes_encode import H3MCtxFromFrames
 from .nodes_joint import (H3ContextWindows, H3JointAudioMask,
-                          H3JointConditioning, H3JointLatent, H3JointSlice,
-                          H3JointStore)
+                          H3JointConditioning, H3JointLatent)
 from .nodes_load import H3LoadMCtx, H3LoadVideoWithMCtx
-from .nodes_loop import H3UpscaleLoopEnd, H3UpscaleLoopStart
-from .nodes_mode import H3RunModeGate
-from .nodes_refs import H3RecordReferences
+from .nodes_render import H3JointRender
 from .nodes_result import H3ResultPreview
 from .nodes_pins import (
     H3MCtxApplyPins,
@@ -54,16 +51,10 @@ NODE_CLASS_MAPPINGS = {
     "H3JointConditioning": H3JointConditioning,
     "H3JointAudioMask": H3JointAudioMask,
     "H3ContextWindows": H3ContextWindows,
-    "H3JointStore": H3JointStore,
-    "H3JointSlice": H3JointSlice,
+    "H3JointRender": H3JointRender,
     "H3Assemble": H3Assemble,
-    "H3AssembleUpscale": H3AssembleUpscale,
     "H3Timeline": H3Timeline,
     "H3ResultPreview": H3ResultPreview,
-    "H3RecordReferences": H3RecordReferences,
-    "H3UpscaleLoopStart": H3UpscaleLoopStart,
-    "H3UpscaleLoopEnd": H3UpscaleLoopEnd,
-    "H3RunModeGate": H3RunModeGate,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -76,20 +67,14 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3MCtxPinSpec": "H3 MCtx Pin Spec",
     "H3MCtxApplyPins": "H3 MCtx Apply Pins",
     "H3TrimPinned": "H3 MCtx Trim Pinned",
-    "H3JointLatent": "H3 Joint Latent",
+    "H3JointLatent": "H3 Join Latents",
     "H3JointConditioning": "H3 Joint Conditioning",
     "H3JointAudioMask": "H3 Joint Audio Mask",
-    "H3ContextWindows": "H3 Context Windows",
-    "H3JointStore": "H3 Joint Store",
-    "H3JointSlice": "H3 Joint Slice",
+    "H3ContextWindows": "H3 Context Windowing",
+    "H3JointRender": "H3 Joint VAE Decode and Save",
     "H3Assemble": "H3 MCtx Assemble",
-    "H3AssembleUpscale": "H3 Assemble Upscale",
     "H3Timeline": "H3 MCtx Timeline",
     "H3ResultPreview": "H3 MCtx Result Preview",
-    "H3RecordReferences": "H3 Record References",
-    "H3UpscaleLoopStart": "H3 Upscale Loop Start",
-    "H3UpscaleLoopEnd": "H3 Upscale Loop End",
-    "H3RunModeGate": "H3 Run Mode Gate",
 }
 
 WEB_DIRECTORY = "./web"

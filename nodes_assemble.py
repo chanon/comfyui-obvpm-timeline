@@ -59,7 +59,6 @@ from . import levellock
 from . import mctx
 from . import nodes_load
 from . import nodes_masked
-from . import nodes_mode
 
 _LOG = logging.getLogger("obvpm.h3")
 
@@ -861,8 +860,8 @@ class H3Timeline:
 
     CATEGORY = "obvpm/h3"
     FUNCTION = "emit"
-    RETURN_TYPES = (wt.PINSPECS, "INT", "STRING", "STRING")
-    RETURN_NAMES = ("pin_specs", "length", "sequence", "run_mode")
+    RETURN_TYPES = (wt.PINSPECS, "INT", "STRING", "BOOLEAN")
+    RETURN_NAMES = ("pin_specs", "length", "sequence", "upscaling")
     OUTPUT_TOOLTIPS = (
         "Pin spec for the clip pinned in the timeline widget (extend/"
         "prepend); empty when nothing is pinned. Wire to H3MCtxApplyPins "
@@ -874,11 +873,14 @@ class H3Timeline:
         "The clip list exactly as the widget holds it, so a pass that "
         "walks the timeline reads the SAME list the cut is built from "
         "rather than a copy that has to be kept in step. Wire to H3 "
-        "Upscale Loop Start's sequence. Verbatim, comments and cut "
+        "Join Latents' sequence. Verbatim, comments and cut "
         "markers included -- readers strip what they do not need.",
-        "The run_mode widget, on a wire. Feed every H3 Run Mode Gate in "
-        "the graph from here: one switch, set where the timeline is, and "
-        "the branches cannot disagree about which one is running.",
+        "The toolbar's upscale toggle, on a wire: true when a Run should "
+        "refine and render the timeline, false when it should generate "
+        "the next take. Drive a Mute If gate on each branch from here "
+        "(the generation branch muted when this is true, the refine "
+        "branch when it is false, through a Not node) so one switch "
+        "decides and the branches cannot disagree.",
     )
     DESCRIPTION = (
         "Timeline editor for composed clips: seam-aware blocks, "
@@ -1098,9 +1100,14 @@ class H3Timeline:
                                "(~0.7 s steps)."}),
                 # Declared LAST (see the note above): widgets_values is
                 # positional, so new widgets may only be appended.
-                "run_mode": (list(nodes_mode.RUN_MODES), {
-                    "default": nodes_mode.GENERATION,
-                    "tooltip": nodes_mode.RUN_MODE_TOOLTIP,
+                "upscaling": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Which half of the workflow this Run is for. "
+                               "Off: generate the next take from the pin. "
+                               "On: refine the whole timeline as one piece "
+                               "and render the finished cut. Flipped from "
+                               "the strip's upscale toggle; comes out on "
+                               "the upscaling output for the Mute If gates.",
                 }),
             },
         }
@@ -1298,17 +1305,18 @@ class H3Timeline:
                       else "17k+5 ladder"))
 
     def emit(self, sequence="", pin_state="", duration_seconds=8.0,
-             run_mode=nodes_mode.GENERATION, **_):
-        # Validated HERE, not only at the gates: an unknown run mode
-        # shuts every gate, and a graph that runs and does nothing is
-        # the most expensive way to learn about a typo.
-        run_mode = nodes_mode.check_run_mode(run_mode, "H3Timeline")
+             upscaling=False, **_):
+        # A graph saved while this was the run_mode combo hands over its
+        # string; "upscale" is the only value that meant on
+        if isinstance(upscaling, str):
+            upscaling = upscaling.strip().lower() in ("upscale", "true", "1")
+        upscaling = bool(upscaling)
         state = self._parse_pin_state(pin_state)
         length, phrase = self._emit_length(state, duration_seconds)
-        _LOG.info("obvpm.h3: timeline run mode %s; length %s",
-                  run_mode, phrase)
+        _LOG.info("obvpm.h3: timeline run: %s; length %s",
+                  "upscale and render" if upscaling else "generate", phrase)
         if state is None:
-            return ([], length, sequence, run_mode)
+            return ([], length, sequence, upscaling)
         # The soft hold applies to the ARRIVING side only: the
         # departing side of a bridge is a masked extend, which is
         # already seamless and has nothing to gain from being loosened.
@@ -1343,7 +1351,7 @@ class H3Timeline:
                       state["source2"], arrive,
                       _shape_note(shape) if shaped else "",
                       state["window"])
-            return (specs, length, sequence, run_mode)
+            return (specs, length, sequence, upscaling)
         specs = self._specs_for(state["source"], state["role"],
                                 state["window"], state.get("cut"),
                                 state["mode"], mask_shape=shape)
@@ -1353,7 +1361,7 @@ class H3Timeline:
                   state["window"],
                   "" if state.get("cut") is None
                   else ", from the cut at frame %d" % state["cut"])
-        return (specs, length, sequence, run_mode)
+        return (specs, length, sequence, upscaling)
 
 
 class H3Assemble:
@@ -1538,129 +1546,3 @@ class H3Assemble:
                   images.shape[0] / fr.FPS,
                   ", audio" if audio is not None else ", silent", wrote)
         return (out_path, images, audio)
-
-
-class H3AssembleUpscale:
-    """Assemble a refine profile, without retyping what it already knows."""
-
-    CATEGORY = "obvpm/h3"
-    FUNCTION = "assemble"
-    OUTPUT_NODE = True
-    RETURN_TYPES = ("STRING", "IMAGE", "AUDIO", "STRING")
-    RETURN_NAMES = ("path", "images", "audio", "sequence")
-    DESCRIPTION = (
-        "Plays a finished upscale profile as one MP4. Point it at the "
-        "same base_folder and profile the loop used and it reads the "
-        "rest from the profile itself -- which refined clip stands in "
-        "for which position, and in what order they play. Assembles "
-        "exactly like H3 MCtx Assemble, because it is that node with "
-        "the sequence filled in for you. Wire the loop's `report` into "
-        "`after` and it runs by itself when the pass finishes."
-    )
-    OUTPUT_TOOLTIPS = (
-        "Path of the written MP4.",
-        "The assembled frames.",
-        "The assembled audio, when every clip carried some.",
-        "The sequence it built, so you can see what it played and paste "
-        "it into H3 MCtx Assemble to adjust by hand.",
-    )
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "base_folder": ("STRING", {
-                    "default": "project1",
-                    "tooltip": "The project folder, the same value the "
-                               "loop and the save nodes use."}),
-                "profile": ("STRING", {
-                    "default": "",
-                    "tooltip": "Which upscale profile to play, i.e. the "
-                               "folder under <base_folder>/_upscale/. "
-                               "Leave empty when profile_folder is wired "
-                               "from Loop End -- that names the folder the "
-                               "pass actually used."}),
-                "filename_prefix": ("STRING", {
-                    "default": "",
-                    "tooltip": "Output path prefix. Empty writes "
-                               "<profile folder>/cut, so the refined cut "
-                               "sits with the clips it was made from."}),
-                "crf": ("INT", {
-                    "default": 19, "min": 0, "max": 51,
-                    "tooltip": "H.264 quality for re-encoded seam "
-                               "bridges; match the takes."}),
-            },
-            "optional": {
-                "after": ("STRING", {
-                    "forceInput": True,
-                    "tooltip": "Wire H3 Upscale Loop End's `report` here "
-                               "and this node runs when the LOOP FINISHES "
-                               "-- not once per clip. The loop's report "
-                               "only becomes a real value at the last "
-                               "iteration (until then it is a link into "
-                               "the next one), so waiting for it is "
-                               "waiting for the whole pass. Unwired, the "
-                               "node assembles whatever the profile "
-                               "folder holds right now, which is how you "
-                               "play a half-finished pass."}),
-                "profile_folder": ("STRING", {
-                    "forceInput": True,
-                    "tooltip": "Wire H3 Upscale Loop End's profile_folder "
-                               "here: the folder the pass wrote, output-"
-                               "relative, so the assembler plays exactly "
-                               "that profile without base_folder and "
-                               "profile being typed again. Like `after`, "
-                               "it only becomes a value when the loop "
-                               "finishes, so wiring it is also what makes "
-                               "this node wait for the whole pass."}),
-            },
-        }
-
-    @classmethod
-    def IS_CHANGED(cls, **kwargs):
-        # what this assembles depends on how far the profile has got,
-        # which is on disk and not in any widget
-        return float("nan")
-
-    def assemble(self, base_folder, profile, filename_prefix, crf,
-                 profile_folder=None, after=None):
-        from . import upscale
-
-        wired = str(profile_folder or "").strip().strip("/\\").replace("\\", "/")
-        if wired:
-            if any(part in ("", "..") for part in wired.split("/")):
-                raise ValueError(
-                    "H3 Assemble Upscale: profile_folder %r is not an "
-                    "output-relative folder." % wired)
-            rel_folder = wired
-            profile = wired.rsplit("/", 1)[-1]
-        elif str(profile or "").strip():
-            rel_folder = upscale.profile_folder(base_folder, profile)
-        else:
-            raise ValueError(
-                "H3 Assemble Upscale: which profile? Wire Loop End's "
-                "profile_folder in, or type the profile name.")
-        folder = os.path.join(folder_paths.get_output_directory(),
-                              *rel_folder.split("/"))
-        document = upscale.read_manifest(folder)
-        sequence = upscale.sequence_text(document, rel_folder)
-        if after:
-            _LOG.info("obvpm.h3: assembling %r because the loop finished "
-                      "(%s)", rel_folder, str(after).strip())
-        if not sequence:
-            raise ValueError(
-                "H3 Assemble Upscale: profile %r has refined nothing yet "
-                "(looked in %s). Run the upscale loop first."
-                % (profile, rel_folder))
-
-        total = len(document.get("lines") or [])
-        played = len(sequence.splitlines())
-        if total and played < total:
-            _LOG.info(
-                "obvpm.h3: profile %r has refined %d of %d clip(s); "
-                "assembling the first %d -- the rest are not there yet",
-                profile, len(document.get("entries") or []), total, played)
-
-        prefix = str(filename_prefix or "").strip() or (rel_folder + "/cut")
-        path, images, audio = H3Assemble().assemble(sequence, prefix, crf)
-        return (path, images, audio, sequence)

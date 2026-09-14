@@ -2,7 +2,7 @@
 
 Non-linear clip composition in ComfyUI: build a long piece out of
 several generations, without the joins showing. The model supported
-today is **MiniMax H3**; the timeline, the assembler and the refine loop
+today is **MiniMax H3**; the timeline, the assembler and the joint refine
 are model-independent, and the H3-specific parts (the frame grid, the
 latent anchoring, the sidecar fields) are the ones a second model would
 bring its own version of. Node names and wire types keep their `H3`
@@ -35,8 +35,8 @@ timeline's clips are laid onto a single latent at their true positions,
 upscaled, and re-sampled together in overlapping windows, each under the
 conditioning its clip was generated with, so fine texture is decided
 across the joins rather than per clip and the refined cut has no seams.
-The result is sliced back into refined takes, the run resumes where it
-stopped, and the same timeline plays it.
+The result is rendered straight to one finished MP4, decoded a few
+seconds at a time, and saved as a take that can itself be refined again.
 
 Full guide: **[docs/h3.md](docs/h3.md)** · per-node reference:
 **[docs/h3-nodes.md](docs/h3-nodes.md)**

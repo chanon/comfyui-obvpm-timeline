@@ -475,7 +475,8 @@ app.registerExtension({
                     // reads widget.options.hidden
                     w.hidden = true;
                     (w.options ??= {}).hidden = true;
-                    if (w.inputEl) w.inputEl.style.display = "none";
+                    const wEl = w.element ?? w.inputEl;
+                    if (wEl) wEl.style.display = "none";
                 }
                 dropWidgetSockets(this, ["metadata"]);
             } catch (err) {
@@ -3081,7 +3082,8 @@ app.registerExtension({
             void seamsTouched;
 
             // ---- run mode (toolbar, not a setup widget) --------------
-            // Which half of the workflow a Run is for (h3/nodes_mode.py).
+            // Which half of the workflow a Run is for: the `upscaling`
+            // BOOLEAN, which the graph's Mute If gates read.
             // It rides the toolbar for snap's reason: it is a mode you
             // flip WHILE working, and the node's own widget rows are on
             // the far side of a thousand pixels of strip. Rightmost, past
@@ -3089,14 +3091,17 @@ app.registerExtension({
             // others act on this timeline, this one says what pressing
             // Run does at all.
             const runModeWidget = node.widgets?.find(
-                (w) => w.name === "run_mode");
+                (w) => w.name === "upscaling");
             if (runModeWidget) {
                 runModeWidget.hidden = true;
                 (runModeWidget.options ??= {}).hidden = true;
             }
             function upscaleMode() {
-                return String(runModeWidget?.value ?? "generation")
-                    === "upscale";
+                const v = runModeWidget?.value;
+                // "upscale" is the value the widget held while it was a
+                // run_mode combo (before 2026-09-14); a saved graph may
+                // still hand it over until onConfigure coerces it
+                return v === true || v === "true" || v === "upscale";
             }
             // A TOGGLE, not a two-value selector: the label is fixed and
             // the fill says whether it is on, exactly like snap cuts.
@@ -3123,9 +3128,10 @@ app.registerExtension({
                 runModeBtn.style.borderColor = up ? "transparent" : P.edge;
                 runModeBtn.style.color = up ? "#fff" : P.text;
                 runModeBtn.title = up
-                    ? "ON: Run refines this whole timeline through the "
-                      + "upscale loop. Any pin is kept and comes back "
-                      + "when you switch it off. Click to generate again."
+                    ? "ON: Run refines this whole timeline as one piece "
+                      + "and renders the finished cut. Any pin is kept and "
+                      + "comes back when you switch it off. Click to "
+                      + "generate again."
                     : "OFF: Run generates the next take from the pin "
                       + "below. Click to refine this whole timeline "
                       + "instead.";
@@ -3137,7 +3143,7 @@ app.registerExtension({
             runModeBtn.addEventListener("mouseleave", paintRunMode);
             runModeBtn.addEventListener("click", () => {
                 if (!runModeWidget) return;
-                runModeWidget.value = upscaleMode() ? "generation" : "upscale";
+                runModeWidget.value = !upscaleMode();
                 // through the widget's own callback, so a value set from
                 // here and one set from anywhere else take the same road
                 runModeWidget.callback?.(runModeWidget.value);
@@ -3223,8 +3229,9 @@ app.registerExtension({
             // sequence UI); the ✎ button pops it up for hand editing.
             seqWidget.hidden = true;
             (seqWidget.options ??= {}).hidden = true;
-            if (seqWidget.inputEl) {
-                seqWidget.inputEl.style.display = "none";
+            const seqEl = seqWidget.element ?? seqWidget.inputEl;
+            if (seqEl) {
+                seqEl.style.display = "none";
             }
             // auto_add is deprecated and inert -- the Result Preview owns
             // offering new takes now. Hidden rather than deleted because
@@ -3236,12 +3243,12 @@ app.registerExtension({
                 autoAddWidget.hidden = true;
                 (autoAddWidget.options ??= {}).hidden = true;
             }
-            // run_mode joins these: hiding a widget hides its ROW but
+            // upscaling joins these: hiding a widget hides its ROW but
             // leaves its input socket, invisible and still hit-tested
             // over the node's real pins. Anything genuinely wired is
             // skipped, so driving the mode from a graph still works.
             dropWidgetSockets(node, ["pin_state", "sequence", "auto_add",
-                                     "snap_cuts_to_grid", "run_mode"]);
+                                     "snap_cuts_to_grid", "upscaling"]);
             // Editing the keyword re-renders the clip row, so the restore
             // button's enabled look tracks it instead of going stale.
             const rgWidget = node.widgets?.find(
@@ -4024,7 +4031,8 @@ app.registerExtension({
             }
             function setSequence(text) {
                 seqWidget.value = text;
-                if (seqWidget.inputEl) seqWidget.inputEl.value = text;
+                const seqEl2 = seqWidget.element ?? seqWidget.inputEl;
+                if (seqEl2) seqEl2.value = text;
                 seqWidget.callback?.(text);
                 tlNoteEdit();      // one undo step per edit
                 void refresh();
@@ -6357,7 +6365,7 @@ app.registerExtension({
                 bridge.style.boxShadow = isThis
                     ? "0 0 0 2px rgba(255,255,255,0.7)" : "none";
                 bridge.title = upscaleMode()
-                    ? "run_mode is 'upscale', so the next Run refines "
+                    ? "upscaling is on, so the next Run refines "
                       + "this timeline rather than generating anything. "
                       + "Switch to generation to bridge this space."
                     : ends
@@ -7180,16 +7188,16 @@ app.registerExtension({
                     // The duration box is left off for the same reason
                     // the pin is: `length` feeds the generation branch,
                     // which this mode switches off.
-                    value.textContent = "upscale — refine every clip";
+                    value.textContent = "upscale — refine and render the cut";
                     value.style.background = TL_UPSCALE_BG;
                     value.style.color = "#fff";
                     value.style.borderColor = "transparent";
                     value.style.flexShrink = "1";
                     value.style.minWidth = "0";
                     value.title =
-                        "run_mode is 'upscale', so a Run walks this "
-                        + "timeline and refines each clip through the "
-                        + "upscale loop instead of generating a new "
+                        "upscaling is on, so a Run refines this "
+                        + "whole timeline as one piece and renders the "
+                        + "finished cut instead of generating a new "
                         + "take. Any pin is kept exactly as it is and "
                         + "comes back when you switch to generation.";
                     frame.append(value);
@@ -7646,13 +7654,19 @@ app.registerExtension({
             };
             // live re-render while typing in the textarea
             let typeTimer = null;
-            seqWidget.inputEl?.addEventListener("input", () => {
+            (seqWidget.element ?? seqWidget.inputEl)?.addEventListener("input", () => {
                 clearTimeout(typeTimer);
                 typeTimer = setTimeout(() => void refresh(), 400);
             });
             const onConfigure = node.onConfigure;
             node.onConfigure = function () {
                 const r = onConfigure?.apply(this, arguments);
+                // a graph saved while this widget was the run_mode combo
+                // restores "generation"/"upscale"; as a BOOLEAN input
+                // the server would read either string as true
+                if (runModeWidget && typeof runModeWidget.value === "string") {
+                    runModeWidget.value = runModeWidget.value === "upscale";
+                }
                 void refresh();
                 return r;
             };
@@ -8092,33 +8106,12 @@ function rpWidgetValue(node, name) {
     return traced == null ? null : String(traced);
 }
 
-// H3 Assemble Upscale is a writer too, but not of "<base_folder>/<prefix>":
-// with its prefix empty it writes "<profile folder>/cut_NNNNN", and the
-// profile folder is chosen SERVER-SIDE (automatic profiles), so no widget
-// on this side can name it. The scope is therefore the SHAPE of that path
-// -- mirrors upscale.SUBFOLDER ("_upscale") and the "/cut" default in
-// H3AssembleUpscale.assemble. Reading it as a save node instead yielded a
-// scope of just the base folder, which no cut could ever match, and the
-// preview stayed silent (2026-09-02).
-const RP_UPSCALE_CUT = "<upscale profile>/cut";
-const RP_UPSCALE_CUT_RE = /\/_upscale\/[^/]+\/cut_\d+\.[A-Za-z0-9]+$/;
-
-function rpIsUpscaleAssembler(node) {
-    return node?.comfyClass === "H3AssembleUpscale"
-        || node?.type === "H3AssembleUpscale";
-}
-
 // The joined save prefix of one node: undefined if it is not a save node,
-// null if it is but its prefix cannot be known.
+// null if it is but its prefix cannot be known. H3 Joint VAE Decode and Save counts:
+// it writes "<base_folder>/<prefix>_NNNNN.mp4" like the save nodes do.
 function rpSavePrefix(node) {
     const name = rpWidgetValue(node, "filename_prefix");
     if (name === undefined) return undefined;
-    if (rpIsUpscaleAssembler(node)) {
-        if (name === null) return null;
-        // a typed prefix is the WHOLE output-relative prefix, not joined
-        const typed = name.trim().replace(/^[/\\]+/, "");
-        return typed ? (typed.includes("%") ? null : typed) : RP_UPSCALE_CUT;
-    }
     const folder = rpWidgetValue(node, "base_folder");
     if (name === null || folder === null) return null;
     const prefix = rpJoinPrefix(folder ?? "", name);
@@ -8158,9 +8151,6 @@ function rpVerdict(node, d) {
     const scope = rpScopeFolder(node);
     const clip = String(d?.clip ?? "");
     if (scope === null || !clip) return "unknown";
-    if (scope === RP_UPSCALE_CUT) {
-        return RP_UPSCALE_CUT_RE.test(clip) ? "yes" : "no";
-    }
     // the save nodes write "<prefix>_00042.mp4"; anything not shaped that
     // way falls back to the folder so nothing legitimate is dropped
     const m = clip.match(/^(.*)_\d+\.[A-Za-z0-9]+$/);
@@ -8228,13 +8218,6 @@ function rpPromptWrites(prompt, scope) {
         if (n?.inputs?.filename_prefix === undefined) continue;
         const p = rpPromptValue(prompt, n.inputs.filename_prefix, RP_HOPS);
         if (p == null) continue;
-        if (n.class_type === "H3AssembleUpscale") {
-            // same rule as rpSavePrefix: empty prefix = the profile cut
-            if (scope === RP_UPSCALE_CUT ? !p.trim() : p.trim() === scope) {
-                return true;
-            }
-            continue;
-        }
         // ABSENT and UNREADABLE are different: a save node with no
         // base_folder really does write at the root, but one whose folder
         // can't be resolved must not be judged as if it were empty -- that
@@ -9273,93 +9256,3 @@ function buildResultPreview(node) {
         return onRemoved?.apply(this, arguments);
     };
 }
-
-// ============ H3 Record References: hiding the unused outputs ==========
-// ComfyUI has no dynamic outputs. `DynamicOutput` in comfy_api is an
-// abstract class with no subclass, and that is not an oversight: a link's
-// type is resolved from the upstream CLASS's static RETURN_TYPES indexed
-// by slot number, so outputs are addressed BY POSITION while inputs are
-// addressed BY NAME. Inserting an output would silently re-point every
-// downstream link.
-//
-// So the node declares nine image outputs and three audio outputs, and
-// this hides the ones past the last used slot. It is COSMETIC ONLY --
-// slot 3 is slot 3 whether or not it is drawn, nothing is renumbered,
-// and a graph opened without this file shows all twelve sockets and runs
-// identically. Never let backend behaviour depend on it.
-const RR_NODE = "H3RecordReferences";
-const RR_GROUPS = [
-    { input: "image_", output: "image_", max: 9 },
-    { input: "audio_", output: "audio_", max: 3 },
-];
-
-// how many slots to show for a group: every connected one, plus a single
-// empty slot to wire the next reference into
-function rrVisibleCount(node, group) {
-    let last = -1;
-    for (let i = 0; i < group.max; i++) {
-        const input = node.inputs?.find((s) => s.name === group.input + i);
-        const output = node.outputs?.find((s) => s.name === group.output + i);
-        if (input?.link != null || output?.links?.length) last = i;
-    }
-    return Math.min(last + 2, group.max);
-}
-
-function rrSyncOutputs(node) {
-    if (!node?.outputs) return;
-    for (const group of RR_GROUPS) {
-        const shown = rrVisibleCount(node, group);
-        for (let i = 0; i < group.max; i++) {
-            const slot = node.outputs.find((s) => s.name === group.output + i);
-            if (!slot) continue;
-            // a connected slot is never hidden, whatever the count says:
-            // hiding a wired socket would strand a visible link
-            slot.hidden = i >= shown && !slot.links?.length;
-        }
-    }
-    node.setDirtyCanvas?.(true, true);
-}
-
-app.registerExtension({
-    name: "obvpm.h3_record_refs",
-    async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData.name !== RR_NODE) return;
-
-        const onNodeCreated = nodeType.prototype.onNodeCreated;
-        nodeType.prototype.onNodeCreated = function () {
-            const r = onNodeCreated?.apply(this, arguments);
-            try {
-                rrSyncOutputs(this);
-            } catch (err) {
-                console.error("[obvpm-h3-refs] initial sync failed:", err);
-            }
-            return r;
-        };
-
-        // fires for both inputs and outputs, which is what we want: the
-        // slot count follows whichever side the user wired
-        const onConnectionsChange = nodeType.prototype.onConnectionsChange;
-        nodeType.prototype.onConnectionsChange = function () {
-            const r = onConnectionsChange?.apply(this, arguments);
-            try {
-                rrSyncOutputs(this);
-            } catch (err) {
-                console.error("[obvpm-h3-refs] sync failed:", err);
-            }
-            return r;
-        };
-
-        // a graph loaded from disk restores links after creation, so the
-        // count has to be recomputed once configure() has run
-        const onConfigure = nodeType.prototype.onConfigure;
-        nodeType.prototype.onConfigure = function () {
-            const r = onConfigure?.apply(this, arguments);
-            try {
-                rrSyncOutputs(this);
-            } catch (err) {
-                console.error("[obvpm-h3-refs] configure sync failed:", err);
-            }
-            return r;
-        };
-    },
-});

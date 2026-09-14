@@ -15,19 +15,13 @@ Pinning · [H3 MCtx Pin Spec](#h3-mctx-pin-spec) ·
 [H3 MCtx Trim Pinned](#h3-mctx-trim-pinned)
 Composing · [H3 MCtx Timeline](#h3-mctx-timeline) ·
 [H3 MCtx Result Preview](#h3-mctx-result-preview) ·
-[H3 MCtx Assemble](#h3-mctx-assemble) ·
-[H3 Assemble Upscale](#h3-assemble-upscale)
-Refining · [H3 Record References](#h3-record-references) ·
-[The joint refine](#the-joint-refine) ·
-[H3 Joint Latent](#h3-joint-latent) ·
+[H3 MCtx Assemble](#h3-mctx-assemble)
+Refining · [The joint refine](#the-joint-refine) ·
+[H3 Join Latents](#h3-join-latents) ·
 [H3 Joint Conditioning](#h3-joint-conditioning) ·
 [H3 Joint Audio Mask](#h3-joint-audio-mask) ·
-[H3 Context Windows](#h3-context-windows) ·
-[H3 Joint Store](#h3-joint-store) ·
-[H3 Upscale Loop Start](#h3-upscale-loop-start) ·
-[H3 Joint Slice](#h3-joint-slice) ·
-[H3 Upscale Loop End](#h3-upscale-loop-end) ·
-[H3 Run Mode Gate](#h3-run-mode-gate)
+[H3 Context Windowing](#h3-context-windowing) ·
+[H3 Joint VAE Decode and Save](#h3-joint-vae-decode-and-save)
 
 ---
 
@@ -45,7 +39,6 @@ saves the clip pair (MP4 + mctx sidecar) in one step.
 | `crf` | INT | H.264 quality for the MP4; the sidecar keeps lossless latents regardless |
 | `audio` | AUDIO (optional) | untrimmed decoded audio; trimmed in lock step and tail-matched to exactly `frames/fps` |
 | `pins` | PINS (optional) | the resolved pins from Apply; unconnected = root clip, saved as-is |
-| `refs` | REFS (optional) | the reference pixels this take was conditioned on, from H3 Record References; recorded beside the clip so a refine can rebuild its conditioning without the `.cond`. A mismatch warns and still saves |
 | `metadata` | STRING (hidden) | provenance JSON stored as `user_meta`; hidden, since the prompt and workflow are now captured automatically |
 
 Outputs: `path` (the written MP4; the sidecar sits next to it), plus
@@ -56,7 +49,7 @@ the trimmed `images` / `audio` for preview.
 The same save transaction without the trim: wire the already-trimmed
 (delivered) images/audio yourself, e.g. when you post-process the
 delivered frames mid-graph before saving. Same inputs as above —
-including `conditioning` and `refs` — except `images`/`audio` must
+including `conditioning` — except `images`/`audio` must
 already be delivered content; refuses when the frame count doesn't
 reconcile with the latent and the pins.
 
@@ -78,7 +71,6 @@ guaranteed-consistent route.
 | `video_path` | STRING | the saved video: absolute or output-relative; a VHS filenames output works, the last path is used |
 | `samples` | LATENT | the sampler's raw output latent |
 | `pins` | PINS (optional) | unconnected = root |
-| `refs` | REFS (optional) | the reference pixels this take was conditioned on, from H3 Record References; recorded beside the clip so a refine can rebuild its conditioning without the `.cond`. A mismatch warns and still saves |
 | `metadata` | STRING (hidden) | `user_meta` JSON; hidden, see above |
 
 The video must be the **delivered (trimmed)** clip. The node validates
@@ -277,9 +269,20 @@ export). The node itself:
 | `crossfade_frames` | INT | fade length; **0 means the whole overlap**, which is the right answer — see the guide (default **0**) |
 | `audio_declick` | BOOLEAN | 5 ms taper each side of joins no crossfade covers (default **off**) |
 | `duration_seconds` | FLOAT | how long the next generation should be; the `length` output converts and snaps it |
-| `run_mode` | COMBO (toolbar) | `generation` or `upscale` — which half of the workflow a Run is for. Driven by the **upscale** toggle on the strip toolbar past **export**, not from the setup widgets. See [H3 Run Mode Gate](#h3-run-mode-gate) |
+| `upscaling` | BOOLEAN (toolbar) | which half of the workflow a Run is for: off generates the next take, on refines the whole timeline and renders the cut. Driven by the **upscale** toggle on the strip toolbar past **export**, not from the setup widgets |
 
-Outputs: `pin_specs`, `length`, `sequence`, `run_mode`.
+Outputs: `pin_specs`, `length`, `sequence`, `upscaling`.
+
+**Switching branches.** A workflow that can both generate a take and
+refine the timeline holds two branches that must never run together.
+Put a **Mute If** gate (comfyui-obvpm) on the last wire before each
+branch's own work begins and drive both from `upscaling`: the
+generation branch's gate on `length` → MiniMax H3 Reference to Video,
+muted when `upscaling` is true; the refine branch's gate on `sequence`
+→ H3 Join Latents, muted when it is false (core's **Not** node inverts
+the wire). Everything downstream of a muted gate is skipped, save nodes
+and previews included, so one switch on the strip decides and the
+branches cannot disagree.
 
 The seam settings above are **defaults, not decisions** — any single join can
 override them from its own seam dialog, and those overrides ride in the
@@ -395,79 +398,6 @@ seam are re-encoded; audio is decoded and encoded once as a continuous
 track (packet-spliced AAC always clicks). No sidecar is written — an
 assembly is delivery, not a take; the source clips remain the masters.
 
-## H3 Assemble Upscale
-
-Plays a finished upscale profile as one MP4 — H3 MCtx Assemble with the
-sequence filled in from the profile itself.
-
-| Input | Type | Notes |
-|---|---|---|
-| `base_folder` | STRING | the project folder, same value the loop and save nodes use |
-| `profile` | STRING | which profile under `<base_folder>/_upscale/` to play; leave empty when `profile_folder` is wired |
-| `filename_prefix` | STRING | empty writes `<profile folder>/cut`, so the refined cut sits with the clips it was made from |
-| `crf` | INT | quality for re-encoded seam bridges; match the takes |
-| `profile_folder` | STRING (optional) | wire Loop End's `profile_folder` here: the folder the pass actually wrote, so nothing is typed twice. Overrides `base_folder` + `profile`, and — like `after` — only becomes a value when the loop finishes |
-| `after` | STRING (optional) | wire Loop End's `report` here and this node runs **when the loop finishes** — see below |
-
-Outputs: `path`, `images`, `audio`, and `sequence` — the list it built,
-so you can see what it played or paste it into H3 MCtx Assemble to
-adjust by hand.
-
-Why a node rather than retyping the list: refined clips are numbered in
-the order the loop **worked**, which is not delivery order — a join
-carried by a clip's tail is delivered after the clip that plays behind
-it. The profile records each clip's delivery position, so the mapping is
-already written down; this reads it. The original ` @ N` cut markers
-come back as typed: a refined clip covers its source's raw span and
-carries its pins, so the source's cut is the refined cut.
-
-A half-finished profile assembles its leading run and says so, rather
-than splicing across the gap — a cut with a clip silently missing looks
-exactly like a finished one.
-
-**Running it automatically.** Wire Loop End's `report` into `after` and
-the assembly happens by itself when the pass ends — once, not once per
-clip. That works because of how the loop iterates: a non-final Loop End
-hands back a *link* to the next iteration's outputs rather than a value,
-so `report` only becomes a real string at the last one. Waiting for it
-is therefore waiting for the whole pass, and nothing downstream can run
-early by accident. Leave `after` unwired to assemble whatever the folder
-holds right now, which is how you watch a pass that is still running.
-
-## H3 Record References
-
-Records the reference images and audio a take is conditioned on,
-**in line** on their way to MiniMax H3 Reference to Video. Add it
-between the loaders and the reference node; it changes nothing about
-what the sampler sees.
-
-| Input | Type | Notes |
-|---|---|---|
-| `image_0` … `image_8` | IMAGE (optional) | mirrors the reference node's nine `ref_images` |
-| `audio_0` … `audio_2` | AUDIO (optional) | mirrors its three `ref_audios` |
-
-Outputs: the same images and audio unchanged, plus `refs` — wire that
-to a save node beside `conditioning`.
-
-In line rather than branched, deliberately: a wire that must pass
-through cannot be forgotten, whereas branching fails as a take that
-looks correct and is missing a reference. Socket *order* is what
-matters, not which numbers are used — the reference node numbers
-references within each type in the order they arrive, so a graph wiring
-`image_0` and `image_3` gets `<Picture 1>` and `<Picture 2>`.
-
-Storage is content-addressed beside the clip: a reference already on
-the 8-bit grid is written as lossless PNG (core's own resize round
-trips through PIL in `uint8`, so this is the common case), anything
-else as exact `safetensors`. Two takes sharing a reference share one
-file.
-
-**Video references are not recorded.** Core presents them to the text
-encoder at 2 fps but VAE-encodes every frame for the payload, so
-reproducing one means keeping all of it. A take with video references
-keeps its `.cond` instead, and the save node says so rather than
-leaving it to be discovered at refine time.
-
 ## The joint refine
 
 A per-clip refine re-invents fine texture from its own prior and noise,
@@ -486,30 +416,23 @@ across the joins. Per step the model runs once per window, so the pass
 costs one pass over the timeline plus the overlaps; memory is one
 window's worth.
 
-The sampled timeline is stored once. The loop then slices each clip's
-own span back out, decodes it, trims it as the source was trimmed and
-saves it as a refined take with the profile manifest, so H3 Assemble
-Upscale plays the cut unchanged.
-
-Outside the loop:
+The sampled timeline **is** the cut — every row is the clip the cut
+shows there — so H3 Joint VAE Decode and Save decodes it straight into one finished
+MP4, a few seconds at a time, and saves it as a take of its own.
 
 ```
-H3 Joint Latent ─ latent ─> LTXVSeparateAVLatent ─> upscaler (temporal chunking ON) ─> LTXVConcatAVLatent ─> H3 Joint Audio Mask ─> sampler.latent_image
-                ─ joint  ─> H3 Joint Conditioning ─────────────────────────────────────────────────────> sampler.conditioning
-                         └> H3 Joint Store.joint
-refine model ─> H3 Context Windows ─> sampler.model        any NOISE ─> sampler.noise
-sampler ─> H3 Joint Store.samples ─ joint_path ─> H3 Upscale Loop Start.joint_path
+H3 Join Latents ─ latent ─> LTXVSeparateAVLatent ─> upscaler (temporal chunking ON) ─> LTXVConcatAVLatent ─> H3 Joint Audio Mask ─> sampler.latent_image
+                ─ layout ─> H3 Joint Conditioning ─────────────────────────────────────────────────────> sampler.conditioning
+                         └> H3 Joint VAE Decode and Save.layout                                        └> H3 Joint VAE Decode and Save.conditioning
+refine model ─> H3 Context Windowing ─> sampler.model        any NOISE ─> sampler.noise
+sampler ─> H3 Joint VAE Decode and Save.samples ─ path ─> H3 MCtx Result Preview
 ```
 
-Inside the loop: `H3 Upscale Loop Start ─ flow ─> H3 Joint Slice ─>
-decode ─> H3 MCtx Trim and Save Video ─ path ─> H3 Upscale Loop End`,
-with the Slice's `pins` on the save node's `pins`, Loop Start's
-`out_folder` on its `base_folder`, and Loop End's `profile_folder` on
-H3 Assemble Upscale. The refine's schedule (`denoise` on the sampler's
-BasicScheduler) is set outside the loop. Mind the model's timestep
-shift (12 for H3): `denoise` is a fraction of the schedule, and the
-noise level the model actually starts from is 12d/(1+11d) — 0.2 starts
-at 75 % noise, 0.075 at 49 %. 0.2 is the working value.
+The refine's schedule is `denoise` on the sampler's BasicScheduler.
+Mind the model's timestep shift (12 for H3): `denoise` is a fraction of
+the schedule, and the noise level the model actually starts from is
+12d/(1+11d) — 0.2 starts at 75 % noise, 0.075 at 49 %. 0.2 is the
+working value.
 
 **The upscaler must chunk along time.** The H3 3D latent upscaler
 normalises over channels, time, height and width together, and it was
@@ -525,7 +448,7 @@ blended inside the network); with it on, the joint refines cleanly at
 0.2 with no seam (measured 2026-09-08, seven clips; the full record is
 in [joint-refine-investigation.md](joint-refine-investigation.md)).
 
-## H3 Joint Latent
+## H3 Join Latents
 
 Lays every clip of the timeline onto one raw AV latent at its true
 position. A pinned clip sits where its recipe says: its held frames
@@ -551,31 +474,37 @@ first seam and four seconds of the wrong clip under the right audio.
 |---|---|---|
 | `sequence` | STRING | the timeline text — the Timeline's `sequence` output through the upscale gate |
 
-Outputs: `latent` (the joint raw AV latent, for the upscaler), `joint`
-(where each clip sits, for Joint Conditioning and Joint Store). The
+Outputs: `latent` (the joint raw AV latent, for the upscaler), `layout`
+(where each clip sits, for Joint Conditioning and Joint VAE Decode and Save). The
 layout is logged when the node runs.
 
 ## H3 Joint Conditioning
 
 Every clip's own conditioning, on the sampler's one CONDITIONING wire.
-Each clip's `.cond` is loaded (or its conditioning rebuilt from its
-recorded references, through the core reference node); the first
-clip's conditioning carries the whole table together with the cut's
-ownership of every step, and H3 Context Windows lays each clip its own
-run of windows and samples them under that clip's conditioning — so a
-timeline of several prompts and reference sets stays several. Without
-Context Windows on the model the sampler simply runs under the first
-clip's.
+Each clip's saved `.cond` is loaded; the first clip's conditioning
+carries the whole table together with the cut's ownership of every
+step, and H3 Context Windowing lays each clip its own run of windows and
+samples them under that clip's conditioning — so a timeline of several
+prompts and reference sets stays several. Without Context Windowing on
+the model the sampler simply runs under the first clip's.
 
 | Input | Type | Notes |
 |---|---|---|
-| `joint` | JOINT | from Joint Latent |
-| `clip` | CLIP (optional, **lazy**) | text encoder — needed only for a clip with no `.cond` that recorded its references |
-| `vae` / `audio_vae` | VAE (optional, **lazy**) | for the same rebuild |
+| `layout` | JOINT | from Join Latents |
 
-The model inputs are lazy: with a `.cond` beside every clip nothing is
-loaded. A clip with neither a `.cond` nor recorded references is
-refused by name.
+No model is loaded: the `.cond` holds the encoded tensors themselves,
+including the reference blocks and any refmods applied on top. A clip
+without a `.cond` is refused by name — it was saved with
+`save_conditioning` off or with no conditioning wired, and there is
+nothing to rebuild it from.
+
+A clip whose `.cond` carries a joint table of its own — a cut rendered
+by H3 Joint VAE Decode and Save, put back on a timeline to be refined again — is
+spliced in rather than treated as one clip: its inner rows are offset
+to where it sits on this joint, and the steps it owns go to whichever
+inner clip owned them there. A second pass therefore still samples each
+stretch of the rendered cut under the prompt and references it was made
+with.
 
 ## H3 Joint Audio Mask
 
@@ -586,11 +515,11 @@ re-renders sound that is already finished.
 | Input | Type | Notes |
 |---|---|---|
 | `latent` | LATENT | the upscaled joint AV latent |
-| `audio_denoise` | FLOAT | `0` keeps the audio exactly. `~0.5` re-samples it alongside the picture (the model re-derives lip sync from it); save the **source** audio then — H3 Joint Slice's `source_audio`, decoded |
+| `audio_denoise` | FLOAT | `0` keeps the audio exactly. `~0.5` re-samples it alongside the picture (the model re-derives lip sync from it); render the **source** audio then — wire H3 Join Latents' `latent` to H3 Joint VAE Decode and Save's `source_audio` |
 
 Wire the sampler's `latent_image` from here.
 
-## H3 Context Windows
+## H3 Context Windowing
 
 A model patch that samples a long AV latent in windows of
 `window_seconds` overlapping by `overlap_seconds`, blending predictions
@@ -612,8 +541,10 @@ sits in the window). Built once per window per run, not per step.
 |---|---|---|
 | `window_seconds` | FLOAT | window length in seconds of picture, rounded to a clip-shaped number of latent steps (5j+2, about 3.4 frames a step; the log reports what it became). 5 by default |
 | `overlap_seconds` | FLOAT | seconds shared by neighbouring windows; the blend happens here. About a quarter of the window; 1.25 by default |
-| `fuse_method` | COMBO | `pyramid` (triangular weights over each window, the default and the working choice) or `flat` (plain average) |
-| `vram_headroom_gb` | FLOAT | VRAM kept free of model weights for one window's activations. 10 by default, matching the 5 s window |
+
+Where windows overlap the two predictions are blended with triangular
+weights (each window counts most in its middle and fades out toward
+its edges), so the hand-over is a ramp rather than a step.
 
 A latent no longer than the window samples plainly. The windows and
 which clip conditions each are logged when sampling starts.
@@ -664,11 +595,11 @@ estimate of the sampling's activations, and it makes that estimate for
 the whole latent in its packed form — for a seven-clip timeline that is
 182 GB, so it loads no weights at all and streams 20 GB from RAM on
 every window. The patch corrects the estimate to one window (plus its
-overlap) in unpacked form, then adds `vram_headroom_gb` on top: core's
-own formula for this model comes out at about 2 GB per window, which is
-far too small, and a window whose activations do not fit spills into
-system RAM and runs ten times slower. Weights that do not fit beside
-the headroom stream from RAM, which costs little. The blended
+overlap) in unpacked form and leaves the rest of the budget to core.
+A window whose activations do not fit beside the weights spills into
+system RAM and runs ten times slower, and the per-step summary line
+reports the measured peak, so a spill shows in the log; shorten the
+window if it does. The blended
 prediction accumulates in system RAM, so the card holds one window's
 tensors and the result, not the timeline several times over. The log
 line `VRAM budgeted for one window` shows the numbers; the load line
@@ -680,132 +611,44 @@ in T s, peak +X MB over Y MB resident (reserved R of T MB)` — X is the
 largest window's activations (measured: 9.2 GB for a 5 s window at
 1920×1088), Y the latents and buffers already on the card (the dynamic
 loader's weights are not counted there; `reserved` is the honest
-total), and a `spill is likely` suffix means the card was full. Set the
-headroom a little above X if you use it. Per-window detail is at DEBUG. Raise it if the load line says `loaded completely`
-and windows still crawl; lower it if windows are quick but more weights
-stream than you like. On a smaller card the same X decides the window:
-activations scale with `window_seconds`, so shorten the window until X
-fits beside a few GB of weights.
+total), and a `spill is likely` suffix means the card was full.
+Per-window detail is at DEBUG. X decides the window: activations scale
+with `window_seconds`, so if the suffix appears or windows crawl,
+shorten the window until X fits beside a few GB of weights.
 
-## H3 Joint Store
+## H3 Joint VAE Decode and Save
 
-Writes the sampled joint latent as
-`<base_folder>/_upscale/<profile>/joint.mctx.safetensors` with each
-clip's span recorded in it and a stamp naming this sampling. Wire
-`joint_path` to H3 Upscale Loop Start. With `reuse_existing` on, a
-joint file already there for this timeline is kept and the sampler is
-not run again — the Timeline re-runs everything downstream on every
-press, and the sampling is the expensive part. Output: `joint_path`;
-the profile folder comes out of Loop End.
-
-## H3 Upscale Loop Start
-
-Opens the loop that turns the joint latent into refined takes: resolves
-which clip this iteration slices, and where it goes.
+The end of the upscale branch: the sampler's output — the refined joint
+AV latent — decoded and written as **one finished MP4**, with a
+`.mctx.safetensors` sidecar beside it holding the refined latent and,
+when `conditioning` is wired, a `.cond` holding what the sampler ran
+under. The rendered cut is therefore a take: put it on a timeline by
+itself and the same upscale branch refines it again (4x from the
+sources), with H3 Joint Conditioning splicing its stored table back in.
 
 | Input | Type | Notes |
 |---|---|---|
-| `joint_path` | STRING | from H3 Joint Store. Its folder is the profile folder |
-| `start_index` | INT | `-1` resumes where the profile left off; the loop drives this itself after the first iteration. A number redoes one clip |
+| `samples` | LATENT | the sampler's output |
+| `vae` / `audio_vae` | VAE | the H3 video and audio VAEs |
+| `base_folder` | STRING | output-relative folder, same meaning as the Timeline's; empty = the output root |
+| `filename_prefix` | STRING | filename prefix within `base_folder` (default `cut`); numbering is appended |
+| `crf` | INT | H.264 quality |
+| `window_seconds` | FLOAT | seconds of picture decoded at a time (default 5). Only memory changes with it — the frames of one window sit in RAM while they are encoded, about 5 GB for 5 s at 1920×1088. The output is identical at any value |
+| `conditioning` | CONDITIONING (optional) | H3 Joint Conditioning's output, stored beside the cut as `.cond`. Unwired = the cut cannot be refined again |
+| `layout` | JOINT (optional) | from Join Latents: the source clips and sequence lines are recorded in the sidecar, and a latent that is not that timeline is refused |
+| `source_audio` | LATENT (optional) | an AV latent whose **audio** is rendered instead of the sampled one — wire Join Latents' `latent` here when Audio Mask re-sampled the sound for lip sync. The sidecar stores the audio that was rendered |
 
-Outputs: `flow` (to Joint Slice and Loop End), `out_folder` (the
-profile folder, for the save node's `base_folder`).
+Output: `path`, the written MP4. Wire it to H3 MCtx Result Preview to
+watch the cut when the pass ends.
 
-The profile folder is the whole state: the joint latent, the refined
-clips and a `profile.json` recording which **source** each came from,
-which sampling it was cut from, and which refined neighbours its
-lineage points at. A clip counts as done only while it was cut from
-the joint file that is there now, so sampling the timeline again
-delivers every clip again. Clips are delivered in dependency order —
-a held join's arriving side after the side it holds — so each refined
-clip's pins can point at the refined neighbour that already exists.
-
-## H3 Joint Slice
-
-Inside the loop: this iteration's clip out of the stored joint latent,
-its own raw span (video steps and audio ticks).
-
-| Input | Type | Notes |
-|---|---|---|
-| `flow` | LOOP | from Loop Start |
-
-Outputs: `latent` (the refined raw AV latent — decode it, and wire the
-save node's `samples` from it), `pins` (trim-only pins: the take's
-recorded recipe, with the source ids of held neighbours renamed to
-their refined renderings, so the save node trims exactly what the
-source trimmed and the refined clips carry the same lineage among
-themselves that the sources had), and `source_audio` (the source
-take's audio latent, for the save node's `audio` when the joint pass
-re-sampled sound). Refuses a joint latent built for a different
-timeline.
-
-## H3 Upscale Loop End
-
-Closes the loop: commits this iteration, then expands the next.
-
-| Input | Type | Notes |
-|---|---|---|
-| `flow` | LOOP | from Loop Start |
-| `after` | STRING | the save node's `path` — what makes the commit happen *after* the clip is on disk |
-
-Outputs: `report` and `profile_folder`. This is an output node, so it is
-an execution root. Both outputs are the pass's **done** signal — they only
-become values at the last iteration — so wire `profile_folder` into H3
-Assemble Upscale's `profile_folder` and the refined cut is built the
-moment the last clip lands, from the folder the pass actually used.
-
-ComfyUI graphs are acyclic, so iteration is **node expansion**: on each
-pass the body is cloned with the next clip's index and handed back to
-the executor. The body is what depends on Loop Start *and* reaches Loop
-End — the joint sampling, the VAEs and anything else feeding it from
-outside are shared, run once, and not cloned. The manifest is written
-after the clip it describes, so a crash between the two leaves a refined
-clip the manifest does not know about, which the next run simply slices
-again.
-
-## H3 Run Mode Gate
-
-A one-wire on/off switch for a whole branch of the graph. The Timeline's
-`run_mode` widget picks `generation` or `upscale`; each gate passes its
-value through in the mode it is set to and shuts in the other.
-
-| Input | Type | Notes |
-|---|---|---|
-| `run_mode` | STRING (wired) | from the Timeline's `run_mode` output. One source for every gate, so two branches cannot disagree |
-| `pass_when` | COMBO | the mode this gate is open in |
-| `value` | any (lazy, wired) | anything at all — the gate does not look at it |
-
-Output: `value`, unchanged when open; a block when shut.
-
-**Why a gate and not muting the output nodes.** Muting works, but it is
-state kept in as many places as the branch has roots, and getting it
-half-right runs both branches. One switch cannot be half-flipped.
-
-**Why it needs two mechanisms.** They cut in opposite directions, and
-neither alone is enough:
-
-- The `value` input is **lazy**, which prunes everything *upstream*.
-  ComfyUI asks the node what it needs before evaluating its inputs, and
-  a shut gate asks for nothing. This is what `MuteGate` cannot do — its
-  own docs say "the nodes upstream of `input` still run".
-- A shut gate returns an **`ExecutionBlocker`**, which prunes everything
-  *downstream*, output nodes included. Every `OUTPUT_NODE` is an
-  execution root: a save node is not reached *through* anything, so
-  laziness can never prune one. Handing it an input it must refuse is
-  the only way.
-
-**Where to put one.** As far upstream in the branch as a single wire can
-reach, because the block travels forwards from there. In
-`h3_obvpm_r2v.json` that is two wires off the Timeline:
-
-| Gate | On the wire | Switches off |
-|---|---|---|
-| `generation` | `length` → MiniMax H3 Reference to Video | the reference encode, the sampler, the decode, the take's save node and its Result Preview |
-| `upscale` | `sequence` → H3 Upscale Loop Start | the whole refine loop, its resume check included, the refined save, and H3 Assemble Upscale behind it |
-
-Nodes that only *feed* a gate — image loaders, a seed — still run. They
-are cheap, and buying their silence would cost a gate each.
-
-An unrecognised run mode is refused loudly at both the Timeline and the
-gate rather than quietly shutting everything: a graph that runs and does
-nothing is the most expensive way to find a typo.
+**Decoded in windows, streamed to the encoder.** A timeline is long —
+1400 frames at 1920×1088 are 35 GB of float pixels — so the frames
+never exist all at once: each window's frames are piped into ffmpeg as
+they are decoded. The window is exact, not a tiling approximation:
+core's H3 decoder already works in chunks of 5 latent steps with a
+2-step lookahead and blends 5 frames into the next chunk, so a window
+that starts and ends on 5-step boundaries, decoded with one chunk of
+run-in before it and the lookahead after it, reproduces the
+whole-latent decode (the run-in's 17 frames are dropped). Without an
+ffmpeg binary the frames are gathered for the in-process encoder
+instead, and a warning says what that costs.

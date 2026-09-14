@@ -47,7 +47,6 @@ from . import crossfade as xf
 from . import frames as fr
 from . import levellock
 from . import mctx
-from . import refstore
 from . import nodes_assemble as na
 from . import yuv
 from .nodes_save import H3SaveVideoWithMCtx
@@ -1192,12 +1191,10 @@ def delete_take(path):
 
     Exists for the Result Preview's delete button: rejecting a take
     right where its measured seam verdict appeared. Removes the MP4,
-    its mctx sidecar, its recorded-references list (.refs.json) and its
-    conditioning cache (.cond.safetensors) -- per-take files that would
-    otherwise sit orphaned, or worse, get adopted by the NEXT take when
-    the save counter reuses the freed number. The content-addressed
-    reference pixels under _refs/ stay: they are shared across every
-    take that used them. Returns the output-relative names removed.
+    its mctx sidecar and its conditioning cache (.cond.safetensors) --
+    per-take files that would otherwise sit orphaned, or worse, get
+    adopted by the NEXT take when the save counter reuses the freed
+    number. Returns the output-relative names removed.
     """
     root = os.path.abspath(folder_paths.get_output_directory())
     ap = os.path.abspath(os.path.join(root, str(path or "").strip()))
@@ -1209,8 +1206,7 @@ def delete_take(path):
     if not os.path.isfile(ap):
         raise ValueError("delete_take: not found: %r" % path)
     removed = []
-    for f in (ap, mctx.sidecar_path(ap),
-              refstore.refs_path(ap), condstore.cond_path(ap)):
+    for f in (ap, mctx.sidecar_path(ap), condstore.cond_path(ap)):
         if os.path.isfile(f):
             os.remove(f)
             removed.append(os.path.relpath(f, root).replace(os.sep, "/"))
