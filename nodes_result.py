@@ -12,6 +12,7 @@ scan the take's folder for the matching sidecar); everything visual
 happens in web/h3_mctx_ui.js from the ui payload returned here.
 """
 
+import json
 import logging
 import os
 
@@ -216,6 +217,7 @@ class H3ResultPreview:
 
         relation, parent_rel, parent2_rel = "", None, None
         seam, seam2 = None, None
+        render = None   # "joint" for a rendered cut (H3 Joint VAE Decode and Save)
 
         def _clip_for(pid, recorded_path=None):
             """The parent clip, output-relative. None when not findable.
@@ -258,6 +260,11 @@ class H3ResultPreview:
             try:
                 header = mctx.read_header(side)
                 relation = header.get("relation") or ""
+                try:
+                    render = (json.loads(header.get("user_meta") or "{}")
+                              or {}).get("render") or None
+                except (TypeError, ValueError):
+                    render = None
                 pid = header.get("parent_id") or ""
                 if not relation:
                     # multi-pin take: derive lineage from the pins
@@ -366,5 +373,5 @@ class H3ResultPreview:
         return {"ui": {"h3_result": [{
             "clip": rel, "parent": parent_rel, "parent2": parent2_rel,
             "relation": relation, "sequence": sequence,
-            "seam": seam, "seam2": seam2,
+            "seam": seam, "seam2": seam2, "render": render,
         }]}}

@@ -374,7 +374,10 @@ timeline is involved. Buttons: **+ add to timeline** (shown when a
 Timeline node matching the clip's folder exists; inserts at the
 lineage-derived position), **✕ delete** (removes the take's MP4 and
 sidecar from disk, after confirmation), **dismiss** (hides the
-buttons).
+buttons). A decision sticks to its take: once added or dismissed, that
+take never asks again, through reloads and workflow switches. A cut
+from H3 Joint VAE Decode and Save is the finished product, so the
+preview offers delete and dismiss for it but not add to timeline.
 
 **Live preview while sampling.** With KJNodes' Model Preview Override
 on the sampler's model, the frames it pushes each step are shown in
@@ -603,8 +606,10 @@ first, then lengthen it if a fast move across a window edge shows.
 estimate of the sampling's activations, and it makes that estimate for
 the whole latent in its packed form — for a seven-clip timeline that is
 182 GB, so it loads no weights at all and streams 20 GB from RAM on
-every window. The patch corrects the estimate to one window (plus its
-overlap) in unpacked form and leaves the rest of the budget to core.
+every window. The patch replaces the estimate with one window's (plus its
+overlap) real need, sized from its token count at about 120 KB a
+token, so core keeps that much VRAM free of weights; weights that no
+longer fit beside it stream from RAM, about a second per window.
 A window whose activations do not fit beside the weights spills into
 system RAM and runs ten times slower, and the per-step summary line
 reports the measured peak, so a spill shows in the log; shorten the

@@ -1275,11 +1275,69 @@ def prepare_sampling_for_window(executor, model, noise_shape, conds, *args, **kw
             est = model.model.memory_required(noise_shape) / (1024 * 1024)
         except Exception:
             pass
-        # (Until 2026-09-14 a vram_headroom_gb widget stretched this
-        # estimate so core kept extra VRAM free of weights; the budget is
-        # left to core now, and each step's summary line still reports
-        # the measured peak so a spill shows in the log.)
+        need = _window_activation_mb(noise_shape)
+        slack = 0.0 if _dynamic_vram() else _CLASSIC_SLACK_MB
+        need += slack
+        if est and need > est:
+            # Core's formula for this model is far too small (under 1 GB
+            # for a 5 s window at 1920x1088 that measures 9.2 GB), so
+            # it loads every weight and the activations spill into system
+            # RAM, where the window runs ten times slower. The formula is
+            # linear in the area after batch and channels, so stretching
+            # the last dim by need / estimate makes it ask for the
+            # measured amount instead -- the same request whichever
+            # attention branch it picks. Weights that no longer fit
+            # beside it stream from RAM, about a second per window.
+            noise_shape[-1] = max(1, int(noise_shape[-1] * (need / est)))
         _LOG.info("obvpm.h3 context windows: VRAM budgeted for one window "
-                  "(%d of %d steps%s)", span, total,
-                  "" if est is None else ", %.0f MB core estimate" % est)
+                  "(%d of %d steps%s, %.0f MB kept for activations%s)", span,
+                  total, "" if est is None else ", %.0f MB core estimate" % est,
+                  need - slack,
+                  "" if not slack else " + %.0f MB allocator slack under the "
+                  "classic loader" % slack)
     return executor(model, noise_shape, conds, *args, **kwargs)
+
+
+def _dynamic_vram():
+    """True when core's dynamic loader manages the weights."""
+    try:
+        import comfy.cli_args
+        return bool(comfy.cli_args.enables_dynamic_vram())
+    except Exception:
+        return True
+
+
+# Under the classic loader (--disable-dynamic-vram) the resident weights
+# are fixed for the run and the stream-ordered allocator keeps what it
+# freed, so the card holds a few GB the activations never asked for.
+# Measured 2026-09-15 on the 32 GB card, 5 s windows at 1920x1088: peak
+# reserved 21.3 GB = 7.9 GB resident + 10.7 GB activations + 2.7 GB of
+# slack, beside core's own 1.2 GB buffer. Budgeting 4 GB for it keeps
+# fewer weights resident and streams the rest from RAM each window
+# (about a second per GB here, so every GB resident matters); a spill
+# costs the whole run.
+_CLASSIC_SLACK_MB = 4 * 1024.0
+
+
+# Activation memory per video token, measured on the 32 GB card: a 37
+# step window at 1920x1088 (75k tokens) peaks at 9.2 GB -- about 122 KB
+# a token, and linear in the token count -- plus a fifth for the audio
+# rows, keyframe rows and the sampler's own buffers.
+_ACTIVATION_MB_PER_TOKEN = 0.122 * 1.2
+_PATCH_AREA = 2 * 2                # H3 patchifies 1x2x2 latent cells per token
+
+
+def _window_activation_mb(noise_shape):
+    """VRAM one window's activations need, from its video element count.
+
+    `noise_shape` is already the window's share in [B, C, T*H*W] form
+    (or the model's own [B, C, T, H, W]); every C x 2 x 2 latent cells
+    make one token.
+    """
+    import comfy.latent_formats
+    ch = int(comfy.latent_formats.MiniMaxH3Video.latent_channels)
+    area = 1
+    for n in noise_shape[2:]:
+        area *= int(n)
+    tokens = int(noise_shape[0]) * int(noise_shape[1]) * area / float(ch * _PATCH_AREA)
+    return tokens * _ACTIVATION_MB_PER_TOKEN

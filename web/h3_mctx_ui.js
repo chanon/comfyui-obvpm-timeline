@@ -325,6 +325,7 @@ app.registerExtension({
                 container, { hideOnZoom: false });
             widget.serialize = false;
             widget.options.serialize = false;
+            tlPanWithMiddleButton(container);
             widget.computeLayoutSize = () => ({ minHeight, minWidth });
             // THE frozen-width culprit (diagnosed via the sampler): once
             // something stores widget.width (the Vue legacy-widget mirror
@@ -756,6 +757,33 @@ function tlSameValue(a, b) {
 // used to be mostly packet copying into real work, and a spinner with no
 // sense of how far along it is reads as a hang.
 const TL_PROGRESS_EVENT = "obvpm.h3.build_progress";
+
+// Middle-button drag pans the canvas -- except over a DOM widget, whose
+// element takes the pointerdown and the canvas never hears of it. The
+// canvas element listens for pointerdown itself and, in its handler,
+// takes pointer capture (CanvasPointer.setPointerCapture), after which
+// every move and the release reach it whatever is under the pointer.
+// So a middle press that lands on one of our panels is handed to the
+// canvas element as a copy of itself and the pan just works; the copy
+// carries the same clientX/Y and pointerId, which is all the canvas
+// reads. Left and right buttons are untouched: those are the panel's.
+function tlPanWithMiddleButton(el) {
+    el.addEventListener("pointerdown", (e) => {
+        if (e.button !== 1) return;
+        const canvas = app.canvas?.canvas;
+        if (!canvas) return;
+        e.preventDefault();
+        e.stopPropagation();
+        canvas.dispatchEvent(new PointerEvent("pointerdown", e));
+    }, true);
+    // the browser's own middle-button behaviours (autoscroll, X11 paste)
+    // would otherwise still fire on the element
+    for (const type of ["mousedown", "auxclick"]) {
+        el.addEventListener(type, (e) => {
+            if (e.button === 1) e.preventDefault();
+        }, true);
+    }
+}
 
 function tlProgressBar() {
     const wrap = document.createElement("div");
@@ -4004,6 +4032,7 @@ app.registerExtension({
                 container, { hideOnZoom: false });
             widget.serialize = false;
             widget.options.serialize = false;
+            tlPanWithMiddleButton(container);
             const minHeight = 320;
             widget.computeLayoutSize = () => ({ minHeight, minWidth: 340 });
             Object.defineProperty(widget, "width", {
@@ -8132,11 +8161,21 @@ function rpScopeFolder(node) {
     } catch (err) {
         src = null; // getInputNode throws while the graph is still loading
     }
-    for (let hop = 0; src && hop < 4; hop++) {
+    for (let hop = 0; src && hop < 6; hop++) {
         const prefix = rpSavePrefix(src);
         if (prefix !== undefined) return prefix;
         try {
-            src = src.getInputNode?.(0) ?? null;
+            // KJNodes Get: no input of its own -- the wire continues at
+            // the Set node carrying the same constant. Without this hop
+            // a preview fed through a Get reads as scope unknown, and
+            // two unknown previews both show every result (2026-09-14).
+            if (src.type === "GetNode") {
+                const key = String(src.widgets?.[0]?.value ?? "");
+                src = (src.graph?._nodes ?? []).find(
+                    (n) => n.type === "SetNode"
+                           && String(n.widgets?.[0]?.value ?? "") === key) ?? null;
+            }
+            src = src?.getInputNode?.(0) ?? null;
         } catch (err) {
             src = null;
         }
@@ -8435,9 +8474,12 @@ function buildResultPreview(node) {
         const url = URL.createObjectURL(blob);
         const old = liveUrl;
         liveUrl = url;
-        // the result of the previous run gives way to the live picture;
-        // stopClock() brings it back if this run leaves no result
+        // the result of the previous run gives way to the live picture,
+        // its clip strip and buttons with it; stopClock() brings them
+        // back if this run leaves no result
         video.style.display = "none";
+        strip.style.display = "none";
+        btnRow.style.display = "none";
         if (mime === "video/mp4") {
             liveImg.style.display = "none";
             liveVideo.src = url;
@@ -8508,6 +8550,7 @@ function buildResultPreview(node) {
                                      { hideOnZoom: false });
     widget.serialize = false;
     widget.options.serialize = false;
+    tlPanWithMiddleButton(container);
     widget.computeLayoutSize = () => ({ minHeight: 220, minWidth: 240 });
     Object.defineProperty(widget, "width", {
         configurable: true, get: () => undefined, set: () => {},
@@ -8754,9 +8797,8 @@ function buildResultPreview(node) {
         strip.replaceChildren();
         strip.style.display = "flex";
         if (!opts?.keep) {
-            dismissed = false;   // a new result is a new decision
-            // ...and the open dialog describes a join that is no longer
-            // on screen, holding the clips it was opened with
+            // the open dialog describes a join that is no longer on
+            // screen, holding the clips it was opened with
             rpCloseSeamDialog(false);
         }
         updateActionBtns(); // owns btnRow visibility too
@@ -9004,9 +9046,13 @@ function buildResultPreview(node) {
     }
     // a live frame is shown only for the run being timed: the event is
     // global, and another workflow's sampling must not paint here
+    // Per node, saved in the workflow: a preview on the refine branch
+    // shares the one event stream with the generation branch's, and
+    // its owner may not want the sampler's frames there at all.
+    const liveWanted = () => node.properties?.h3_live_preview !== false;
     const onLivePreview = (e) => {
         const data = e?.detail;
-        if (!data || runStartedAt === null) return;
+        if (!data || runStartedAt === null || !liveWanted()) return;
         if (typeof data.step === "number" && typeof data.total === "number") {
             liveStep = { step: data.step, total: data.total };
             runTick();
@@ -9057,6 +9103,8 @@ function buildResultPreview(node) {
         if (liveUrl) {
             liveClear();
             if (video.getAttribute("src")) video.style.display = "block";
+            if (current) strip.style.display = "flex";
+            updateActionBtns();
         }
     }
     const onRunEnd = (e) => {
@@ -9136,17 +9184,27 @@ function buildResultPreview(node) {
             return !f || f === folderOf;
         });
     }
-    let dismissed = false; // per-result: cleared by the next render
+    // The decision taken on a take (added, or dismissed) is kept BY CLIP
+    // in the node's properties, so it survives a reload, a workflow
+    // switch and the restore of the same result: the same take never
+    // asks twice. A new take is a new decision; a deleted one is gone.
+    const decided = () => !!current &&
+        node.properties?.h3_decided === current.clip;
+    function decide() {
+        node.properties = node.properties || {};
+        node.properties.h3_decided = current?.clip ?? null;
+    }
     function updateActionBtns() {
-        if (dismissed) {
+        if (decided()) {
             btnRow.style.display = "none";
             return;
         }
         // a take that already sits in a timeline is neither addable
-        // nor safe to delete from here
+        // nor safe to delete from here; a rendered cut is the final
+        // product, not a take for a timeline
         const inTl = current && [...TL_REGISTRY.values()]
             .some((t) => t.has?.(current.clip));
-        const canAdd = !!(current && !inTl &&
+        const canAdd = !!(current && !inTl && current.render !== "joint" &&
             tlMatchesFor(current.clip).length);
         const canDel = !!(current && !inTl);
         addTlBtn.style.display = canAdd ? "" : "none";
@@ -9176,17 +9234,18 @@ function buildResultPreview(node) {
         }
         // the timeline's own refresh is async, so has() still answers
         // with the OLD sequence here -- but the offer just succeeded,
-        // so the take is in a timeline now: hide directly (the hover
-        // re-check keeps this honest if it is later removed again)
+        // so the take is in a timeline now: hide directly, and remember
+        // the decision so the row stays down for this take
+        decide();
         addTlBtn.style.display = "none";
         delBtn.style.display = "none";
         btnRow.style.display = "none"; // dismiss alone is no row
     });
     dismissBtn.addEventListener("click", () => {
         // just tuck the buttons away; the preview itself stays. Sticky
-        // until the next result arrives (hover re-checks must not
-        // resurrect an explicitly dismissed row)
-        dismissed = true;
+        // for this take (hover re-checks and reloads must not resurrect
+        // an explicitly dismissed row)
+        decide();
         btnRow.style.display = "none";
     });
     delBtn.addEventListener("click", async () => {
@@ -9289,6 +9348,26 @@ function buildResultPreview(node) {
             }
         }
     }
+    const prevMenu = node.getExtraMenuOptions;
+    node.getExtraMenuOptions = function (canvas, options) {
+        const r = prevMenu?.apply(this, arguments);
+        options.push({
+            content: (liveWanted() ? "✓ " : "") + "Live preview while sampling",
+            callback: () => {
+                this.properties ??= {};
+                this.properties.h3_live_preview = !liveWanted();
+                if (!liveWanted()) {
+                    liveClear();
+                    if (video.getAttribute("src")) video.style.display = "block";
+                    if (current) strip.style.display = "flex";
+                    updateActionBtns();
+                }
+                this.setDirtyCanvas?.(true, true);
+            },
+        });
+        return r;
+    };
+
     const live = {
         alive: () => !!node.graph,
         describe: () => `#${node.id} watches ${rpScopeFolder(node) ?? "(any)"}`,
