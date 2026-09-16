@@ -2850,6 +2850,11 @@ app.registerExtension({
                          kept: f - head - tail };
             }
             const secTxt = (fr) => (fr / TL_FPS).toFixed(2) + "s";
+            // below this much KEPT footage the readout warns: a run that
+            // pins both ends and keeps under three seconds is a
+            // window-and-a-bit of scaffolding around very little
+            const DUR_SHORT_FRAMES = 3 * TL_FPS;
+            const DUR_WARN = "#e09a2b";      // amber, legible on both grounds
             // The hover: what the run is made of, laid out on ITS OWN
             // timeline. The question this answers is a prompting one --
             // the prompt describes the whole generated run, pinned
@@ -2899,6 +2904,13 @@ app.registerExtension({
                     if (plan.kept <= 0) {
                         L.push("!! The pins leave nothing -- lengthen the "
                                + "run or shrink the window.");
+                    } else if (plan.kept < DUR_SHORT_FRAMES) {
+                        L.push("!! Only " + secTxt(plan.kept) + " of new "
+                               + "footage survives the pins (under "
+                               + (DUR_SHORT_FRAMES / TL_FPS) + "s). A "
+                               + "bridge or loop pins BOTH ends, so a short "
+                               + "run is mostly scaffolding -- lengthen the "
+                               + "run or shrink the window.");
                     }
                     L.push("");
                     L.push("PROMPT FOR THE WHOLE " + (f / TL_FPS).toFixed(2)
@@ -2946,18 +2958,27 @@ app.registerExtension({
                     + "will actually emit: runs live on a grid, so this "
                     + "is rounded to the nearest legal length.";
                 const plan = durPlan(f);
+                // a bridge or loop pins BOTH ends: with a short run most
+                // of it is scaffolding and the clip that reaches the
+                // timeline is a fraction of what was asked. Say so where
+                // the length is set, not after the run.
+                const short = !!(plan && (plan.head || plan.tail)
+                                 && plan.kept < DUR_SHORT_FRAMES);
                 const snapped = f == null ? null
                     : (f / TL_FPS).toFixed(2) + "s · " + f + "f"
                       // the length that ends up on the timeline, when a
                       // pin makes it differ from the length generated
                       + (plan && (plan.head || plan.tail)
-                         ? " · keeps " + secTxt(plan.kept) : "");
+                         ? " · keeps " + secTxt(plan.kept)
+                           + (short ? " ⚠" : "") : "");
                 durOut.textContent = wired
                     ? (secs == null ? "(driven)"
                        : Number(secs.toFixed(3)) + "s → " + snapped)
                     : (snapped == null ? "s → (driven)" : "s → " + snapped);
                 durOut.style.color = f == null ? P.sub
+                    : short ? DUR_WARN
                     : (masks ? P.text : P.sub);
+                durOut.style.fontWeight = short ? "600" : "";
                 durOut.title = f == null
                     ? "The wired value cannot be read from here, so the "
                       + "snapped length is only known at run time."
