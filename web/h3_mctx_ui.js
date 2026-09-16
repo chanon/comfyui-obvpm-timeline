@@ -1,5 +1,6 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
+import { specHandover } from "./h3_handover.js";
 // drop-resolution helpers shared with the loader drop handler -- same
 // trust rules for drops into the timeline strip (in-place when the
 // content already lives in output, upload to dropped/ otherwise)
@@ -2325,11 +2326,17 @@ function tlExtendParent(meta) {
                  join: Number(meta.parent_join_frame) || 0 };
     }
     if (meta.relation) return null;
+    // join = source_start + the window's HANDOVER (nodes_assemble.
+    // _extend_parent). For a hard hold that is the window's end,
+    // source_start + source_frames, which is all this read until
+    // 2026-09-16 -- so a bridge arriving on a soft hold played its
+    // seam at the wrong frame in quick preview while the build (which
+    // reads the handover) had it right.
     const p = tlPins(meta).find((s) => s.place === "before" &&
         s.source_kind === "clip" && s.source_id);
     return p ? { id: p.source_id,
                  join: (Number(p.source_start) || 0) +
-                       (Number(p.source_frames) || 0) } : null;
+                       specHandover(p, "before") } : null;
 }
 function tlPrependChild(meta) {
     // {id, join} of the clip `meta` PREPENDS INTO (its after-context)
@@ -2339,10 +2346,13 @@ function tlPrependChild(meta) {
                  join: Number(meta.parent_join_frame) || 0 };
     }
     if (meta.relation) return null;
+    // join = source_start + handover (nodes_assemble._prepend_child);
+    // a hard hold hands over at 0, a soft one past its ramped frames
     const p = tlPins(meta).find((s) => s.place === "after" &&
         s.source_kind === "clip" && s.source_id);
     return p ? { id: p.source_id,
-                 join: Number(p.source_start) || 0 } : null;
+                 join: (Number(p.source_start) || 0) +
+                       specHandover(p, "after") } : null;
 }
 function tlDeriveSeam(lh, rh) {
     if (!lh || !rh) return { exitL: null, enterR: 0, kind: "butt",
