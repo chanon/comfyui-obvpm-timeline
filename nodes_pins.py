@@ -57,7 +57,17 @@ def _keyframe_origin(pin):
     pin will arrive with neither and go untagged, which the save side
     reads as content without having to know it exists.
     """
-    if pin.get("source_kind") in mctx.LINEAGE_KINDS and pin.get("source_id"):
+    # A RESOLVED pin (what apply() holds) names its source as `kind` +
+    # `source_id` at the top level and keeps the recipe's `source_kind`
+    # inside `spec`; a bare spec has only the latter. Reading just one
+    # spelling tagged nothing for months: every guided and both-mode
+    # keyframe reached the .cond as "content", which a same-resolution
+    # refine tolerates and an upscaled one cannot lay out (a 34x60
+    # keyframe on a 68x120 target grid).
+    spec = pin.get("spec") or {}
+    kind = pin.get("source_kind") or spec.get("source_kind") or pin.get("kind")
+    source_id = pin.get("source_id") or spec.get("source_id")
+    if kind in mctx.LINEAGE_KINDS and source_id:
         return PIN_ORIGIN
     return None
 

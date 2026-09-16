@@ -186,6 +186,44 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(got.tolist(), list(range(10, 20)))
         self.assertEqual(list(nj.crop_blocks(iter(blocks), 30, 40)), [])
 
+    # -- pin keyframes are lineage, and a refine at another size drops them
+
+    def test_resolved_pins_are_tagged_as_lineage(self):
+        np_ = importlib.import_module("obvpm_tl_test.nodes_pins")
+        # the shape apply() holds: kind + source_id at the top, the
+        # recipe's source_kind inside spec
+        resolved = {"kind": "clip", "source_id": "A", "place": "after",
+                    "spec": {"source_kind": "clip", "source_id": "A",
+                             "mode": "both"}}
+        self.assertEqual(np_._keyframe_origin(resolved), np_.PIN_ORIGIN)
+        # a bare spec, and a pixel-graded pin
+        self.assertEqual(np_._keyframe_origin({"source_kind": "clip", "source_id": "A"}),
+                         np_.PIN_ORIGIN)
+        self.assertEqual(np_._keyframe_origin({"kind": "clip_pixels", "source_id": "A"}),
+                         np_.PIN_ORIGIN)
+        # a content anchor names no source and stays untagged
+        self.assertIsNone(np_._keyframe_origin({"kind": "image", "place": "at_frame"}))
+        self.assertIsNone(np_._keyframe_origin({"kind": "clip", "spec": {}}))
+
+    def test_refine_drops_keyframes_at_another_resolution(self):
+        import torch
+        nj = importlib.import_module("obvpm_tl_test.nodes_joint")
+        small = torch.zeros(1, 24, 12, 34, 60)
+        big = torch.zeros(1, 24, 12, 68, 120)
+        audio = torch.zeros(1, 32, 2, 65)
+        kfs = [{"resolved_frame_index": 0, "latent": small},
+               {"resolved_frame_index": 0.0, "audio_latent": audio},
+               {"resolved_frame_index": 40, "latent": big},
+               {"resolved_frame_index": 40.0, "audio_latent": audio}]
+        target = (1, 24, 37, 68, 120)
+        kept = nj.fit_keyframes(kfs, target, "clip 1")
+        # the 34x60 keyframe AND its audio twin go; the 68x120 pair stays
+        self.assertEqual(kept, kfs[2:])
+        # at the matching grid nothing is touched
+        self.assertEqual(nj.fit_keyframes(kfs, (1, 24, 37, 34, 60)), kfs[:2])
+        self.assertEqual(nj.fit_keyframes([], target), [])
+        self.assertIsNone(nj.fit_keyframes(None, target))
+
     def test_seam_plan_treats_entry_zero_as_the_wrap_child(self):
         es = na.resolve_sequence("loop\na.mp4\nt.mp4")
         base = {"level_lock": True, "crossfade": True, "audio_declick": True}

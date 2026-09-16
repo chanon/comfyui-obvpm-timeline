@@ -284,6 +284,48 @@ def timeline_layout(lines, headers, audio_ticks):
             "heads": heads, "hard_hold": hard}
 
 
+def fit_keyframes(keyframes, target_shape, who="clip"):
+    """Keyframes a window at `target_shape` can actually carry.
+
+    Core lays a keyframe's rows out on the TARGET spatial grid (vt x the
+    target's patch rows) but fills them from the keyframe's own latent,
+    so a keyframe recorded at another resolution -- a take's 34x60
+    anchor under a 2x upscaled 68x120 refine -- allocates four rows for
+    every one it supplies and the forward dies on a shape mismatch.
+    Such a keyframe is dropped here, with its audio twin (the entry that
+    follows it, as apply() writes them), and said so once per clip.
+    Takes saved before pin keyframes were tagged as lineage carry one of
+    these in their .cond; this is what lets them still be refined.
+    """
+    if not keyframes:
+        return keyframes
+    try:
+        want = (int(target_shape[3]), int(target_shape[4]))
+    except (TypeError, IndexError):
+        return keyframes
+    out, dropped, skip_audio = [], 0, False
+    for kf in keyframes:
+        z = kf.get("latent") if isinstance(kf, dict) else None
+        if z is not None:
+            have = (int(z.shape[3]), int(z.shape[4]))
+            if have != want:
+                dropped += 1
+                skip_audio = True
+                continue
+            skip_audio = False
+        elif skip_audio and isinstance(kf, dict) and kf.get("audio_latent") is not None:
+            skip_audio = False
+            continue
+        out.append(kf)
+    if dropped:
+        _LOG.warning("obvpm.h3 joint: %s carries %d keyframe(s) at another "
+                     "resolution than this refine's %dx%d latent grid; "
+                     "dropped (a lineage anchor that leaked into its "
+                     ".cond, most likely -- the refine does not need it)",
+                     who, dropped, want[0], want[1])
+    return out
+
+
 def wrap_keep_frames(layout, entries, headers):
     """[lo, hi): the joint frames the cut SHOWS when it loops.
 
@@ -1197,6 +1239,8 @@ class H3WindowHandler:
             keyframes = [
                 dict(kf, resolved_frame_index=kf.get("resolved_frame_index", 0) + shift)
                 if isinstance(kf, dict) else kf for kf in keyframes]
+            keyframes = fit_keyframes(keyframes, sub_shapes[0],
+                                      "clip %s" % (key[0],))
         if keyframes is not None:
             params["minimax_keyframes"] = keyframes
         built = model.extra_conds(**params)
