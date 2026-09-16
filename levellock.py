@@ -348,8 +348,22 @@ def apply_gains(images, g):
     return out.clamp_(0.0, 1.0)
 
 
+def join_pairs(entries, loop=False):
+    """(left index, right index) for every join in playback order.
+
+    A looping cut has one more join than it has boundaries between
+    lines: its last entry into its first. Callers key their results by
+    entry index, so the wrap join lands on entry 0's opening and the
+    last entry's closing with no special case of its own.
+    """
+    pairs = [(i - 1, i) for i in range(1, len(entries))]
+    if loop and entries:
+        pairs.append((len(entries) - 1, 0))
+    return pairs
+
+
 def plan(entries, frames=FRAMES, fit=FIT, fix_step=True, fix_swing=True,
-         opts_for=None):
+         opts_for=None, loop=False):
     """{entry index: gains} for a resolved sequence.
 
     Only joins where one clip genuinely continues another are corrected:
@@ -362,8 +376,8 @@ def plan(entries, frames=FRAMES, fit=FIT, fix_step=True, fix_swing=True,
     away: measuring is the expensive half.
     """
     out, closing = {}, {}
-    for i in range(1, len(entries)):
-        left, right = entries[i - 1], entries[i]
+    for j, i in join_pairs(entries, loop):
+        left, right = entries[j], entries[i]
         if left.get("gap") or right.get("gap"):
             continue
         one = opts_for(i) if opts_for else {}
@@ -393,7 +407,7 @@ def plan(entries, frames=FRAMES, fit=FIT, fix_step=True, fix_swing=True,
         if gc is not None:
             # keyed by the entry that gets corrected, exactly as `out`
             # is: there it is the right clip, here the left one
-            closing[i - 1] = gc
+            closing[j] = gc
             _LOG.debug("obvpm.h3: level lock %s -> %s: step %+.2f, "
                        "swing %.2f, gain %.4f..%.4f (closing %s)",
                        left.get("clip"), right.get("clip"),
@@ -402,7 +416,7 @@ def plan(entries, frames=FRAMES, fit=FIT, fix_step=True, fix_swing=True,
     return out, closing
 
 
-def report(entries, frames=FRAMES, fit=FIT, with_gains=False):
+def report(entries, frames=FRAMES, fit=FIT, with_gains=False, loop=False):
     """Per-join measurements for the UI: one entry per seam index.
 
     `with_gains` adds the correction as a list of per-frame LUMA gains.
@@ -413,8 +427,8 @@ def report(entries, frames=FRAMES, fit=FIT, with_gains=False):
     joins, i.e. invisible). The export still applies all three.
     """
     out = {}
-    for i in range(1, len(entries)):
-        left, right = entries[i - 1], entries[i]
+    for j, i in join_pairs(entries, loop):
+        left, right = entries[j], entries[i]
         if left.get("gap") or right.get("gap"):
             continue
         try:

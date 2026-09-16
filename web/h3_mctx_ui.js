@@ -1840,6 +1840,20 @@ tldbg("timeline code loaded, build v39-resume-play");
 // cut that round-trips differently here is a cut that silently moves.
 const TL_LINE_RE = /^(.+?)(?:\s*@\s*(\d+)?(?:\s*\.\.\s*(\d+))?)?$/;
 const TL_GAP_RE = /^~\s*(\d+)$/;
+// The one directive: `loop` makes the cut a RING -- its last entry joins
+// its first. Mirrors _LOOP_RE / sequence_loops. Not an entry: every
+// index map over the raw lines must skip it the way it skips comments,
+// or a cut lands one line off.
+const TL_LOOP_RE = /^loop$/i;
+const TL_LOOP_LINE = "loop";
+function tlSequenceLoops(text) {
+    return String(text || "").split("\n")
+        .some((raw) => TL_LOOP_RE.test(raw.trim()));
+}
+function tlIsEntryLine(trimmed) {
+    return !!trimmed && !trimmed.startsWith("#")
+        && !TL_LOOP_RE.test(trimmed);
+}
 
 // PER-SEAM SETTINGS: mirrors nodes_assemble's split_seam_opts /
 // format_seam_opts, and must stay in lockstep with them. The bracket
@@ -2008,7 +2022,7 @@ function tlParseSequence(text) {
     const out = [];
     for (const raw of String(text || "").split("\n")) {
         const line = raw.trim();
-        if (!line || line.startsWith("#")) continue;
+        if (!tlIsEntryLine(line)) continue;
         const g = line.match(TL_GAP_RE);
         if (g) {
             out.push({ clip: null, gap: Number(g[1]),
@@ -3391,6 +3405,33 @@ app.registerExtension({
                 }
                 return st.source === clip ? st.role : null;
             }
+            // Does the clip carry THIS role? Asked per side, because a
+            // clip bridged onto itself (the take that loops a lone clip)
+            // carries both, and pinRoleFor can only answer one.
+            function pinHasRole(clip, st, role) {
+                if (!st) return false;
+                if (st.role === "bridge") {
+                    return role === "extend" ? st.source === clip
+                                             : st.source2 === clip;
+                }
+                return st.source === clip && st.role === role;
+            }
+            // A bridge from the LAST entry into the FIRST is the take
+            // that closes a loop -- the same clip on both sides when the
+            // strip holds only one.
+            function impliesLoop(st) {
+                if (!st || st.role !== "bridge" || !lastEntries?.length) {
+                    return false;
+                }
+                return st.source === lastEntries[lastEntries.length - 1].clip
+                    && st.source2 === lastEntries[0].clip;
+            }
+            // Arming that bridge is deciding the cut loops: a take with
+            // both feet on the strip's ends has nowhere else to land.
+            function setBridge(st) {
+                setPinState(st);
+                if (impliesLoop(st) && !loopOn()) setLoop(true);
+            }
             // The pin AS SHOWN. The run mode itself lives on the toolbar
             // (see runModeBtn above); it changes NOTHING about what is
             // stored -- the pin stays exactly as it was, so switching
@@ -4067,13 +4108,33 @@ app.registerExtension({
                 void refresh();
             }
             function entryLines() {
-                // indices of non-comment lines within the raw line list
+                // indices of entry lines (not comments, not the loop
+                // directive) within the raw line list
                 const map = [];
                 currentLines().forEach((raw, i) => {
                     const t = raw.trim();
-                    if (t && !t.startsWith("#")) map.push(i);
+                    if (tlIsEntryLine(t)) map.push(i);
                 });
                 return map;
+            }
+            // The cut as a RING: its last entry joins its first. Stored
+            // as the `loop` line in the sequence text -- a property of
+            // the cut, so it lives with the cut -- and set from the end
+            // pills' menu ("+ loop new" arms the take that closes the
+            // ring and writes the line; "stop looping" removes it), or
+            // implied by pinning a lone clip on both sides. There is no
+            // separate switch: it would be a second control for the
+            // same fact. Everything that acts on the wrap (end pills,
+            // quick playback, the export) reads the text.
+            function loopOn() { return tlSequenceLoops(seqWidget?.value); }
+            // The directive's one writer. It rides as the FIRST line, so
+            // a glance at the text says the cut is a ring before it says
+            // what is in it; reading accepts it anywhere.
+            function setLoop(on) {
+                const kept = currentLines().filter(
+                    (raw) => !TL_LOOP_RE.test(raw.trim()));
+                if (on) kept.unshift(TL_LOOP_LINE);
+                setSequence(kept.join("\n"));
             }
             // One writer for cuts, going through the same formatter the
             // server's parser mirrors. `null` clears that side.
@@ -4165,7 +4226,7 @@ app.registerExtension({
                 const map = [];
                 lines.forEach((raw, k) => {
                     const t = raw.trim();
-                    if (t && !t.startsWith("#")) map.push(k);
+                    if (tlIsEntryLine(t)) map.push(k);
                 });
                 const at = to >= map.length ? lines.length : map[to];
                 lines.splice(at, 0, moved);
@@ -4572,7 +4633,9 @@ app.registerExtension({
                 // Without this the gap ends onto an empty <video>, which
                 // has to start loading from scratch -- playback stalls
                 // there instead of continuing across.
-                preloadInto(vids[1 - act], playlist[i + 1]);
+                preloadInto(vids[1 - act],
+                            playlist[i + 1] ?? (loopOn() ? playlist[0]
+                                                        : undefined));
                 if (!autoplay) return;
                 const t0 = performance.now();
                 const tick = () => {
@@ -4705,6 +4768,14 @@ app.registerExtension({
                 rafId = requestAnimationFrame(tick);
             }
             function playAt(i, offset = 0, autoplay = true) {
+                // a looping cut wraps: running off the end starts over,
+                // through the wrap cut (already in the playlist's
+                // enters/exits), which is the seam to be listening for
+                if (i >= playlist.length && i > 0 && playlist.length
+                        && loopOn()) {
+                    playAt(0, 0, autoplay);
+                    return;
+                }
                 if (i < 0 || i >= playlist.length) {
                     // Running off the end must STOP the picture. Without
                     // this the last clip's <video> kept rolling past its
@@ -4755,7 +4826,9 @@ app.registerExtension({
                 showActive();
                 highlight(i);
                 if (autoplay) tryPlay(v);
-                preloadInto(vids[1 - act], playlist[i + 1]);
+                preloadInto(vids[1 - act],
+                            playlist[i + 1] ?? (loopOn() ? playlist[0]
+                                                        : undefined));
                 watchBoundary();
             }
             for (const v of vids) {
@@ -5574,12 +5647,18 @@ app.registerExtension({
                         pill.style.color = "#fff";
                         pill.style.font = "bold 11px/13px sans-serif";
                     }
-                    const edge = !Le ? "timeline start"
+                    // an end zone with BOTH sides is the wrap of a loop
+                    const wrapZone = !!(Le && Re && loopOn()
+                        && (i === 0 || i === entries.length));
+                    const edge = wrapZone
+                        ? "loop: the end wraps onto the start (no link yet)"
+                        : !Le ? "timeline start"
                         : !Re ? "timeline end"
                         : (Le.gap != null || Re.gap != null)
                             ? "edge of empty space"
                             : "no link";
-                    const baseTitle = (hasLink ? seam.note : edge)
+                    const baseTitle = (hasLink
+                        ? (wrapZone ? "loop: " : "") + seam.note : edge)
                         + (atPin
                            ? "\nnext run generates here" : "");
                     // always clickable: even with no linking clips on
@@ -5678,11 +5757,23 @@ app.registerExtension({
                     const lB = blockEls[blockEls.length - 1];
                     // straddling the outer clip edge, exactly like the
                     // interior pills straddle the gap between blocks
-                    if (first.meta && fB) {
+                    // a looping cut has ONE seam here, drawn at both
+                    // ends: the last clip into the first. Both pills
+                    // carry the wrap's link state and open the same menu.
+                    const wrap = loopOn() && first.gap == null
+                        && last.gap == null && (first.meta || last.meta);
+                    const wrapSeam = wrap ? (first.wrapSeam ?? null) : null;
+                    if (wrap && fB) {
+                        addZone(0, fB.offsetLeft, wrapSeam, last, first);
+                    } else if (first.meta && fB) {
                         addZone(0, fB.offsetLeft, null,
                                 null, first);
                     }
-                    if (last.meta && lB) {
+                    if (wrap && lB) {
+                        addZone(entries.length,
+                                lB.offsetLeft + lB.offsetWidth,
+                                wrapSeam, last, first);
+                    } else if (last.meta && lB) {
                         addZone(entries.length,
                                 lB.offsetLeft + lB.offsetWidth,
                                 null, last, null);
@@ -5694,9 +5785,15 @@ app.registerExtension({
                 closeSeamPopup();
                 lastSeamX = x;
                 lastSeamLink = hasLink;
-                // edge zones have only one real side
-                const L = i > 0 ? entries[i - 1] : null;
-                const R = i < entries.length ? entries[i] : null;
+                // edge zones have only one real side -- unless the cut
+                // loops, when both ends are the SAME seam: last into
+                // first (the same clip on both sides when there is one)
+                const n = entries.length;
+                const wrap = loopOn() && n > 0 && (i === 0 || i === n)
+                    && entries[0].gap == null && entries[n - 1].gap == null;
+                const L = i > 0 ? entries[i - 1]
+                    : wrap ? entries[n - 1] : null;
+                const R = i < n ? entries[i] : wrap ? entries[0] : null;
                 const pop = document.createElement("div");
                 seamPopup = pop;
                 const stripTop = timelineWrap.offsetTop +
@@ -5777,8 +5874,8 @@ app.registerExtension({
                         // ALREADY active the item wears the pin purple
                         // and clicking it again clears the pin
                         const cur = pinState();
-                        const genActive = pinRoleFor(
-                            side.gen.clip, cur) === side.gen.role;
+                        const genActive = pinHasRole(
+                            side.gen.clip, cur, side.gen.role);
                         const g = item(parent,
                             side.gen.role === "extend"
                                 ? "+ extend new" : "+ prepend new",
@@ -5824,10 +5921,55 @@ app.registerExtension({
                 };
 
                 pop.textContent = "";
-                const insertAtGap = (clip) => {
+                // Either END pill offers the loop, whether or not the
+                // cut loops yet: "+ loop new" arms the take that CLOSES
+                // the ring -- one run, extending the last clip and
+                // prepending into the first -- and writes the `loop`
+                // line; while the cut loops, "stop looping" removes it.
+                // The loop is created and undone in one place.
+                const endL = entries[n - 1], endR = entries[0];
+                const atEnd = n > 0 && (i === 0 || i === n)
+                    && endL.gap == null && endR.gap == null;
+                if (atEnd && !upscaleMode() && tlPinGrade(endL)
+                        && tlPinGrade(endR)) {
+                    const cur = pinState();
+                    const active = impliesLoop(cur);
+                    const same = endL.clip === endR.clip;
+                    const g = item(pop,
+                        active ? "✓ loop take armed" : "+ loop new",
+                        active ? "active -- click to clear the pin"
+                            : (same
+                                ? "next run bridges " + endL.clip
+                                  + "'s tail to its own head"
+                                : "next run bridges " + endL.clip + " → "
+                                  + endR.clip)
+                              + (loopOn() ? ""
+                                 : " and makes the cut loop"),
+                        () => {
+                            if (active) { setPinState(null); return; }
+                            setBridge({ role: "bridge", source: endL.clip,
+                                        source2: endR.clip,
+                                        window: cur?.window ?? "22" });
+                        });
+                    g.style.fontWeight = "600";
+                    g.style.color = active
+                        ? (PAL.light ? "#5e3a9e" : TL_ROLE.extend.text)
+                        : PAL.text;
+                }
+                if (atEnd && loopOn()) {
+                    const s = item(pop, "stop looping",
+                        "open the cut again: the ends stop being a seam, "
+                        + "playback stops at the end, and the export keeps "
+                        + "its own top and tail. Any pin stays as it is.",
+                        () => setLoop(false));
+                    s.style.color = PAL.sub;
+                }
+                // at the wrap, "before the first" is line 0 and "after
+                // the last" is the end -- not the zone's own index
+                const insertAtGap = (clip, idx = i) => {
                     const ls = currentLines();
                     const map = entryLines();
-                    const at = i >= map.length ? ls.length : map[i];
+                    const at = idx >= map.length ? ls.length : map[idx];
                     ls.splice(at, 0, clip);
                     setSequence(ls.join("\n"));
                 };
@@ -5845,7 +5987,7 @@ app.registerExtension({
                         title: "replace left side",
                         items: cand.filter((c) => c.clip !== L.clip &&
                             linkedMeta(c.meta, R.meta)),
-                        act: (clip) => replaceAt(i - 1, clip),
+                        act: (clip) => replaceAt(wrap ? n - 1 : i - 1, clip),
                         gen: tlPinGrade(R)
                             ? { clip: R.clip, role: "prepend",
                                 pixel: tlPinGrade(R) === "pixel" } : null,
@@ -5854,7 +5996,7 @@ app.registerExtension({
                         title: "replace right side",
                         items: cand.filter((c) => c.clip !== R.clip &&
                             linkedMeta(L.meta, c.meta)),
-                        act: (clip) => replaceAt(i, clip),
+                        act: (clip) => replaceAt(wrap ? 0 : i, clip),
                         gen: tlPinGrade(L)
                             ? { clip: L.clip, role: "extend",
                                 pixel: tlPinGrade(L) === "pixel" } : null,
@@ -5873,7 +6015,7 @@ app.registerExtension({
                             title: "insert before",
                             items: R.meta ? cand.filter((c) =>
                                 linkedMeta(c.meta, R.meta)) : [],
-                            act: insertAtGap,
+                            act: (clip) => insertAtGap(clip, wrap ? 0 : i),
                             gen: { clip: R.clip, role: "prepend",
                                    pixel: tlPinGrade(R) === "pixel" },
                         });
@@ -5883,7 +6025,7 @@ app.registerExtension({
                             title: "insert after",
                             items: L.meta ? cand.filter((c) =>
                                 linkedMeta(L.meta, c.meta)) : [],
-                            act: insertAtGap,
+                            act: (clip) => insertAtGap(clip, wrap ? n : i),
                             gen: { clip: L.clip, role: "extend",
                                    pixel: tlPinGrade(L) === "pixel" },
                         });
@@ -6492,6 +6634,20 @@ app.registerExtension({
                     entries[i].enter = s.enterR;
                     entries[i].seam = s;
                 }
+                // the wrap join of a looping cut: last into first, by
+                // the same rule (mirrors resolve_sequence). A gap at
+                // either end cannot wrap: the server refuses that build,
+                // and the strip shows the ends unjoined rather than
+                // pretending.
+                if (loopOn() && entries.length && entries[0].gap == null
+                        && entries[entries.length - 1].gap == null) {
+                    const first = entries[0];
+                    const last = entries[entries.length - 1];
+                    const s = tlDeriveSeam(last.meta, first.meta);
+                    if (last.exit === null) last.exit = s.exitL;
+                    first.enter = s.enterR;
+                    first.wrapSeam = s;
+                }
                 // a manual cut IS the decision -- it beats the derived seam
                 for (const e of entries) {
                     if (e.enterOverride !== null) e.enter = e.enterOverride;
@@ -6713,7 +6869,12 @@ app.registerExtension({
                     // corners. Green = seamless link on that side,
                     // purple = the next run regenerates on that side,
                     // gray = otherwise.
-                    const seamR = entries[i + 1]?.seam;
+                    // at the ends of a looping cut the wrap seam is the
+                    // last clip's right join and the first clip's left
+                    const seamR = entries[i + 1]?.seam
+                        ?? (i === entries.length - 1
+                            ? entries[0]?.wrapSeam : undefined);
+                    const seamL = i > 0 ? e.seam : e.wrapSeam;
                     const mkBar = (side, color) => {
                         const bar = document.createElement("div");
                         Object.assign(bar.style, {
@@ -6725,14 +6886,16 @@ app.registerExtension({
                         return bar;
                     };
                     block.append(
+                        // per SIDE, not per role: a clip bridged onto
+                        // itself carries both
                         mkBar("left",
-                            pinnedRole === "prepend"
+                            pinHasRole(e.clip, pst, "prepend")
                                 ? TL_ROLE.prepend.bg
-                                : i > 0 && e.seam?.kind === "seamless"
+                                : seamL?.kind === "seamless"
                                     ? TL_COLORS.seamless
                                     : TL_COLORS.butt),
                         mkBar("right",
-                            pinnedRole === "extend"
+                            pinHasRole(e.clip, pst, "extend")
                                 ? TL_ROLE.extend.bg
                                 : seamR?.kind === "seamless"
                                     ? TL_COLORS.seamless
@@ -6753,13 +6916,22 @@ app.registerExtension({
                             background: TL_ROLE[pinnedRole].bg,
                             color: "#fff", font: "9px sans-serif",
                         });
-                        pb.textContent = pinnedRole === "extend"
-                            ? "extending" : "prepending";
-                        pb.title = pinnedRole === "extend"
-                            ? "the next generation extends from this "
-                              + "clip's tail"
-                            : "the next generation prepends into this "
-                              + "clip's head";
+                        // the take that closes a loop wears its own
+                        // word on both clips it touches (or the one)
+                        const looping = impliesLoop(pst) &&
+                            (pst.source === e.clip || pst.source2 === e.clip);
+                        pb.textContent = looping ? "looping"
+                            : pinnedRole === "extend"
+                                ? "extending" : "prepending";
+                        pb.title = looping
+                            ? "the next generation closes the loop: it "
+                              + "bridges the last clip's tail to the "
+                              + "first clip's head"
+                            : pinnedRole === "extend"
+                                ? "the next generation extends from this "
+                                  + "clip's tail"
+                                : "the next generation prepends into this "
+                                  + "clip's head";
                         pinSlot.appendChild(pb);
                     }
                     subRow.append(sub, mbadge, pinSlot);
@@ -7040,7 +7212,7 @@ app.registerExtension({
             function togglePinFor(clip, role) {
                 const cur = pinState();
                 const w = cur?.window ?? "22";
-                if (pinRoleFor(clip, cur) === role) {
+                if (pinHasRole(clip, cur, role)) {
                     // toggling an ACTIVE side off: a bridge keeps its
                     // other side as a single pin, a single pin clears
                     if (cur.role === "bridge") {
@@ -7057,10 +7229,15 @@ app.registerExtension({
                 // opposite-side single pin already set on another clip
                 // -> combine into a bridge (extend side = source,
                 // prepend side = source2)
+                // ...or on the SAME clip when it is the only one on the
+                // strip: extending its tail and prepending its head in
+                // one run is the take that loops it onto itself
+                const alone = lastEntries?.length === 1 &&
+                    lastEntries[0].clip === clip;
                 if (cur && cur.role !== "bridge" &&
-                        clip !== cur.source && cur.role ===
+                        (clip !== cur.source || alone) && cur.role ===
                         (role === "extend" ? "prepend" : "extend")) {
-                    setPinState(role === "extend"
+                    setBridge(role === "extend"
                         ? { role: "bridge", source: clip,
                             source2: cur.source, window: w }
                         : { role: "bridge", source: cur.source,
@@ -7248,8 +7425,13 @@ app.registerExtension({
                 }
                 const shortName = st.source.split("/").pop();
                 value.textContent = st.role === "bridge"
-                    ? `bridges ${shortName} → `
-                      + st.source2.split("/").pop()
+                    ? (impliesLoop(st)
+                        ? (st.source === st.source2
+                            ? `loops ${shortName} onto itself`
+                            : `loops: bridges ${shortName} → `
+                              + st.source2.split("/").pop())
+                        : `bridges ${shortName} → `
+                          + st.source2.split("/").pop())
                     : st.role === "extend"
                         ? `extends ${shortName}`
                         : `prepends into ${shortName}`;
@@ -7438,7 +7620,7 @@ app.registerExtension({
                 // active, not framed buttons -- they read as part of
                 // the bar itself
                 const mkToggle = (role, label, title) => {
-                    const active = pinRoleFor(e.clip, pst) === role;
+                    const active = pinHasRole(e.clip, pst, role);
                     const b = document.createElement("button");
                     b.textContent = label;
                     b.title = pixel

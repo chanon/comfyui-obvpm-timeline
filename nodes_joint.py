@@ -43,6 +43,7 @@ from . import avpack
 from . import condload
 from . import frames as fr
 from . import mctx
+from . import nodes_assemble as na
 from . import nodes_load
 from . import wiretypes as wt
 
@@ -68,13 +69,14 @@ def parse_sequence(text):
     """The timeline's `sequence` widget -> clip paths, in delivery order.
 
     The same shape H3Assemble reads: one output-relative clip per line,
-    `# ...` ignored, and an optional ` @ N` cut marker which is about
-    where a clip ENTERS the cut and is not part of its identity.
+    `# ...` and the `loop` directive ignored, and an optional ` @ N` cut
+    marker which is about where a clip ENTERS the cut and is not part of
+    its identity.
     """
     clips = []
     for line in str(text or "").splitlines():
         line = line.strip()
-        if not line or line.startswith("#"):
+        if not line or line.startswith("#") or na.LOOP_RE.match(line):
             continue
         clips.append(line.split("@")[0].strip())
     return [c for c in clips if c]
@@ -89,7 +91,7 @@ def parse_sequence_lines(text):
     out = []
     for line in str(text or "").splitlines():
         line = line.strip()
-        if not line or line.startswith("#"):
+        if not line or line.startswith("#") or na.LOOP_RE.match(line):
             continue
         if line.split("@")[0].strip():
             out.append(line)
@@ -272,11 +274,59 @@ def timeline_layout(lines, headers, audio_ticks):
                     and not pins[0].get("mask_ramp_frames")
                     and not pins[0].get("mask_hold"))
     return {"steps": steps, "ticks": ticks,
+            # each clip's RAW frame 0 on the joint, in frames -- what a
+            # delivered frame of a clip maps through (see wrap_keep_frames)
+            "starts": [int(s - first) for s in starts_frames],
             "total_steps": int(total_steps), "total_frames": int(total_frames),
             "total_ticks": int(total_ticks),
             "owner_steps": owners(steps, j_steps, int(total_steps)),
             "owner_ticks": owners(ticks, j_ticks, int(total_ticks)),
             "heads": heads, "hard_hold": hard}
+
+
+def wrap_keep_frames(layout, entries, headers):
+    """[lo, hi): the joint frames the cut SHOWS when it loops.
+
+    The joint carries every clip's whole raw latent, and that is right
+    for refining: the take that closes a loop ends on rows reproducing
+    the first clip's head, and the sampler should see them as context.
+    But the rendered file must not: played on repeat it would show that
+    opening twice. So the render is cropped to the cut's own wrap --
+    the first entry's derived `enter` (past the frames the loop take
+    delivers itself) to the last entry's `exit` -- mapped into joint
+    coordinates: a clip's delivered frame f sits at its raw start plus
+    its pinned head plus f. `entries` are resolve_sequence's, so manual
+    cuts are already in.
+    """
+    starts, heads = layout["starts"], layout["heads"]
+    first, last = entries[0], entries[-1]
+    lo = starts[0] + heads[0] + int(first.get("enter") or 0)
+    exit_ = last.get("exit")
+    if exit_ is None:
+        exit_ = int(headers[-1].get("delivered_frames", 0) or 0)
+    hi = starts[-1] + heads[-1] + int(exit_)
+    lo, hi = max(0, lo), min(int(layout["total_frames"]), hi)
+    if hi <= lo:
+        raise ValueError(
+            "H3 Join Latents: the loop's wrap leaves nothing to render "
+            "(frames %d..%d of %d)." % (lo, hi, layout["total_frames"]))
+    return [int(lo), int(hi)]
+
+
+def crop_blocks(blocks, lo, hi):
+    """The frame blocks of a decode, cut to joint frames [lo, hi).
+
+    Every block is still drawn from the decoder -- the windows past
+    `hi` are its last ones and it must run to the end to report -- but
+    only frames inside the range are yielded.
+    """
+    pos = 0
+    for block in blocks:
+        n = int(block.shape[0])
+        a, b = max(lo, pos), min(hi, pos + n)
+        if b > a:
+            yield block[a - pos:b - pos]
+        pos += n
 
 
 def assemble(videos, audios, layout):
@@ -402,6 +452,16 @@ class H3JointLatent:
         layout = timeline_layout(lines, headers, [a.shape[-1] for a in audios])
         video, audio = assemble(videos, audios, layout)
         record = dict(layout, clips=list(clips), lines=list(lines))
+        if na.sequence_loops(sequence):
+            # the cut's own wrap, hash-verified and with manual cuts in,
+            # as the frames the RENDER keeps; the joint itself is whole
+            entries = na.resolve_sequence(sequence)
+            record["keep_frames"] = wrap_keep_frames(layout, entries, headers)
+            lo, hi = record["keep_frames"]
+            _LOG.info("obvpm.h3 joint: the cut loops -- the render keeps "
+                      "frames %d..%d of %d (%d off the head, %d off the "
+                      "tail, which reproduce the opening)", lo, hi,
+                      layout["total_frames"], lo, layout["total_frames"] - hi)
         info = "\n".join(
             "%s: steps %d..%d, ticks %d..%d"
             % (clip, s, s + n, t, t + m)

@@ -258,18 +258,21 @@ def _read_meta(meta_path):
 # The timeline's own values, as build_preview receives them. A join may
 # override any of them from its own sequence line -- see
 # nodes_assemble.split_seam_opts.
-def _seam_plan(entries, base):
+def _seam_plan(entries, base, loop=False):
     """The settings in force at each join, indexed by the CHILD entry.
 
     A join's overrides ride on the clip to its RIGHT, so entry i's
     settings describe the join between i-1 and i -- the same index the
     corrections themselves are keyed by. Absent keys inherit `base`.
+    In a looping cut entry 0 is the child of the wrap join, so its
+    settings describe the join out of the last entry.
     """
     out = []
     for i, e in enumerate(entries):
         one = dict(base)
-        if i and na.masked_continuation(entries[i - 1].get("header"),
-                                        e.get("header")):
+        prev = entries[i - 1] if i else (entries[-1] if loop else None)
+        if prev is not None and na.masked_continuation(
+                prev.get("header"), e.get("header")):
             # a masked join is latent-identical: repairs would correct
             # noise (measured to INTRODUCE flicker). Defaults off; the
             # join's own seam_opts below still override.
@@ -280,7 +283,7 @@ def _seam_plan(entries, base):
     return out
 
 
-def _join_fixes(entries, plan):
+def _join_fixes(entries, plan, loop=False):
     """({index: opening gains}, {index: fade frames}, {ramps},
     {index: closing gains}) for a sequence.
 
@@ -352,7 +355,12 @@ def _join_fixes(entries, plan):
     # two directions: `locks` corrects a child's OPENING (an extend),
     # `tail_locks` corrects a take's CLOSING (a prepend, working
     # backwards from the join). Both are keyed by the entry they touch.
-    locks, tail_locks = levellock.plan(entries, opts_for=lock_opts)
+    # the wrap join of a loop is planned like any other: its opening
+    # correction lands on entry 0, its closing one on the last entry.
+    # No crossfade crosses the wrap (the blend would have to straddle
+    # the file's end); bridge joins default it off regardless.
+    locks, tail_locks = levellock.plan(entries, opts_for=lock_opts,
+                                       loop=loop)
 
     # Where the lock is off but a fade runs, the fade has to carry the
     # level itself -- and only where the join measured a step worth
@@ -363,7 +371,8 @@ def _join_fixes(entries, plan):
         return {"frames": opt(i, "level_lock_frames", levellock.FRAMES),
                 "fix_step": True, "fix_swing": False}
 
-    ramps = set(levellock.plan(entries, opts_for=ramp_opts)[0]) & set(fades)
+    ramps = set(levellock.plan(entries, opts_for=ramp_opts,
+                               loop=loop)[0]) & set(fades)
     return locks, fades, ramps, tail_locks, tfades
 
 
@@ -784,6 +793,7 @@ def build_preview(sequence, crf, probe=False, base_folder="",
     import torch
 
     entries = na.resolve_sequence(sequence)
+    loop = na.sequence_loops(sequence)
 
     played = []
     for e in entries:
@@ -813,13 +823,14 @@ def build_preview(sequence, crf, probe=False, base_folder="",
         "crossfade_frames": int(crossfade_frames),
         "audio_declick": bool(audio_declick),
     }
-    seam_plan = _seam_plan(entries, base_opts)
+    seam_plan = _seam_plan(entries, base_opts, loop)
     # The RESOLVED settings go in the key, not the timeline's defaults:
     # a per-join override changes the output, so a preview built under
-    # one must not be served for another.
+    # one must not be served for another. `loop` too: the same lines
+    # build a different file once they wrap.
     fixes = [[one[k] for k in sorted(base_opts)] for one in seam_plan]
     key = hashlib.sha256(
-        json.dumps([key_src, int(crf), fixes,
+        json.dumps([key_src, int(crf), fixes, bool(loop),
                     BUILD_VERSION]).encode()).hexdigest()[:16]
     out_path, meta_path, name, sub = _preview_paths(base_folder,
                                                     preview_filename)
@@ -830,9 +841,10 @@ def build_preview(sequence, crf, probe=False, base_folder="",
         return name, sub, starts, total, current, key
 
     (locks, fades, ramps, tail_locks,
-     tfades) = _join_fixes(entries, seam_plan)
-    # the joins whose child asked for the carried spatial field
-    locals_ = {i for i in range(1, len(entries))
+     tfades) = _join_fixes(entries, seam_plan, loop)
+    # the joins whose child asked for the carried spatial field (entry
+    # 0 is a child too when the cut loops)
+    locals_ = {i for i in range(0 if loop else 1, len(entries))
                if seam_plan[i].get("level_lock_local", True)}
     if locks or fades:
         overrides = sum(1 for e in entries if e.get("seam_opts"))
@@ -899,6 +911,9 @@ def build_preview(sequence, crf, probe=False, base_folder="",
         declick_here = (seam_plan[i + 1].get("audio_declick",
                                              base_opts["audio_declick"])
                         if i + 1 < len(seam_plan)
+                        else seam_plan[0].get("audio_declick",
+                                              base_opts["audio_declick"])
+                        if loop and seam_plan
                         else base_opts["audio_declick"])
         if declick_here and sample_rate:
             # No overlap to fade into: soften the discontinuity instead,
@@ -908,12 +923,14 @@ def build_preview(sequence, crf, probe=False, base_folder="",
             # from it, which is the most click-prone boundary of all.
             # The cut's own start and end are left alone: that is not a
             # join, and fading them would quietly alter the top and tail
-            # of every export.
+            # of every export. UNLESS the cut loops: then the end runs
+            # straight into the start on every repeat, and that IS a
+            # join -- the most exposed one in the file.
             # keyed on whether a fade ACTUALLY happened, not on whether
             # one was planned: an overlap that carries no audio would
             # otherwise leave the boundary with neither treatment
-            tail = (i + 1 < len(entries)) and not faded_here
-            head = i > 0 and not _faded_audio.get(i, False)
+            tail = (i + 1 < len(entries) or loop) and not faded_here
+            head = (i > 0 or loop) and not _faded_audio.get(i, False)
             if head or tail:
                 part = xf.taper_audio(part, sample_rate,
                                       head=head, tail=tail)
@@ -1111,7 +1128,8 @@ def seam_levels(sequence, level_lock_frames=levellock.FRAMES,
         if not e.get("gap"):
             e["frames"] = _clip_frames(e)
     return levellock.report(entries, frames=level_lock_frames,
-                            with_gains=with_gains)
+                            with_gains=with_gains,
+                            loop=na.sequence_loops(sequence))
 
 
 def export_cut(sequence, crf, base_folder, preview_filename,

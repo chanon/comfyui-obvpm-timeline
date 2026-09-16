@@ -265,8 +265,24 @@ class H3JointRender:
 
         sound = decode_audio(audio_vae, audio)
         blobs = nodes_save._workflow_blobs(prompt, extra_pnginfo)
+        # a looping cut: the joint holds the loop take's tail rows (the
+        # opening again, as context for the refine); the FILE must not,
+        # so the render is cropped to the wrap the layout recorded
+        keep = (layout or {}).get("keep_frames")
+        lo, hi = (int(keep[0]), int(keep[1])) if keep else (0, frames)
+        blocks = decode_windows(vae, video, window_steps)
+        if keep:
+            from .nodes_joint import crop_blocks
+            blocks = crop_blocks(blocks, lo, hi)
+            sr = int(sound["sample_rate"])
+            wf = sound["waveform"]
+            sound = {"waveform": wf[..., round(lo / fr.FPS * sr):
+                                     round(hi / fr.FPS * sr)],
+                     "sample_rate": sr}
+            _LOG.info("obvpm.h3 render: looping cut, keeping frames %d..%d "
+                      "of %d", lo, hi, frames)
         nodes_save.encode_mp4_stream(
-            video_path, decode_windows(vae, video, window_steps), frames,
+            video_path, blocks, hi - lo,
             height, width, sound, crf, metadata=nodes_save._workflow_tags(blobs))
 
         self_id = mctx.hash_file(video_path)
@@ -275,6 +291,9 @@ class H3JointRender:
         if layout:
             user_meta["source_clips"] = list(layout.get("clips") or [])
             user_meta["source_lines"] = list(layout.get("lines") or [])
+        if keep:
+            user_meta["loop"] = True
+            user_meta["keep_frames"] = [lo, hi]
         meta = {
             "format": mctx.FORMAT,
             "self_id": self_id,
@@ -284,10 +303,13 @@ class H3JointRender:
             "width": str(width),
             "height": str(height),
             "fps": str(fr.FPS),
+            # the sidecar keeps the WHOLE raw latent; a looping cut's
+            # crop is recorded as the head and tail it took off, so
+            # raw and delivered coordinates keep their usual relation
             "raw_frames": str(frames),
-            "pinned_head_frames": "0",
-            "pinned_tail_frames": "0",
-            "delivered_frames": str(frames),
+            "pinned_head_frames": str(lo),
+            "pinned_tail_frames": str(frames - hi),
+            "delivered_frames": str(hi - lo),
             "parent_grade": mctx.lineage_grade([]),
             "pins": mctx.serialize_pins([]),
             "user_meta": json.dumps(user_meta, ensure_ascii=False),

@@ -164,12 +164,34 @@ def format_seam_opts(opts):
     return " [%s]" % " ".join(parts) if parts else ""
 
 
+# The one directive a sequence may carry. `loop` makes the cut a RING:
+# its last entry is joined to its first exactly as neighbours are, so
+# the export ends where its own opening begins and a player set to
+# repeat wraps onto continuous motion. It is a property of the cut and
+# so lives in the cut's text, beside the clips and gaps it applies to
+# -- a widget or property for it would be a second store for one fact.
+LOOP_RE = re.compile(r"^loop$", re.IGNORECASE)
+LOOP_LINE = "loop"
+
+
+def sequence_loops(sequence):
+    """Does the sequence text carry the `loop` directive?"""
+    return any(LOOP_RE.match(raw.strip())
+               for raw in (sequence or "").splitlines())
+
+
 def _parse_sequence(sequence):
-    """Lines of "clip.mp4", "clip.mp4 @ enter[..exit]", or "~ frames"."""
+    """Lines of "clip.mp4", "clip.mp4 @ enter[..exit]", or "~ frames".
+
+    The `loop` directive is not an entry and is skipped here; read it
+    with `sequence_loops`. Any other line is a clip path, so a directive
+    unknown to this parser would be looked up as a file -- which is the
+    right failure: loud, and naming the line.
+    """
     out = []
     for raw in (sequence or "").splitlines():
         line = raw.strip()
-        if not line or line.startswith("#"):
+        if not line or line.startswith("#") or LOOP_RE.match(line):
             continue
         gap = _GAP_RE.match(line)
         if gap:
@@ -490,6 +512,25 @@ def resolve_sequence(sequence):
         right["enter"] = enter_f
         _LOG.debug("obvpm.h3: seam %s | %s -- %s",
                   left["clip"], right["clip"], note)
+    # A looping cut has one more join: its last entry into its first,
+    # derived by the same rule. A loop take is a bridge whose arriving
+    # side is entry 0, so its recipe carries an after-pin on that clip
+    # and _prepend_child finds it: the take exits where clip 0's kept
+    # frames begin, and clip 0 enters past the frames the take delivers
+    # itself. A single clip with no take yet simply butt-joins itself.
+    if sequence_loops(sequence):
+        first, last = entries[0], entries[-1]
+        if first.get("gap") or last.get("gap"):
+            raise ValueError(
+                "H3Assemble: a looping sequence cannot start or end on "
+                "empty space -- a gap has nothing to wrap onto. Remove "
+                "the `loop` line or the gap at that end.")
+        exit_f, enter_f, note = _derive_seam(last, first)
+        if last["exit"] is None:
+            last["exit"] = exit_f
+        first["enter"] = enter_f
+        _LOG.debug("obvpm.h3: wrap seam %s | %s -- %s",
+                  last["clip"], first["clip"], note)
     # Manual cuts win over derived seams -- they ARE the user's decision.
     # Logged at DEBUG: resolve_sequence runs on every preview probe, so
     # at INFO a single drag buries the console.
@@ -1416,6 +1457,8 @@ class H3Assemble:
         root = folder_paths.get_output_directory()
         parts = []
         for entry in _parse_sequence(sequence):
+            if entry.get("gap"):
+                continue           # empty space has no file to watch
             p = os.path.join(root, entry["clip"])
             for f in (p, mctx.sidecar_path(p)):
                 try:
