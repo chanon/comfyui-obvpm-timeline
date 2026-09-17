@@ -2767,16 +2767,17 @@ app.registerExtension({
             const AV_STEP = 51, AV_BASE = 39;
             const durWidget = node.widgets?.find(
                 (w) => w.name === "duration_seconds");
-            function durMasks() {
-                const st = pinState();
+            // `st` defaults to the stored pin; the gap fit asks about a
+            // pin that is being armed, before it is the stored one
+            function durMasks(st = pinState()) {
                 if (!st) return false;
                 const arriving = st.role === "bridge"
                     ? arriveModeOf(st) : pinModeOf(st);
                 return pinModeMasks(arriving) || pinModeMasks(pinModeOf(st));
             }
-            function durFrames(secs = durWidget?.value ?? 8) {
+            function durFrames(secs = durWidget?.value ?? 8, st = pinState()) {
                 const want = Math.max(1, Number(secs) || 0) * TL_FPS;
-                if (durMasks()) {
+                if (durMasks(st)) {
                     const lo = AV_BASE + Math.max(0, Math.floor(
                         (want - AV_BASE) / AV_STEP)) * AV_STEP;
                     return want <= AV_BASE ? AV_BASE
@@ -2840,8 +2841,7 @@ app.registerExtension({
             // pin is a hard masked extend and trims its whole window; an
             // arriving (after) pin trims all but its runway, because the
             // take delivers the ramped frames itself.
-            function durPlan(f) {
-                const st = pinState();
+            function durPlan(f, st = pinState()) {
                 if (!st || f == null) return null;
                 const arriving = st.role === "bridge"
                     ? arriveModeOf(st) : pinModeOf(st);
@@ -2993,6 +2993,13 @@ app.registerExtension({
                     ? "The wired value cannot be read from here, so the "
                       + "snapped length is only known at run time."
                     : durBreakdown(f, secs, wired, masks, plan);
+                // the landing band on the ruler is as long as the kept
+                // span, so a new length moves it. Next frame, not now:
+                // this also runs while the widget is still being built,
+                // before the ruler and the strip exist
+                requestAnimationFrame(() => {
+                    try { drawRuler(); } catch (err) { /* pre-build */ }
+                });
             }
             function commitDur() {
                 if (!durWidget || durWired()) return;
@@ -3503,6 +3510,7 @@ app.registerExtension({
             }
             function setPinState(st) {
                 if (!psWidget) return;
+                const prev = pinState();
                 if (st && st.role) {
                     // the role decides, every time: a mode left over
                     // from a hand-edited workflow would otherwise
@@ -3515,6 +3523,15 @@ app.registerExtension({
                     }
                 }
                 psWidget.value = st ? JSON.stringify(st) : "";
+                // Arming a pin that lands in empty space sizes the run to
+                // fill it. Only when WHAT is pinned changes (role or
+                // clips): cycling the window or the mask of an armed pin
+                // must not keep overwriting a length that was typed.
+                if (st && st.role && (!prev || prev.role !== st.role
+                        || prev.source !== st.source
+                        || (prev.source2 ?? null) !== (st.source2 ?? null))) {
+                    fitDurationToGap(st);
+                }
                 tlNoteEdit();
                 node.setDirtyCanvas?.(true, true);
                 void refresh();
@@ -3894,6 +3911,7 @@ app.registerExtension({
                 const ctx = ruler.getContext("2d");
                 ctx.clearRect(0, 0, w, 16);
                 if (!totalFrames || !blockEls.length) return;
+                drawLanding(ctx, w);
                 ctx.fillStyle = PAL.tick;
                 ctx.strokeStyle = PAL.tickLine;
                 ctx.font = "9px sans-serif";
@@ -3921,6 +3939,109 @@ app.registerExtension({
                     }
                 }
             }
+            // ---- where the next run lands ------------------------------
+            // The span the armed run's KEPT footage would occupy once it
+            // is generated and added -- the same position placeClip
+            // gives it (see insertFilling), in timeline frames:
+            //   extend / bridge  starts where the pinned clip stops
+            //                    playing, filling the empty space after it
+            //   prepend          ends where the pinned clip starts,
+            //                    right-aligned in the space before it
+            //   loop bridge      after the last clip, on the wrap
+            // A linked neighbour already sitting there is REPLACED by
+            // the new take, so the span starts where that one does.
+            // `frames` is null when the length cannot be read (a wired
+            // duration nobody can trace); the band then covers the gap.
+            function pinLanding(st = shownPin()) {
+                const es = lastEntries;
+                if (!st || !es?.length || !cumStarts.length) return null;
+                const k = es.findIndex((e) => e.clip === st.source);
+                if (k < 0) return null;
+                const secs = durSeconds();
+                const plan = secs == null ? null
+                    : durPlan(durFrames(secs, st), st);
+                const kept = plan ? Math.max(0, plan.kept) : null;
+                const isGap = (i) => es[i] != null && es[i].gap != null;
+                const endOf = (i) => cumStarts[i] + playedArr[i];
+                if (st.role === "prepend") {
+                    const occ = tlOccupant(es, st.source, "before", linkedMeta);
+                    if (occ) {
+                        return { start: cumStarts[occ.idx], gapIdx: -1,
+                                 frames: kept ?? playedArr[occ.idx] };
+                    }
+                    if (isGap(k - 1)) {
+                        const gf = playedArr[k - 1];
+                        const f = kept ?? gf;
+                        return { start: Math.max(cumStarts[k - 1],
+                                                 cumStarts[k] - f),
+                                 frames: f, gapIdx: k - 1, gapFrames: gf };
+                    }
+                    return { start: cumStarts[k], frames: kept, gapIdx: -1 };
+                }
+                if (st.role === "bridge" && impliesLoop(st)) {
+                    return { start: totalFrames, frames: kept, gapIdx: -1 };
+                }
+                const occ = tlOccupant(es, st.source, "after", linkedMeta);
+                if (occ) {
+                    return { start: endOf(k), gapIdx: -1,
+                             frames: kept ?? playedArr[occ.idx] };
+                }
+                if (isGap(k + 1)) {
+                    const gf = playedArr[k + 1];
+                    return { start: endOf(k), frames: kept ?? gf,
+                             gapIdx: k + 1, gapFrames: gf };
+                }
+                return { start: endOf(k), frames: kept, gapIdx: -1 };
+            }
+
+            // The run length whose KEPT footage comes closest to the
+            // empty space the pin lands in. Only legal lengths are tried
+            // (the shared AV grid when the pin masks, the 17k+5 ladder
+            // otherwise), so "closest" can still be a rung away: 2.125 s
+            // on the AV grid. A length that keeps nothing is never
+            // chosen. A wired duration is left alone -- its value belongs
+            // to whatever drives it.
+            function fitDurationToGap(st) {
+                if (!durWidget || durWired() || !st) return;
+                const land = pinLanding(st);
+                if (!land || land.gapIdx < 0 || !land.gapFrames) return;
+                const masks = durMasks(st);
+                const base = masks ? AV_BASE : RUN_BASE;
+                const step = masks ? AV_STEP : RUN_LADDER;
+                let best = null;
+                for (let f = base; f <= 150 * TL_FPS; f += step) {
+                    const kept = durPlan(f, st)?.kept ?? f;
+                    if (kept <= 0) continue;
+                    const d = Math.abs(kept - land.gapFrames);
+                    if (!best || d < best.d) best = { f, d };
+                }
+                if (!best) return;
+                durWidget.value = Number((best.f / TL_FPS).toFixed(3));
+                paintDur();
+            }
+
+            // Purple: not the playhead's amber (time), the pin's orange
+            // (the join) or the drop green (an edit) -- this is a clip
+            // that does not exist yet.
+            function drawLanding(ctx, w) {
+                const land = pinLanding();
+                if (!land) return;
+                const px = scaleNow() || 1;
+                const frames = land.frames
+                    ?? (land.gapIdx >= 0 ? land.gapFrames : null);
+                const x0 = frameToX(land.start) - strip.scrollLeft;
+                // an unknown length still marks WHERE: a narrow band
+                const x1 = frames ? x0 + frames * px : x0 + 4;
+                if (x1 < 0 || x0 > w) return;
+                ctx.save();
+                ctx.globalAlpha = 0.35;
+                ctx.fillStyle = "rgb(150, 104, 222)";
+                ctx.fillRect(x0, 0, Math.max(2, x1 - x0), 16);
+                ctx.globalAlpha = 1;
+                ctx.fillRect(x0, 13, Math.max(2, x1 - x0), 3);
+                ctx.restore();
+            }
+
             let lastEntries = [];
             let lastPx = null;          // the scale the last render used
             // Where the playhead was, kept ACROSS rebuilds. A cut edits
@@ -8000,13 +8121,6 @@ app.registerExtension({
                 return { at: lastEntries.length, parentIdx: -1,
                          side: null, label: "at the end", tail: false };
             }
-            function insertEntryAt(idx, clip) {
-                const ls = currentLines();
-                const map = entryLines();
-                const at = idx >= map.length ? ls.length : map[idx];
-                ls.splice(at, 0, clip);
-                setSequence(ls.join("\n"));
-            }
             function replaceEntry(idx, clip) {
                 const ls = currentLines();
                 ls[entryLines()[idx]] = clip;
@@ -8095,8 +8209,49 @@ app.registerExtension({
                             + clipBase(held.entry.clip) + " (same gap)");
                     }
                 }
-                insertEntryAt(aim.at, clip);
-                return note("inserted " + aim.label);
+                return note(insertFilling(aim, clip, meta));
+            }
+            // Insert the take, and when it lands in empty space let the
+            // space give up the take's length -- so the take FILLS the
+            // hole instead of pushing it, and everything past it, along.
+            // That is what the gap-fitted duration is for, and what the
+            // ruler's landing band shows. A take shorter than the hole
+            // leaves the rest of it behind; a longer one uses it all and
+            // pushes only the difference. A bridge whose other foot is
+            // the clip right after the hole takes the whole hole either
+            // way: a remainder would stand between it and the clip it
+            // was generated to lead into.
+            // One sequence write for both edits, so the undo step and the
+            // refresh see a single change.
+            function insertFilling(aim, clip, meta) {
+                const es = lastEntries;
+                const ls = currentLines();
+                const map = entryLines();
+                let at = aim.at >= map.length ? ls.length : map[aim.at];
+                const gi = aim.side === "after" ? aim.at
+                    : aim.side === "before" ? aim.at - 1 : -1;
+                const hole = gi >= 0 ? es?.[gi] : null;
+                const took = Number(meta?.delivered_frames) || 0;
+                let filled = "";
+                if (hole && hole.gap != null && map[gi] != null && took) {
+                    const child = tlPrependChild(meta);
+                    const bridged = aim.side === "after" && !!child
+                        && es[gi + 1]?.meta?.self_id === child.id;
+                    const left = bridged ? 0
+                        : Math.max(0, Math.round(Number(hole.gap) || 0) - took);
+                    if (left > 0) {
+                        ls[map[gi]] = `~ ${left}`;
+                        filled = `, ${(left / TL_FPS).toFixed(1)}s of empty `
+                            + "space left";
+                    } else {
+                        ls.splice(map[gi], 1);
+                        if (map[gi] < at) at -= 1;
+                        filled = ", filling the empty space";
+                    }
+                }
+                ls.splice(at, 0, clip);
+                setSequence(ls.join("\n"));
+                return "inserted " + aim.label + filled;
             }
 
             TL_REGISTRY.set(node.id, {
