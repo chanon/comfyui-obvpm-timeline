@@ -12,6 +12,7 @@ one pack, so saved workflows keep loading.
 """
 
 from .nodes_assemble import H3Assemble, H3Timeline
+from .nodes_budget import H3VramHeadroom
 from .nodes_encode import H3MCtxFromFrames
 from .nodes_joint import (H3ContextWindows, H3JointAudioMask,
                           H3JointConditioning, H3JointLatent)
@@ -51,6 +52,7 @@ NODE_CLASS_MAPPINGS = {
     "H3JointConditioning": H3JointConditioning,
     "H3JointAudioMask": H3JointAudioMask,
     "H3ContextWindows": H3ContextWindows,
+    "H3VramHeadroom": H3VramHeadroom,
     "H3JointRender": H3JointRender,
     "H3Assemble": H3Assemble,
     "H3Timeline": H3Timeline,
@@ -71,6 +73,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3JointConditioning": "H3 Joint Conditioning",
     "H3JointAudioMask": "H3 Joint Audio Mask",
     "H3ContextWindows": "H3 Context Windowing",
+    "H3VramHeadroom": "H3 VRAM Headroom",
     "H3JointRender": "H3 Joint VAE Decode and Save",
     "H3Assemble": "H3 MCtx Assemble",
     "H3Timeline": "H3 MCtx Timeline",
