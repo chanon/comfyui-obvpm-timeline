@@ -1319,13 +1319,15 @@ function tlSeamDialog({ get, set, seams, onChange, onClose, scope }) {
 // usually cannot act.
 //
 // Deliberately self-contained rather than a `scope`-style variant of
-// tlSeamDialog: that dialog is kept working exactly as it was, reachable
-// from "Advanced" below, so nothing about the full editor has to change
-// shape because this one exists. The cost is a copy of the panel chrome,
+// tlSeamDialog: that dialog still serves a join that carries overrides
+// of its own, so nothing about the full editor has to change shape
+// because this one exists. The cost is a copy of the panel chrome,
 // which is the cheap half; the wording -- where the actual thinking is
 // -- is not duplicated, because the two say different things.
-function tlAudioSeamDialog({ get, set, seams, onChange, onClose,
-                             onAdvanced }) {
+// It used to offer "Advanced..." into the full editor; that went when
+// guided mode was withheld, since none of the six controls there can
+// act on a masked or both-mode join.
+function tlAudioSeamDialog({ get, set, seams, onChange, onClose }) {
     const PAL = themePalette();
     const BG = (typeof LiteGraph !== "undefined"
         && LiteGraph.NODE_DEFAULT_BGCOLOR) || PAL.rest;
@@ -1444,24 +1446,6 @@ function tlAudioSeamDialog({ get, set, seams, onChange, onClose,
         // button needs two clicks to reopen.
         onClose?.();
     };
-    if (onAdvanced) {
-        const adv = document.createElement("button");
-        adv.textContent = "Advanced\u2026";
-        adv.title = "The full seam editor: level lock and crossfade as "
-            + "well. Those act on guided-mode joins only.";
-        Object.assign(adv.style, {
-            padding: "6px 14px", borderRadius: "5px", cursor: "pointer",
-            border: "1px solid " + PAL.edge, background: "none",
-            color: PAL.text, font: "13px sans-serif", marginRight: "auto",
-        });
-        adv.addEventListener("click", () => {
-            // close() fires onClose, which clears the owner's handle,
-            // and onAdvanced then sets it to the full dialog's
-            close();
-            onAdvanced();
-        });
-        foot.appendChild(adv);
-    }
     const done = document.createElement("button");
     done.textContent = "Done";
     Object.assign(done.style, {
@@ -3088,8 +3072,7 @@ app.registerExtension({
                 "Seam audio: how the sound is handled where one clip "
                 + "meets the next. The de-click tapers 5ms each side of "
                 + "every join that is not blended, which on a masked or "
-                + "both-mode sequence is all of them. The picture "
-                + "repairs are behind Advanced.");
+                + "both-mode sequence is all of them.");
             let seamDialogClose = null;
             function seamSettingsChanged() {
                 // the built preview was made under the OLD settings, so
@@ -3108,18 +3091,11 @@ app.registerExtension({
                 const w = node.widgets?.find((x) => x.name === name);
                 if (w) w.value = value;
             };
-            // The full editor, still whole -- reached from "Advanced" in
-            // the audio dialog, and the only way in when the guided
-            // surface is withheld.
-            function openFullSeamDialog() {
-                seamDialogClose = tlSeamDialog({
-                    get: seamWidgetValue,
-                    set: setSeamWidget,
-                    seams: seamFix,
-                    onChange: seamSettingsChanged,
-                    onClose: () => { seamDialogClose = null; },
-                });
-            }
+            // The full editor (tlSeamDialog: level lock, crossfade) is
+            // no longer reachable from here. Its controls act on guided
+            // joins only, and guided mode is withheld (SHOW_GUIDED); a
+            // join that already carries overrides still opens it from
+            // its seam popup.
             function openAudioSeamDialog() {
                 seamDialogClose = tlAudioSeamDialog({
                     get: seamWidgetValue,
@@ -3127,7 +3103,6 @@ app.registerExtension({
                     seams: seamFix,
                     onChange: seamSettingsChanged,
                     onClose: () => { seamDialogClose = null; },
-                    onAdvanced: openFullSeamDialog,
                 });
             }
             seamBtn.addEventListener("click", (ev) => {
@@ -3149,8 +3124,7 @@ app.registerExtension({
             // the de-click applies to every join that is not blended --
             // which on the masked/both route is all of them, so on the
             // mode this UI actually offers it is always relevant. The
-            // guided repairs behind "Advanced" are still governed by
-            // SHOW_GUIDED inside the full dialog's own wording.
+            // guided repairs are not offered from the toolbar at all.
             // (seamsTouched is kept: it is what used to reveal the
             // button, and it still says whether this timeline carries
             // settings of its own -- worth reading before removing.)
@@ -4710,6 +4684,14 @@ app.registerExtension({
                 });
             }
             function preloadInto(v, item) {
+                // Whatever this element held, it is not the full build
+                // any more. `_single` is how ensureSingleSrc decides the
+                // build is ALREADY loaded, and it was only ever set: cut
+                // a clip and drag the cut back, and the same build (same
+                // content key, same URL) is adopted again, the marker
+                // still matches, the src is never restored -- and the
+                // scrub seeks the full build's time inside the clip.
+                v._single = null;
                 v._item = item ?? null;
                 if (!item || item.gap != null) {   // nothing to load
                     v._item = null;
