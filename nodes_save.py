@@ -492,6 +492,30 @@ def guided_sides(pins):
     return out
 
 
+def rerendered_sides(pins):
+    """{"before", "after"} -- the sides worth keeping an overlap for.
+
+    The guided sides, plus any side whose window was ENCODED FROM
+    PIXELS. A masked window holds its latents verbatim whatever they
+    came from -- but when the clip it continues had no sidecar, those
+    latents are a VAE encode of that clip's pixels, and the timeline
+    plays the clip's ORIGINAL file next to the decode of them. That is
+    two renderings of one moment after all: not because the model
+    re-drew the window, but because the round trip did. It is the same
+    thing a crossfade blends, and the per-region level match measures
+    its field from it. Latent-grade masked windows are still not kept,
+    for the reason guided_sides gives.
+    """
+    out = set(guided_sides(pins))
+    for p in pins or []:
+        spec = p.get("spec") or {}
+        if spec.get("source_kind") == "clip_pixels":
+            place = p.get("place") or spec.get("place")
+            if place in ("before", "after"):
+                out.add(place)
+    return out
+
+
 def _overlap_bytes(untrimmed_images, untrimmed_audio, n, crf, tail=False):
     """The take's own re-render of a pinned window, as a small MP4.
 
@@ -738,9 +762,10 @@ class H3SaveVideoWithMCtx:
         self._encode_mp4(video_path, images, audio, crf,
                          metadata=_workflow_tags(blobs))
         self_id = mctx.hash_file(video_path)
-        # Kept for the GUIDED side only -- that is the one that was
-        # re-rendered and therefore the only one a crossfade can blend.
-        guided = guided_sides(pins)
+        # Kept only for a side with a SECOND RENDERING of its window:
+        # a guided one (the model re-drew it) or one encoded from pixels
+        # (the VAE round trip did). Nothing else can be crossfaded.
+        guided = rerendered_sides(pins)
         overlap = (_overlap_bytes(untrimmed_images, untrimmed_audio,
                                   head, crf)
                    if "before" in guided else None)

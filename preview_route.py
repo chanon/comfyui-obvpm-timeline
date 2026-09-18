@@ -61,7 +61,7 @@ DEFAULT_PREVIEW_NAME = "obvpm_h3_preview"
 # an older version is served as current -- and a fix looks like it did
 # nothing. Raise it with any change to how frames are decoded, corrected
 # or encoded.
-BUILD_VERSION = 9
+BUILD_VERSION = 10
 
 
 def _decode_audio(path):
@@ -1127,9 +1127,19 @@ def seam_levels(sequence, level_lock_frames=levellock.FRAMES,
     for e in entries:
         if not e.get("gap"):
             e["frames"] = _clip_frames(e)
-    return levellock.report(entries, frames=level_lock_frames,
-                            with_gains=with_gains,
-                            loop=na.sequence_loops(sequence))
+    loop = na.sequence_loops(sequence)
+    found = levellock.report(entries, frames=level_lock_frames,
+                             with_gains=with_gains, loop=loop)
+    # The gains drive quick playback's brightness filter, so they follow
+    # the same plan the build does: a latent-identical join is not
+    # corrected there, and must not be corrected here either. The
+    # MEASUREMENT stays -- the badge reports every join.
+    plan = _seam_plan(entries, {"level_lock": True}, loop)
+    for i, one in found.items():
+        if (isinstance(one, dict) and "gains" in one and i < len(plan)
+                and not plan[i].get("level_lock", True)):
+            one["gains"] = None
+    return found
 
 
 def export_cut(sequence, crf, base_folder, preview_filename,

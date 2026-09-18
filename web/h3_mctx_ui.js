@@ -900,8 +900,10 @@ function tlSeamDialog({ get, set, seams, onChange, onClose, scope }) {
     // latent-identical, so they default to off there -- and switching
     // them on can INTRODUCE flicker. Said once, in every scope.
     const modeNote = document.createElement("div");
-    modeNote.textContent = "For guided-mode joins. Masked-mode joins "
-        + "are latent-identical, so these default to off there.";
+    modeNote.textContent = "For joins with two renderings of the same "
+        + "moment: a guided join, or an extend from a clip that had no "
+        + "saved latents. Other masked joins are latent-identical, so "
+        + "these default to off there.";
     Object.assign(modeNote.style, { color: PAL.sub, marginTop: "4px",
                                     fontSize: "12px", fontStyle: "italic",
                                     lineHeight: "1.5" });
@@ -1978,9 +1980,15 @@ function tlSeamCapability(L, R) {
     const pr = tlPrependChild(L.meta);
     const prepending = !!(pr && R.meta && pr.id === R.meta.self_id);
     const delivered = Number(L.meta?.delivered_frames ?? 0) || 0;
+    // A window encoded from PIXELS may sit anywhere in its source, so
+    // there the natural place is the exit the lineage derives and not
+    // only the clip's end (crossfade.usable, same exception).
+    const pixelExit = tlPixelJoin(L, R) && ex
+        ? ex.join - (Number(L.meta?.pinned_head_frames ?? 0) || 0) : null;
     const natural = extending && !R.enter
         && (L.exit == null
-            || (delivered && Number(L.exit) === delivered));
+            || (delivered && Number(L.exit) === delivered)
+            || (pixelExit != null && Number(L.exit) === pixelExit));
     const fade = !!(natural && Number(R.meta?.overlap_frames ?? 0) > 0);
     // The prepend mirror: the take on the LEFT kept the re-render, and
     // the target must still enter where its lineage says -- a manual cut
@@ -1992,6 +2000,20 @@ function tlSeamCapability(L, R) {
     const anyFade = fade || tfade;
     return { lock: extending || prepending, fade: anyFade,
              local: anyFade, declick: !anyFade };
+}
+// Is this a join onto a clip that had NO sidecar? Its window was
+// encoded from the neighbour's pixels, so the two sides are two
+// renderings of one moment -- the original file, and the decode of a
+// VAE round trip -- and the picture repairs have a real step to work
+// on. nodes_assemble.masked_continuation makes the same exception, per
+// pin, which is why this reads the pins too: a bridge has two and its
+// header carries no single grade.
+function tlPixelJoin(L, R) {
+    if (!L || !R || L.gap != null || R.gap != null) return false;
+    const from = (meta, place, other) => tlPins(meta).some((s) =>
+        s.place === place && s.source_kind === "clip_pixels"
+        && s.source_id && s.source_id === other?.self_id);
+    return from(R.meta, "before", L.meta) || from(L.meta, "after", R.meta);
 }
 const TL_SEAM_NEEDS = {
     level_lock: "lock",
@@ -6273,8 +6295,11 @@ app.registerExtension({
                 const own = es[i].seamOpts || {};
                 const n = Object.keys(own).length;
                 // withheld (SHOW_GUIDED) unless this join already has
-                // settings of its own
-                if (!SHOW_GUIDED && !n) return;
+                // settings of its own, or continues a clip that had no
+                // sidecar -- the one masked join the repairs act on
+                const pixel = tlPixelJoin(lastEntries?.[i - 1],
+                                          lastEntries?.[i]);
+                if (!SHOW_GUIDED && !n && !pixel) return;
                 const b = document.createElement("button");
                 b.textContent = n
                     ? `seam settings (${n} of its own)…`
@@ -9274,8 +9299,12 @@ function buildResultPreview(node) {
                     rpOpenSeamDialog(d, k, clips, metas);
                 });
                 // withheld (SHOW_GUIDED) unless this join already has
-                // settings of its own
-                if (SHOW_GUIDED || n) wrap.appendChild(cog);
+                // settings of its own, or continues a clip that had no
+                // sidecar (see tlPixelJoin)
+                const pixel = tlPixelJoin(
+                    { clip: clips[k - 1], gap: null, meta: metas[k - 1] },
+                    { clip: clips[k], gap: null, meta: metas[k] });
+                if (SHOW_GUIDED || n || pixel) wrap.appendChild(cog);
                 strip.appendChild(wrap);
             }
             const role = clips.length === 1 ? "alone"

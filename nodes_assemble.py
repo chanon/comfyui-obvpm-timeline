@@ -444,6 +444,16 @@ def masked_continuation(lh, rh):
         # then there is no frame the two sides agree on exactly.
         if p.get("mode") not in held:
             return False
+        # A window ENCODED FROM PIXELS is held just as hard, but it is
+        # not the neighbour's own latents: the clip it continues has no
+        # sidecar, so the timeline plays that clip's original file on
+        # one side and the decode of a VAE round trip on the other. That
+        # is a second rendering of the moment, with the level step that
+        # comes with one -- the repairs are for exactly this. A take
+        # extended from THIS one slices its sidecar again and is
+        # latent-grade, so the exception does not travel down a chain.
+        if p.get("source_kind") == "clip_pixels":
+            return False
         from .nodes_masked import holds_exactly
         return holds_exactly(
             int(p.get("source_frames", 0) or 0), p.get("place"),

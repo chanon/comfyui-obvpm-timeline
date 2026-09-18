@@ -222,6 +222,15 @@ def forget():
     _PLANES.clear()
 
 
+def _pixel_pin(header, place):
+    """Was this take's `place` window encoded from a clip's pixels?"""
+    for p in mctx.parse_pins(header or {}):
+        if (p.get("place") == place
+                and p.get("source_kind") == "clip_pixels"):
+            return True
+    return False
+
+
 def usable(left, right, max_frames=None):
     """How many frames this join can crossfade over. 0 = it cannot.
 
@@ -242,7 +251,22 @@ def usable(left, right, max_frames=None):
     delivered = int(lh.get("delivered_frames", 0) or 0)
     exit_f = left.get("exit")
     if exit_f is not None and delivered and int(exit_f) != delivered:
-        return 0
+        # A window encoded from PIXELS may sit anywhere in its source --
+        # footage with no sidecar is cut wherever the eye wants, and the
+        # pixel route takes any frame. There the natural place is the
+        # frame the lineage derives, exactly as usable_tail reads it: the
+        # overlap's last frame is the one before that exit. Latent-grade
+        # takes keep the stricter rule they always had.
+        if not _pixel_pin(right.get("header"), "before"):
+            return 0
+        from . import nodes_assemble as na
+        try:
+            want_exit, _, _ = na._derive_seam(left, right)
+        except Exception:
+            return 0
+        if want_exit is None or int(exit_f) != int(want_exit):
+            return 0
+        delivered = int(exit_f)
     n = available(right["path"])
     if n <= 0:
         return 0
