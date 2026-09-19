@@ -1214,29 +1214,6 @@ def video_workflow(path):
     return read_video_workflow(ap)
 
 
-def clip_arrival(path):
-    """The Result Preview's `arrival` reading for a take, on demand.
-
-    The reading normally rides in the node's payload, but that payload is
-    saved INTO the workflow and restored without running anything -- so a
-    take shown before the reading existed would never get one. Same
-    function, same numbers; None when the take arrives nowhere or is too
-    short to measure.
-    """
-    from .seam_report import arrival_frame, measure_arrival
-    root = os.path.abspath(folder_paths.get_output_directory())
-    ap = os.path.abspath(os.path.join(root, str(path or "").strip()))
-    if os.path.commonpath([root, ap]) != root:
-        raise ValueError("arrival: %r escapes the output folder" % path)
-    if not ap.lower().endswith(".mp4") or not os.path.isfile(ap):
-        raise ValueError("arrival: not found: %r" % path)
-    side = mctx.sidecar_path(ap)
-    if not os.path.isfile(side):
-        return None
-    at = arrival_frame(mctx.read_header(side))
-    return measure_arrival(ap, at) if at is not None else None
-
-
 def delete_take(path):
     """Delete a take and everything filed under its name.
 
@@ -1404,18 +1381,6 @@ def register():
             # info, not exception: asking about a clip that has since been
             # moved is ordinary, and the caller degrades to "no meta"
             _LOG.info("obvpm.h3: clip_meta failed: %s", exc)
-            return web.json_response({"error": str(exc)}, status=400)
-
-    @PromptServer.instance.routes.post("/obvpm/h3/arrival")
-    async def _arrival(request):
-        import asyncio
-        try:
-            data = await request.json()
-            found = await asyncio.to_thread(
-                clip_arrival, str(data.get("clip", "")))
-            return web.json_response({"arrival": found})
-        except Exception as exc:
-            _LOG.info("obvpm.h3: arrival failed: %s", exc)
             return web.json_response({"error": str(exc)}, status=400)
 
     @PromptServer.instance.routes.post("/obvpm/h3/delete_take")

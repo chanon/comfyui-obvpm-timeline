@@ -9376,43 +9376,6 @@ function buildResultPreview(node) {
                 } else {
                     wrap.append(pill);
                 }
-                // The ARRIVING gap also says how the take's own frames
-                // meet its pinned window -- inside the take, ~half a
-                // second before this join. Always drawn when measured
-                // (clean included) so the row keeps one height.
-                const arriving = d.relation === "bridges"
-                    ? clips[k] !== d.clip : d.relation === "prepends";
-                if (arriving && d.arrival) {
-                    const a = document.createElement("span");
-                    const bad = d.arrival.verdict !== "clean";
-                    Object.assign(a.style, {
-                        font: (bad ? "600 " : "") + "9px sans-serif",
-                        whiteSpace: "nowrap",
-                        color: d.arrival.verdict === "local jump"
-                            ? "#b3403c"
-                            : bad ? TL_COLORS.cut : PAL.sub,
-                    });
-                    a.textContent = `arrival ${d.arrival.ratio}x`
-                        + (bad ? ` ${d.arrival.verdict}` : "");
-                    a.title = "Where this take's own frames give way to "
-                        + "the window it arrives in (frame "
-                        + d.arrival.frame + "): the worst-changing parts "
-                        + "of the picture there, against the same moment "
-                        + "one latent step (4 frames) earlier and later. "
-                        + "About 1x is clean."
-                        + (bad ? " Above 1.3x something moves or sharpens "
-                            + "in a single frame -- the take arrives "
-                            + "slower or sharper than the clip it lands "
-                            + "in. It can pass at this size and show after "
-                            + "an upscale, which keeps motion as it is. "
-                            + "Another seed is the clean cure. To keep "
-                            + "this take, upscale with a refine amount "
-                            + "around 0.6: it re-draws through the step, "
-                            + "but it re-designs detail too, so anything "
-                            + "that must stay as it is needs a reference "
-                            + "image." : "");
-                    wrap.append(a);
-                }
                 // ⚙ = this join's own seam settings. It sits with the
                 // seam it governs rather than in a corner of the widget,
                 // because there can be two of them (a bridge take has a
@@ -9818,34 +9781,7 @@ function buildResultPreview(node) {
         node.properties = node.properties || {};
         node.properties.h3_result = d;
         void render(d);
-        void backfillArrival(d);
     };
-
-    // A payload saved before the `arrival` reading existed has no such
-    // key at all (a measured "nothing to report" is null), and restoring
-    // it runs nothing on the server. Ask once, keep the answer in the
-    // payload, draw again.
-    async function backfillArrival(d) {
-        if (!d?.clip || d.arrival !== undefined
-                || (d.relation !== "prepends" && d.relation !== "bridges")) {
-            return;
-        }
-        try {
-            const resp = await api.fetchApi("/obvpm/h3/arrival", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ clip: d.clip }),
-            });
-            if (!resp.ok) return;       // older server: leave it unasked
-            const got = await resp.json();
-            if (node.properties?.h3_result !== d) return;   // moved on
-            d.arrival = got.arrival ?? null;
-            lastShownKey = JSON.stringify(d);
-            void render(d);
-        } catch (err) {
-            tldbg("result preview: arrival backfill failed", err);
-        }
-    }
 
     // Pick up a run that finished while this workflow was in the
     // background: its `executed` event never reached this node (the node
