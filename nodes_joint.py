@@ -125,17 +125,52 @@ def marker_starts(lines, headers):
     pinned clips are re-placed by their pin in `raw_starts`.
     """
     starts, t = [], 0
-    for line, header in zip(lines, headers):
-        suffix = line[len(line.split("@")[0].rstrip()):]
-        m = _MARKER.match(suffix)
-        enter = int(m.group(2)) if m and m.group(2) else 0
-        exit_ = int(m.group(4)) if m and m.group(3) and m.group(4) else None
+    for (enter, exit_), header in zip(shown_cuts(lines, headers), headers):
+        enter = enter or 0
         delivered = int(header.get("delivered_frames", 0) or 0)
         head = int(header.get("pinned_head_frames", 0) or 0)
         starts.append(t - enter - head)
         end = exit_ if exit_ is not None else delivered
         t += max(0, end - enter)
     return starts
+
+
+def shown_cuts(lines, headers):
+    """[[enter, exit]] per clip -- the delivered frames the cut SHOWS,
+    None where neither the text nor the lineage says (0 / the clip's end).
+    """
+    # What the TEXT says, None where it says nothing...
+    cuts = []
+    for line in lines:
+        suffix = line[len(line.split("@")[0].rstrip()):]
+        m = _MARKER.match(suffix)
+        cuts.append([int(m.group(2)) if m and m.group(2) else None,
+                     int(m.group(4)) if m and m.group(3) and m.group(4)
+                     else None])
+    # ...and where it says nothing, what the LINEAGE derives -- the same
+    # seam the timeline, the preview and the export all play. The widget
+    # writes a marker only for a cut made by hand, so a parent cut before
+    # it was extended, and the frame a bridge hands its target over at,
+    # exist nowhere but in the takes' recipes. raw_starts re-places a
+    # single-pin take by its pin and that covers the first case; a
+    # BRIDGE has two pins and is placed by the cut alone, and so is the
+    # target it arrives at when that target's own parent is not on the
+    # timeline. Both landed off the latent grid (seen 2026-09-19: a
+    # bridge leaving a cut at frame 107 of 115 put at frame 76, not 68).
+    for i in range(1, len(lines)):
+        if cuts[i - 1][1] is not None and cuts[i][0] is not None:
+            continue
+        try:
+            exit_f, enter_f, _ = na._derive_seam(
+                {"clip": lines[i - 1], "header": headers[i - 1]},
+                {"clip": lines[i], "header": headers[i]})
+        except Exception:
+            continue
+        if cuts[i - 1][1] is None and exit_f is not None:
+            cuts[i - 1][1] = int(exit_f)
+        if cuts[i][0] is None and enter_f:
+            cuts[i][0] = int(enter_f)
+    return cuts
 
 
 def timeline_pin(header, ids):
@@ -263,13 +298,44 @@ def timeline_layout(lines, headers, audio_ticks):
             continue
         j_steps.append((i, kind, js))
         j_ticks.append((i, kind, fr.audio_total(at)))
+    owner_steps = owners(steps, j_steps, int(total_steps))
+    owner_ticks = owners(ticks, j_ticks, int(total_ticks))
+    # ...and then, over that, what the cut SHOWS. A junction is only
+    # known for a single-pin take whose source is on the timeline; a
+    # bridge has two pins, and a clip whose parent is elsewhere has none
+    # that count, so both were left "first come" -- which handed a cut
+    # parent's discarded tail the rows its bridge plays (seen 2026-09-19:
+    # ten steps of a cut-away tail in place of the bridge's opening).
+    # Every clip plays delivered frames [enter, exit), and those frames
+    # sit at known joint positions, so the rows under them are its own
+    # whatever the recipe looks like. On a single-pin chain this writes
+    # what the junctions already wrote.
+    for i, ((enter, exit_), header) in enumerate(
+            zip(shown_cuts(lines, headers), headers)):
+        base = starts_frames[i] - first + int(
+            header.get("pinned_head_frames", 0) or 0)
+        lo_f = base + int(enter or 0)
+        hi_f = base + int(exit_ if exit_ is not None
+                          else int(header.get("delivered_frames", 0) or 0))
+        lo_s, hi_s = fr.steps_for_frames(lo_f) if lo_f > 0 else 0,             fr.steps_for_frames(hi_f)
+        if lo_s is None or hi_s is None or hi_f <= lo_f:
+            continue
+        for t in range(max(0, lo_s), min(int(total_steps), hi_s)):
+            owner_steps[t] = i
+        for t in range(max(0, fr.audio_total(lo_f)),
+                       min(int(total_ticks), fr.audio_total(hi_f))):
+            owner_ticks[t] = i
     # what each clip holds at its head, and whether that hold is exact
     # (a masked pin without a ramp), for the placement check in assemble
     heads, hard = [], []
     for header in headers:
         pins = mctx.parse_pins(header)
         heads.append(int(header.get("pinned_head_frames", 0) or 0))
+        # only a hold whose SOURCE is on this timeline sits on rows it
+        # must match; a head held from a clip that is elsewhere lies over
+        # whatever the cut shows there, and differing from it is no error
         hard.append(len(pins) == 1 and pins[0].get("place") == "before"
+                    and pins[0].get("source_id") in ids
                     and pins[0].get("mode") == "masked"
                     and not pins[0].get("mask_ramp_frames")
                     and not pins[0].get("mask_hold"))
@@ -279,8 +345,8 @@ def timeline_layout(lines, headers, audio_ticks):
             "starts": [int(s - first) for s in starts_frames],
             "total_steps": int(total_steps), "total_frames": int(total_frames),
             "total_ticks": int(total_ticks),
-            "owner_steps": owners(steps, j_steps, int(total_steps)),
-            "owner_ticks": owners(ticks, j_ticks, int(total_ticks)),
+            "owner_steps": owner_steps,
+            "owner_ticks": owner_ticks,
             "heads": heads, "hard_hold": hard}
 
 
@@ -355,6 +421,76 @@ def wrap_keep_frames(layout, entries, headers):
     return [int(lo), int(hi)]
 
 
+def wrap_tie(layout, headers):
+    """Where a looping cut's opening sits TWICE on the joint, or None.
+
+    The joint is a line, and a loop is not. The take that closes a loop
+    holds a window of the first clip at its tail, so the opening is on
+    the joint twice: copy A, the first clip's own rows at the start, and
+    copy B, the take's held tail at the very end. Between ordinary
+    neighbours a held window is laid onto its source's rows and there is
+    one copy; the wrap is the one join where a line cannot do that.
+
+    Left alone the two are refined as strangers -- their own noise,
+    their own window, B under the take's conditioning and A with no past
+    at all -- and they come out the same content with different detail.
+    The take's closing frames are refined to flow into B, the file then
+    shows A, and the detail jumps exactly at the wrap (seen live
+    2026-09-18). The render crop cannot help: it only chooses which copy
+    is shown.
+
+    So the window handler keeps the copies IDENTICAL instead -- see
+    H3WindowHandler._tie. This returns what it needs, in video steps and
+    audio ticks: where each copy starts, how long they are, and the
+    HANDOVER inside the window. The handover matters because the copies
+    are not shown the same way round: a softly held window's first
+    frames are re-drawn by the take and the take delivers them, so
+    before the handover B is what the cut shows and A is cropped away;
+    from it on, A is shown and B is cropped.
+
+    None when the cut's last entry does not hold a window of its first
+    (a loop made by hand, say), or the copies are off the latent grid.
+    """
+    if len(headers) < 1:
+        return None
+    take, first_id = headers[-1], headers[0].get("self_id")
+    pin = next((p for p in mctx.parse_pins(take)
+                if p.get("place") == "after" and p.get("source_id")
+                and p.get("source_id") == first_id
+                and p.get("source_kind") in mctx.LINEAGE_KINDS), None)
+    if pin is None:
+        return None
+    covered = int(pin.get("source_frames", 0) or 0)
+    raw = int(take.get("raw_frames", 0) or 0)
+    if covered <= 0 or raw < covered:
+        return None
+    a_f = int(layout["starts"][0]) + int(pin.get("source_start", 0) or 0)
+    b_f = int(layout["starts"][-1]) + raw - covered
+    hand_f = int(na._handover(pin, "after"))
+    if a_f < 0 or b_f <= a_f:
+        return None
+    marks = [fr.steps_for_frames(f) if f else 0
+             for f in (a_f, a_f + covered, b_f, b_f + covered, a_f + hand_f)]
+    if any(m is None for m in marks):
+        _LOG.warning("obvpm.h3 joint: the loop's held opening is off the "
+                     "latent grid (frames %d and %d); the wrap is refined "
+                     "untied", a_f, b_f)
+        return None
+    a0, a1, b0, b1, ah = marks
+    n = min(a1 - a0, b1 - b0, int(layout["total_steps"]) - b0)
+    if n <= 0 or a0 + n > b0:
+        return None
+    ta, tb = fr.audio_total(a_f), fr.audio_total(b_f)
+    tn = min(fr.audio_span(a_f, a_f + covered),
+             fr.audio_span(b_f, b_f + covered),
+             int(layout["total_ticks"]) - tb)
+    return {"a": int(a0), "b": int(b0), "n": int(n),
+            "hand": int(max(0, min(n, ah - a0))),
+            "ta": int(ta), "tb": int(tb), "tn": int(max(0, tn)),
+            "thand": int(max(0, min(max(0, tn),
+                                    fr.audio_span(a_f, a_f + hand_f))))}
+
+
 def crop_blocks(blocks, lo, hi):
     """The frame blocks of a decode, cut to joint frames [lo, hi).
 
@@ -424,7 +560,7 @@ def assemble(videos, audios, layout):
                              "from the parent rows it sits on (rel diff %.4f); an exact "
                              "hold must match -- the clip is placed wrong or its parent "
                              "was regenerated", i, held, hrel)
-        _LOG.info("obvpm.h3 joint: clip %d covers %d step(s) the cut shows from "
+        _LOG.info("obvpm.h3 joint: clip %d covers %d step(s) the sequence shows from "
                   "another clip; kept theirs (rel diff %.4f)", i, len(theirs), rel)
     if not v_written.all():
         holes = torch.nonzero(~v_written).flatten().tolist()
@@ -499,8 +635,21 @@ class H3JointLatent:
             # as the frames the RENDER keeps; the joint itself is whole
             entries = na.resolve_sequence(sequence)
             record["keep_frames"] = wrap_keep_frames(layout, entries, headers)
+            record["wrap_tie"] = wrap_tie(layout, headers)
+            tie = record["wrap_tie"]
+            if tie:
+                _LOG.info("obvpm.h3 joint: the opening is on the joint twice "
+                          "-- steps %d..%d and %d..%d -- and the refine will "
+                          "keep the two identical (the take's copy leads for "
+                          "%d step(s), the first clip's after)", tie["a"],
+                          tie["a"] + tie["n"], tie["b"], tie["b"] + tie["n"],
+                          tie["hand"])
+            else:
+                _LOG.info("obvpm.h3 joint: the sequence loops but its last clip "
+                          "holds no window of its first; the wrap is "
+                          "refined untied")
             lo, hi = record["keep_frames"]
-            _LOG.info("obvpm.h3 joint: the cut loops -- the render keeps "
+            _LOG.info("obvpm.h3 joint: the sequence loops -- the render keeps "
                       "frames %d..%d of %d (%d off the head, %d off the "
                       "tail, which reproduce the opening)", lo, hi,
                       layout["total_frames"], lo, layout["total_frames"] - hi)
@@ -632,7 +781,9 @@ def build_table(layout, load):
     return {"clips": clips, "spans": spans, "conds": conds,
             # who the cut shows at each step: the window handler
             # anchors its windows per clip on this
-            "owners": owners}
+            "owners": owners,
+            # a looping cut's opening, which sits on the joint twice
+            "wrap_tie": layout.get("wrap_tie")}
 
 
 def window_owner(spans, s, e):
@@ -1065,6 +1216,17 @@ class H3WindowHandler:
         shapes = self._shapes(conds)
         video, audio = comfy.utils.unpack_latents(x_in, shapes)[:2]
         T, A = int(video.shape[2]), int(audio.shape[-1])
+        tie = self._tie(self._table(conds), T, A)
+        if tie:
+            # what the windows SEE: one noisy state for both copies, the
+            # shown copy's. The sampler's own state is left alone -- its
+            # two copies carry different noise, but every prediction they
+            # are stepped toward is shared (below), and the last step
+            # lands on the prediction alone.
+            video, audio = video.clone(), audio.clone()
+            self._mirror(video, 2, tie["a"], tie["b"], tie["n"], tie["hand"])
+            self._mirror(audio, -1, tie["ta"], tie["tb"], tie["tn"],
+                         tie["thand"])
         windows = layout_windows(T, self.context_length, self.context_overlap,
                                  self._table(conds))
         # the blended prediction accumulates in system RAM: only one
@@ -1174,10 +1336,67 @@ class H3WindowHandler:
                 # computes uncond + (cond - uncond) with it), never None
                 results.append(torch.zeros_like(x_in))
                 continue
-            v = (acc_v[i] / cnt_v).to(device=x_in.device, dtype=video.dtype)
-            a = (acc_a[i] / cnt_a).to(device=x_in.device, dtype=audio.dtype)
+            v, a = acc_v[i] / cnt_v, acc_a[i] / cnt_a
+            if tie:
+                # what they PREDICT: the mean of the two, written to both.
+                # Copy A gains the past it never had (B was predicted with
+                # the whole take in front of it) and B the future.
+                self._share(v, 2, tie["a"], tie["b"], tie["n"])
+                self._share(a, -1, tie["ta"], tie["tb"], tie["tn"])
+            v = v.to(device=x_in.device, dtype=video.dtype)
+            a = a.to(device=x_in.device, dtype=audio.dtype)
             results.append(comfy.utils.pack_latents([v, a])[0])
         return results
+
+    # -- the wrap of a looping cut ----------------------------------------------
+
+    def _tie(self, table, T, A):
+        """The table's wrap tie, if it fits THIS latent; else None."""
+        tie = (table or {}).get("wrap_tie")
+        if not tie or int(tie.get("n", 0)) <= 0:
+            return None
+        if int(tie["b"]) + int(tie["n"]) > T or int(tie["a"]) < 0:
+            if not getattr(self, "_tie_warned", False):
+                self._tie_warned = True
+                _LOG.warning("obvpm.h3 context windows: the loop's wrap tie "
+                             "does not fit this latent (%d steps); refining "
+                             "untied", T)
+            return None
+        out = {k: int(v) for k, v in tie.items()}
+        out["tn"] = max(0, min(out.get("tn", 0), A - out.get("tb", 0)))
+        out["thand"] = min(out.get("thand", 0), out["tn"])
+        if not getattr(self, "_tie_said", False):
+            self._tie_said = True
+            _LOG.info("obvpm.h3 context windows: the sequence loops -- steps "
+                      "%d..%d and %d..%d are kept identical through the "
+                      "refine", out["a"], out["a"] + out["n"], out["b"],
+                      out["b"] + out["n"])
+        return out
+
+    @staticmethod
+    def _span(x, dim, start, n):
+        return x.narrow(dim if dim >= 0 else x.dim() + dim, start, n)
+
+    @classmethod
+    def _mirror(cls, x, dim, a, b, n, hand):
+        """Both copies take the SHOWN one's rows: B's up to the handover
+        (the take re-drew those and delivers them), A's from it on."""
+        if n <= 0:
+            return
+        hand = max(0, min(n, hand))
+        if hand:
+            cls._span(x, dim, a, hand).copy_(cls._span(x, dim, b, hand))
+        if n - hand:
+            cls._span(x, dim, b + hand, n - hand).copy_(
+                cls._span(x, dim, a + hand, n - hand))
+
+    @classmethod
+    def _share(cls, x, dim, a, b, n):
+        if n <= 0:
+            return
+        mean = (cls._span(x, dim, a, n) + cls._span(x, dim, b, n)) * 0.5
+        cls._span(x, dim, a, n).copy_(mean)
+        cls._span(x, dim, b, n).copy_(mean)
 
     # -- pieces -----------------------------------------------------------------
 
