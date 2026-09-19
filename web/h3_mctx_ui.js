@@ -3250,13 +3250,36 @@ app.registerExtension({
             // is hidden), so a sequence that silently stopped looping
             // rendered as a line and nothing on the strip said so.
             const loopBtn = mkBtn("loop", "");
+            // set by every strip render: does anything close the ring?
+            // (true until the first render, so nothing greys out early)
+            let loopPossible = true;
+            function tlLoopToast(detail) {
+                try {
+                    app.extensionManager?.toast?.add?.({
+                        severity: "info", summary: "H3 Timeline",
+                        detail, life: 5000,
+                    });
+                } catch (e2) { /* toast API absent */ }
+            }
             function paintLoop() {
                 const on = loopOn();
+                // an ON button is never disabled: it must stay the way
+                // to switch a loaded, unclosed loop off
+                const dead = !on && !loopPossible;
                 const P = themePalette();   // PAL is in its TDZ here
                 loopBtn.style.background = on ? TL_ROLE.extend.bg : P.rest;
                 loopBtn.style.borderColor = on ? "transparent" : P.edge;
                 loopBtn.style.color = on ? "#fff" : P.text;
-                loopBtn.title = on
+                loopBtn.style.opacity = dead ? "0.4" : "1";
+                loopBtn.style.cursor = dead ? "default" : "pointer";
+                loopBtn.title = dead
+                    ? "This sequence cannot loop yet: nothing leads from "
+                      + "its last clip back into its first. Click an end "
+                      + "pill and choose \"+ loop new\" to generate the "
+                      + "take that closes it, or add an existing one as "
+                      + "the last clip -- looping then switches on by "
+                      + "itself."
+                    : on
                     ? "ON: the sequence loops -- its last clip joins its "
                       + "first, playback wraps, and export and upscale "
                       + "keep only the frames of one turn. Click to stop "
@@ -3267,11 +3290,15 @@ app.registerExtension({
                       + "take switches this on by itself.";
             }
             loopBtn.addEventListener("mouseenter", () => {
+                if (!loopOn() && !loopPossible) return;
                 loopBtn.style.background = loopOn()
                     ? TL_ROLE.extend.hover : "rgba(127,127,127,0.3)";
             });
             loopBtn.addEventListener("mouseleave", paintLoop);
-            loopBtn.addEventListener("click", () => setLoop(!loopOn()));
+            loopBtn.addEventListener("click", () => {
+                if (!loopOn() && !loopPossible) return;
+                setLoop(!loopOn());
+            });
             paintLoop();
 
             header.append(quickBtn, fullBtn, stateChip, snapBtn, loopBtn,
@@ -7378,34 +7405,46 @@ app.registerExtension({
                 // a button showing the mode it was left on is worse than
                 // no button
                 paintRunMode();
-                paintLoop();
-                // A take that leads back into the FIRST clip, arriving
-                // as the LAST entry, closes the ring: switch looping on.
-                // Only on ARRIVAL (the clip was not on the strip at the
-                // previous render, and there was a previous render) --
-                // so loading a graph decides nothing, and "stop looping"
-                // sticks instead of being undone by the next repaint.
-                const arrived = seenClips !== null
+                // Can this sequence loop at all? Only when something
+                // closes the ring: its last clip leads back into its
+                // first, or the take that will do so is armed (the pin
+                // "+ loop new" sets, which is why looping may be on
+                // before that take exists).
+                const hadRender = seenClips !== null;
+                const arrived = hadRender
                     ? entries.filter((en) => en.gap == null
                                      && !seenClips.has(en.clip)) : [];
                 seenClips = new Set(entries.filter((en) => en.gap == null)
                                            .map((en) => en.clip));
+                const firstEn = entries[0];
                 const lastEn = entries[entries.length - 1];
-                if (!loopOn() && entries.length > 1 && lastEn.gap == null
-                        && entries[0].gap == null
-                        && arrived.includes(lastEn)
-                        && linkedMeta(lastEn.meta, entries[0].meta)) {
+                const closes = entries.length > 1 && firstEn.gap == null
+                    && lastEn.gap == null
+                    && linkedMeta(lastEn.meta, firstEn.meta);
+                loopPossible = closes || impliesLoop(pinState());
+                paintLoop();
+                // The line follows the strip in BOTH directions, and only
+                // on an edit (there was a previous render) -- loading a
+                // graph decides nothing. ON when the clip that closes the
+                // ring ARRIVES as the last entry, so "stop looping"
+                // sticks rather than being undone by the next repaint;
+                // OFF when nothing closes it any more (that take was
+                // removed, the loop pin dropped), because a `loop` line
+                // nobody can see or justify renders the wrong frames.
+                if (hadRender && !loopOn() && closes
+                        && arrived.includes(lastEn)) {
                     tldbg("loop on: the added clip leads back into the first");
-                    try {
-                        app.extensionManager?.toast?.add?.({
-                            severity: "info", summary: "H3 Timeline",
-                            detail: "looping switched on: "
-                                + lastEn.clip.split("/").pop()
-                                + " leads back into the first clip",
-                            life: 5000,
-                        });
-                    } catch (e2) { /* toast API absent */ }
+                    tlLoopToast("looping switched on: "
+                        + lastEn.clip.split("/").pop()
+                        + " leads back into the first clip");
                     setLoop(true);      // re-renders through setSequence
+                    return;
+                }
+                if (hadRender && loopOn() && !loopPossible) {
+                    tldbg("loop off: nothing closes the ring any more");
+                    tlLoopToast("looping switched off: no clip leads back "
+                        + "into the first one any more");
+                    setLoop(false);
                     return;
                 }
                 renderNextRun();
@@ -9337,6 +9376,38 @@ function buildResultPreview(node) {
                 } else {
                     wrap.append(pill);
                 }
+                // The ARRIVING gap also says how the take's own frames
+                // meet its pinned window -- inside the take, ~half a
+                // second before this join. Always drawn when measured
+                // (clean included) so the row keeps one height.
+                const arriving = d.relation === "bridges"
+                    ? clips[k] !== d.clip : d.relation === "prepends";
+                if (arriving && d.arrival) {
+                    const a = document.createElement("span");
+                    const bad = d.arrival.verdict !== "clean";
+                    Object.assign(a.style, {
+                        font: (bad ? "600 " : "") + "9px sans-serif",
+                        whiteSpace: "nowrap",
+                        color: d.arrival.verdict === "local jump"
+                            ? "#b3403c"
+                            : bad ? TL_COLORS.cut : PAL.sub,
+                    });
+                    a.textContent = `arrival ${d.arrival.ratio}x`
+                        + (bad ? ` ${d.arrival.verdict}` : "");
+                    a.title = "Where this take's own frames give way to "
+                        + "the window it arrives in (frame "
+                        + d.arrival.frame + "): the worst-changing parts "
+                        + "of the picture there, against the same moment "
+                        + "one latent step (4 frames) earlier and later. "
+                        + "About 1x is clean."
+                        + (bad ? " Above 1.3x something moves or sharpens "
+                            + "in a single frame -- the take arrives "
+                            + "slower or sharper than the clip it lands "
+                            + "in. It can pass at this size and show after "
+                            + "an upscale, which keeps motion as it is. "
+                            + "Consider another seed." : "");
+                    wrap.append(a);
+                }
                 // ⚙ = this join's own seam settings. It sits with the
                 // seam it governs rather than in a corner of the widget,
                 // because there can be two of them (a bridge take has a
@@ -9742,7 +9813,34 @@ function buildResultPreview(node) {
         node.properties = node.properties || {};
         node.properties.h3_result = d;
         void render(d);
+        void backfillArrival(d);
     };
+
+    // A payload saved before the `arrival` reading existed has no such
+    // key at all (a measured "nothing to report" is null), and restoring
+    // it runs nothing on the server. Ask once, keep the answer in the
+    // payload, draw again.
+    async function backfillArrival(d) {
+        if (!d?.clip || d.arrival !== undefined
+                || (d.relation !== "prepends" && d.relation !== "bridges")) {
+            return;
+        }
+        try {
+            const resp = await api.fetchApi("/obvpm/h3/arrival", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ clip: d.clip }),
+            });
+            if (!resp.ok) return;       // older server: leave it unasked
+            const got = await resp.json();
+            if (node.properties?.h3_result !== d) return;   // moved on
+            d.arrival = got.arrival ?? null;
+            lastShownKey = JSON.stringify(d);
+            void render(d);
+        } catch (err) {
+            tldbg("result preview: arrival backfill failed", err);
+        }
+    }
 
     // Pick up a run that finished while this workflow was in the
     // background: its `executed` event never reached this node (the node
