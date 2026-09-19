@@ -9405,7 +9405,12 @@ function buildResultPreview(node) {
                             + "slower or sharper than the clip it lands "
                             + "in. It can pass at this size and show after "
                             + "an upscale, which keeps motion as it is. "
-                            + "Consider another seed." : "");
+                            + "Another seed is the clean cure. To keep "
+                            + "this take, upscale with a refine amount "
+                            + "around 0.6: it re-draws through the step, "
+                            + "but it re-designs detail too, so anything "
+                            + "that must stay as it is needs a reference "
+                            + "image." : "");
                     wrap.append(a);
                 }
                 // ⚙ = this join's own seam settings. It sits with the

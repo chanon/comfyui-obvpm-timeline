@@ -379,8 +379,13 @@ latent step (4 frames) earlier and later. About 1x is clean; from
 moves or sharpens in a single frame, usually because the take arrives
 slower (and so sharper) than the clip it lands in. Such a take can
 look fine at generation size and pop after an upscale, which keeps
-motion as it is; another seed is the cure. The thresholds rest on a
-small sample. Buttons: **+ add to timeline** (shown when a
+motion as it is. Another seed is the clean cure. To keep the take
+instead, upscale with a refine amount around `0.6` (the usual is
+`0.2`-`0.3`): that re-draws through the step, where `0.4` still shows
+it -- but at that strength the refine re-designs detail as well (a
+prop came out a different shape in our test), so give the model
+reference images for anything that must stay as it is. The thresholds
+rest on a small sample. Buttons: **+ add to timeline** (shown when a
 Timeline node matching the clip's folder exists; inserts at the
 lineage-derived position), **✕ delete** (removes the take's MP4 and
 sidecar from disk, after confirmation), **dismiss** (hides the
