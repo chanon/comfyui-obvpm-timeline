@@ -370,7 +370,17 @@ between both (bridge), playable as one seamless preview.
 Each seam carries a **measured verdict** — the motion discontinuity at
 the join computed from the take's own latents, rated `seamless` /
 `soft bump` / `hard cut` — so you can decide keep-or-reroll before the
-timeline is involved. Buttons: **+ add to timeline** (shown when a
+timeline is involved. A take that **arrives** somewhere (a prepend, a
+bridge, a loop take) gets a second line, `arrival 0.98x`: the
+worst-changing parts of the picture at the frame where the take's own
+frames give way to its pinned window, against the same moment one
+latent step (4 frames) earlier and later. About 1x is clean; from
+1.3x it reads `local bump` and from 1.8x `local jump` — something
+moves or sharpens in a single frame, usually because the take arrives
+slower (and so sharper) than the clip it lands in. Such a take can
+look fine at generation size and pop after an upscale, which keeps
+motion as it is; another seed is the cure. The thresholds rest on a
+small sample. Buttons: **+ add to timeline** (shown when a
 Timeline node matching the clip's folder exists; inserts at the
 lineage-derived position), **✕ delete** (removes the take's MP4 and
 sidecar from disk, after confirmation), **dismiss** (hides the

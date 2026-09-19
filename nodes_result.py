@@ -35,8 +35,9 @@ _LOG = logging.getLogger("obvpm.h3")
 # way an extend always got its parent's (2026-08-27). Bumped because the
 # numbers a take was shown with are no longer the numbers it would get:
 # without this, a take measured under an older rule keeps its stale
-# verdict when the node is shown again.
-_MEASURE_VERSION = "4"
+# verdict when the node is shown again. "5" = the local-jump reading
+# where an arriving window starts rides along as `arrival` (2026-09-19).
+_MEASURE_VERSION = "5"
 
 _SEVERITY = {"seamless": 0, "soft bump": 1, "hard cut": 2}
 
@@ -356,6 +357,21 @@ class H3ResultPreview:
             except Exception:
                 _LOG.exception("obvpm.h3: cut scan failed for %s", rel)
 
+        # Where the take's own frames give way to its ARRIVING window: a
+        # take that lands slower and sharper than its target passes every
+        # whole-frame reading above and shows after an upscale. Separate
+        # from `seam` on purpose -- it is a different place (inside the
+        # take, not at the join) and a different question.
+        arrival = None
+        if relation in ("prepends", "bridges"):
+            try:
+                from .seam_report import arrival_frame, measure_arrival
+                at = arrival_frame(header)
+                if at is not None:
+                    arrival = measure_arrival(ap, at)
+            except Exception:
+                _LOG.exception("obvpm.h3: arrival scan failed for %s", rel)
+
         if relation == "bridges":
             parts = ([parent_rel] if parent_rel else []) + [rel] + \
                 ([parent2_rel] if parent2_rel else [])
@@ -374,4 +390,5 @@ class H3ResultPreview:
             "clip": rel, "parent": parent_rel, "parent2": parent2_rel,
             "relation": relation, "sequence": sequence,
             "seam": seam, "seam2": seam2, "render": render,
+            "arrival": arrival,
         }]}}
