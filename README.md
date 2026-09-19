@@ -30,7 +30,7 @@ Seams are **measured and repairable**: each join reports whether motion
 actually flows through it, and level lock / crossfade / audio de-click
 can be set per join.
 
-A finished cut can be **upscaled and refined as one piece**. The
+A finished sequence can be **upscaled and refined as one piece**. The
 timeline's clips are laid onto a single latent at their true positions,
 upscaled, and re-sampled together in overlapping windows, each under the
 conditioning its clip was generated with, so fine texture is decided

@@ -3205,7 +3205,7 @@ app.registerExtension({
                 runModeBtn.style.color = up ? "#fff" : P.text;
                 runModeBtn.title = up
                     ? "ON: Run refines this whole timeline as one piece "
-                      + "and renders the finished cut. Any pin is kept and "
+                      + "and renders the full sequence. Any pin is kept and "
                       + "comes back when you switch it off. Click to "
                       + "generate again."
                     : "OFF: Run generates the next take from the pin "
@@ -3242,8 +3242,40 @@ app.registerExtension({
             }
             paintRunMode();
 
-            header.append(quickBtn, fullBtn, stateChip, snapBtn, seamBtn,
-                          zoomOutBtn, zoomInBtn,
+            // Whether the sequence is a RING, said where it can be seen.
+            // The fact still lives in ONE place, the `loop` line of the
+            // sequence text: the button reads it to paint and writes it
+            // through setLoop, the line's one writer -- it holds nothing
+            // of its own. The line was invisible before this (the text
+            // is hidden), so a sequence that silently stopped looping
+            // rendered as a line and nothing on the strip said so.
+            const loopBtn = mkBtn("loop", "");
+            function paintLoop() {
+                const on = loopOn();
+                const P = themePalette();   // PAL is in its TDZ here
+                loopBtn.style.background = on ? TL_ROLE.extend.bg : P.rest;
+                loopBtn.style.borderColor = on ? "transparent" : P.edge;
+                loopBtn.style.color = on ? "#fff" : P.text;
+                loopBtn.title = on
+                    ? "ON: the sequence loops -- its last clip joins its "
+                      + "first, playback wraps, and export and upscale "
+                      + "keep only the frames of one turn. Click to stop "
+                      + "looping."
+                    : "OFF: the sequence plays once, start to end. Click "
+                      + "to make it loop (its last clip should be a take "
+                      + "that leads back into the first). Adding such a "
+                      + "take switches this on by itself.";
+            }
+            loopBtn.addEventListener("mouseenter", () => {
+                loopBtn.style.background = loopOn()
+                    ? TL_ROLE.extend.hover : "rgba(127,127,127,0.3)";
+            });
+            loopBtn.addEventListener("mouseleave", paintLoop);
+            loopBtn.addEventListener("click", () => setLoop(!loopOn()));
+            paintLoop();
+
+            header.append(quickBtn, fullBtn, stateChip, snapBtn, loopBtn,
+                          seamBtn, zoomOutBtn, zoomInBtn,
                           fitBtn, addBtn, editBtn, exportBtn, runModeBtn);
             // "next run" config bar: reserved space right below the
             // strip, ALWAYS visible -- states what the pin_specs output
@@ -4039,6 +4071,9 @@ app.registerExtension({
             }
 
             let lastEntries = [];
+            // the clips on the strip at the previous render; null until
+            // the first one, so a loaded graph is not read as "added"
+            let seenClips = null;
             let lastPx = null;          // the scale the last render used
             // Where the playhead was, kept ACROSS rebuilds. A cut edits
             // the sequence, which invalidates the loaded playlist -- but
@@ -6100,7 +6135,7 @@ app.registerExtension({
                                 : "next run bridges " + endL.clip + " → "
                                   + endR.clip)
                               + (loopOn() ? ""
-                                 : " and makes the cut loop"),
+                                 : " and makes the sequence loop"),
                         () => {
                             if (active) { setPinState(null); return; }
                             setBridge({ role: "bridge", source: endL.clip,
@@ -6114,7 +6149,7 @@ app.registerExtension({
                 }
                 if (atEnd && loopOn()) {
                     const s = item(pop, "stop looping",
-                        "open the cut again: the ends stop being a seam, "
+                        "open the sequence again: the ends stop being a seam, "
                         + "playback stops at the end, and the export keeps "
                         + "its own top and tail. Any pin stays as it is.",
                         () => setLoop(false));
@@ -7343,6 +7378,36 @@ app.registerExtension({
                 // a button showing the mode it was left on is worse than
                 // no button
                 paintRunMode();
+                paintLoop();
+                // A take that leads back into the FIRST clip, arriving
+                // as the LAST entry, closes the ring: switch looping on.
+                // Only on ARRIVAL (the clip was not on the strip at the
+                // previous render, and there was a previous render) --
+                // so loading a graph decides nothing, and "stop looping"
+                // sticks instead of being undone by the next repaint.
+                const arrived = seenClips !== null
+                    ? entries.filter((en) => en.gap == null
+                                     && !seenClips.has(en.clip)) : [];
+                seenClips = new Set(entries.filter((en) => en.gap == null)
+                                           .map((en) => en.clip));
+                const lastEn = entries[entries.length - 1];
+                if (!loopOn() && entries.length > 1 && lastEn.gap == null
+                        && entries[0].gap == null
+                        && arrived.includes(lastEn)
+                        && linkedMeta(lastEn.meta, entries[0].meta)) {
+                    tldbg("loop on: the added clip leads back into the first");
+                    try {
+                        app.extensionManager?.toast?.add?.({
+                            severity: "info", summary: "H3 Timeline",
+                            detail: "looping switched on: "
+                                + lastEn.clip.split("/").pop()
+                                + " leads back into the first clip",
+                            life: 5000,
+                        });
+                    } catch (e2) { /* toast API absent */ }
+                    setLoop(true);      // re-renders through setSequence
+                    return;
+                }
                 renderNextRun();
                 renderClipInfo();
                 void loadSeamLevels(entries);
@@ -7553,7 +7618,7 @@ app.registerExtension({
                     // The duration box is left off for the same reason
                     // the pin is: `length` feeds the generation branch,
                     // which this mode switches off.
-                    value.textContent = "upscale — refine and render the cut";
+                    value.textContent = "upscale — refine and render the full sequence";
                     value.style.background = TL_UPSCALE_BG;
                     value.style.color = "#fff";
                     value.style.borderColor = "transparent";
@@ -7562,7 +7627,7 @@ app.registerExtension({
                     value.title =
                         "upscaling is on, so a Run refines this "
                         + "whole timeline as one piece and renders the "
-                        + "finished cut instead of generating a new "
+                        + "full sequence instead of generating a new "
                         + "take. Any pin is kept exactly as it is and "
                         + "comes back when you switch to generation.";
                     frame.append(value);

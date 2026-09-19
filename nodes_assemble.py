@@ -1156,7 +1156,7 @@ class H3Timeline:
                     "tooltip": "Which half of the workflow this Run is for. "
                                "Off: generate the next take from the pin. "
                                "On: refine the whole timeline as one piece "
-                               "and render the finished cut. Flipped from "
+                               "and render the full sequence. Flipped from "
                                "the strip's upscale toggle; comes out on "
                                "the upscaling output for the Mute If gates.",
                 }),

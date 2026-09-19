@@ -163,7 +163,7 @@ class H3JointRender:
     DESCRIPTION = (
         "Writes the jointly refined timeline as one finished MP4, with a "
         ".mctx.safetensors sidecar (the refined latent) and, when the joint "
-        "conditioning is wired, a .cond -- so the rendered cut is a take "
+        "conditioning is wired, a .cond -- so the rendered sequence is a take "
         "that can itself be put on a timeline and refined again. The "
         "picture is decoded a few seconds at a time and streamed to the "
         "encoder, so a long timeline costs one window of memory. Wire the "
@@ -186,7 +186,7 @@ class H3JointRender:
                                "meaning as the Timeline's base_folder. "
                                "Empty = the output root."}),
                 "filename_prefix": ("STRING", {
-                    "default": "cut",
+                    "default": "upscale",
                     "tooltip": "Filename prefix within base_folder; "
                                "numbering is appended automatically."}),
                 "crf": ("INT", {
@@ -205,8 +205,8 @@ class H3JointRender:
                 "conditioning": ("CONDITIONING", {
                     "tooltip": "The CONDITIONING the sampler ran under (H3 "
                                "Joint Conditioning's output). Stored beside "
-                               "the cut as .cond so the rendered take can be "
-                               "refined again. Unwired = the cut saves "
+                               "the render as .cond so the rendered take can be "
+                               "refined again. Unwired = the render saves "
                                "normally and cannot be refined further."}),
                 "source_audio": ("LATENT", {
                     "tooltip": "Optional: a latent whose AUDIO is rendered "
@@ -214,7 +214,7 @@ class H3JointRender:
                                "latent, or Separate AV Latent's audio_latent). "
                                "Wire it when H3 Joint Audio Mask "
                                "re-sampled the sound (audio_denoise above 0, "
-                               "for lip sync), so the finished cut keeps the "
+                               "for lip sync), so the finished render keeps the "
                                "source soundtrack. The sidecar stores the "
                                "audio that was rendered."}),
                 "layout": (wt.JOINT, {
@@ -279,7 +279,7 @@ class H3JointRender:
             sound = {"waveform": wf[..., round(lo / fr.FPS * sr):
                                      round(hi / fr.FPS * sr)],
                      "sample_rate": sr}
-            _LOG.info("obvpm.h3 render: looping cut, keeping frames %d..%d "
+            _LOG.info("obvpm.h3 render: looping sequence, keeping frames %d..%d "
                       "of %d", lo, hi, frames)
         nodes_save.encode_mp4_stream(
             video_path, blocks, hi - lo,

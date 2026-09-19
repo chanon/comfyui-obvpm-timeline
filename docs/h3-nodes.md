@@ -269,7 +269,7 @@ export). The node itself:
 | `crossfade_frames` | INT | fade length; **0 means the whole overlap**, which is the right answer — see the guide (default **0**) |
 | `audio_declick` | BOOLEAN | 5 ms taper each side of joins no crossfade covers (default **off**) |
 | `duration_seconds` | FLOAT | how long the next generation should be; the `length` output converts and snaps it |
-| `upscaling` | BOOLEAN (toolbar) | which half of the workflow a Run is for: off generates the next take, on refines the whole timeline and renders the cut. Driven by the **upscale** toggle on the strip toolbar past **export**, not from the setup widgets |
+| `upscaling` | BOOLEAN (toolbar) | which half of the workflow a Run is for: off generates the next take, on refines the whole timeline and renders the full sequence. Driven by the **upscale** toggle on the strip toolbar past **export**, not from the setup widgets |
 
 Outputs: `pin_specs`, `length`, `sequence`, `upscaling`.
 
@@ -645,10 +645,10 @@ sources), with H3 Joint Conditioning splicing its stored table back in.
 | `samples` | LATENT | the sampler's output |
 | `vae` / `audio_vae` | VAE | the H3 video and audio VAEs |
 | `base_folder` | STRING | output-relative folder, same meaning as the Timeline's; empty = the output root |
-| `filename_prefix` | STRING | filename prefix within `base_folder` (default `cut`); numbering is appended |
+| `filename_prefix` | STRING | filename prefix within `base_folder` (default `upscale`); numbering is appended |
 | `crf` | INT | H.264 quality |
 | `window_seconds` | FLOAT | seconds of picture decoded at a time (default 5). Only memory changes with it — the frames of one window sit in RAM while they are encoded, about 5 GB for 5 s at 1920×1088. The output is identical at any value |
-| `conditioning` | CONDITIONING (optional) | H3 Joint Conditioning's output, stored beside the cut as `.cond`. Unwired = the cut cannot be refined again |
+| `conditioning` | CONDITIONING (optional) | H3 Joint Conditioning's output, stored beside the render as `.cond`. Unwired = the render cannot be refined again |
 | `layout` | JOINT (optional) | from Join Latents: the source clips and sequence lines are recorded in the sidecar, and a latent that is not that timeline is refused |
 | `source_audio` | LATENT (optional) | an AV latent whose **audio** is rendered instead of the sampled one — wire Join Latents' `latent` here when Audio Mask re-sampled the sound for lip sync. The sidecar stores the audio that was rendered |
 
