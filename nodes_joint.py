@@ -1338,9 +1338,9 @@ class H3WindowHandler:
                 continue
             v, a = acc_v[i] / cnt_v, acc_a[i] / cnt_a
             if tie:
-                # what they PREDICT: the mean of the two, written to both.
-                # Copy A gains the past it never had (B was predicted with
-                # the whole take in front of it) and B the future.
+                # what they PREDICT: one blend of the two, written to both
+                # -- B's where the span follows the take, A's where it runs
+                # on into the first clip (see _share).
                 self._share(v, 2, tie["a"], tie["b"], tie["n"])
                 self._share(a, -1, tie["ta"], tie["tb"], tie["tn"])
             v = v.to(device=x_in.device, dtype=video.dtype)
@@ -1392,11 +1392,31 @@ class H3WindowHandler:
 
     @classmethod
     def _share(cls, x, dim, a, b, n):
+        """One prediction for both copies: B's at the span's first row,
+        A's at its last, a straight fade between.
+
+        Each end of the span has ONE neighbour that is shown. B's first
+        row follows the take's own rows, and only B was predicted with the
+        take in front of it; A's last row runs on into the rest of the
+        first clip, and only A was predicted with that behind it. A flat
+        mean made every tied row half a stranger's: the row after the
+        take's last free one was suddenly half decided by a copy with no
+        past at all, and the detail popped right there, where the held
+        opening begins (seen live 2026-09-19 -- the same clips refined
+        without the loop showed nothing). Faded, each end is continuous
+        with what it touches, and the copies still end identical, which is
+        all the wrap itself needs.
+        """
         if n <= 0:
             return
-        mean = (cls._span(x, dim, a, n) + cls._span(x, dim, b, n)) * 0.5
-        cls._span(x, dim, a, n).copy_(mean)
-        cls._span(x, dim, b, n).copy_(mean)
+        d = dim if dim >= 0 else x.dim() + dim
+        shape = [1] * x.dim()
+        shape[d] = n
+        w_b = (torch.linspace(1.0, 0.0, n) if n > 1
+               else torch.full((1,), 0.5)).to(device=x.device, dtype=x.dtype).view(shape)
+        mixed = cls._span(x, dim, b, n) * w_b + cls._span(x, dim, a, n) * (1.0 - w_b)
+        cls._span(x, dim, a, n).copy_(mixed)
+        cls._span(x, dim, b, n).copy_(mixed)
 
     # -- pieces -----------------------------------------------------------------
 

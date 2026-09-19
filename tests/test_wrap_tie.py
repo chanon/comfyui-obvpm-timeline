@@ -122,8 +122,34 @@ class WhichCopyLeads(unittest.TestCase):
         x[:, :, 0:12] = 1.0
         x[:, :, 60:72] = 3.0
         nj.H3WindowHandler._share(x, 2, 0, 60, 12)
-        self.assertTrue(bool((x.flatten()[0:12] == 2.0).all()))
-        self.assertTrue(bool((x.flatten()[60:72] == 2.0).all()))
+        a, b = x.flatten()[0:12], x.flatten()[60:72]
+        self.assertTrue(bool((a == b).all()), "both copies get the SAME prediction")
+        # B's (3.0) where the span follows the take, A's (1.0) where it
+        # runs on into the first clip, a straight fade between
+        self.assertEqual(float(b[0]), 3.0)
+        self.assertEqual(float(b[-1]), 1.0)
+        steps = b[:-1] - b[1:]
+        self.assertTrue(bool((steps > 0).all()))
+        self.assertLess(float((steps - steps[0]).abs().max()), 1e-6)
+        # rows outside the two spans are not touched
+        self.assertTrue(bool((x.flatten()[12:60] == 0.0).all()))
+
+    def test_each_end_is_its_neighbours_own_prediction(self):
+        # a prediction that is continuous with the take at B's start and
+        # with the first clip's continuation at A's end stays so
+        x = torch.zeros(1, 1, 80)
+        x[..., 48:60] = 5.0            # the take's free rows, before B
+        x[..., 60:72] = 5.0            # B, predicted as their continuation
+        x[..., 0:12] = 2.0             # A
+        x[..., 12:24] = 2.0            # the first clip running on, after A
+        nj.H3WindowHandler._share(x, -1, 0, 60, 12)
+        self.assertEqual(float(x[..., 60] - x[..., 59]), 0.0)
+        self.assertEqual(float(x[..., 12] - x[..., 11]), 0.0)
+
+    def test_a_single_row_span_is_the_mean(self):
+        x = torch.tensor([[[1.0, 0.0, 3.0]]])
+        nj.H3WindowHandler._share(x, -1, 0, 2, 1)
+        self.assertEqual(x.flatten().tolist(), [2.0, 0.0, 2.0])
 
 
 class TheCopiesEndIdentical(unittest.TestCase):
