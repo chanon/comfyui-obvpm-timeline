@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-obvpm-timeline"
-description = "Non-linear clip composition on a timeline (MiniMax H3 today): takes carry their latents in a sidecar, so a generation can continue an earlier one exactly (extend, prepend, bridge), and a timeline assembles them by smart-cut. Companion to comfyui-obvpm."
+description = "A timeline for MiniMax H3 video: generate a clip, then extend it, prepend to it or bridge between clips seamlessly from their saved latents. The Timeline node is a mini video editor to arrange, cut and preview them, make seamless loops, and upscale the whole sequence in one pass. Companion to comfyui-obvpm."
 version = "0.1.0"
 license = { file = "LICENSE" }
 readme = "README.md"
