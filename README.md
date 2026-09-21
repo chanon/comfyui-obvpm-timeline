@@ -6,6 +6,8 @@ The timeline node is like a mini video editor.
 
 And it also supports creating seamless looping videos.
 
+<img src="assets/timeline-node.png" title="" alt="The Timeline node: three clips on the timeline, with the first one set to be prepended" width="804">
+
 ## Updates
 
 ### 0.1.0 (2026-09-21)
@@ -15,6 +17,10 @@ And it also supports creating seamless looping videos.
 ## Watch the Tutorial
 
 The best way to learn how to use the Timeline and workflow is by watching the YouTube tutorial video:
+
+[![Watch the tutorial on YouTube](https://img.youtube.com/vi/RwmvrYWLulo/hqdefault.jpg)](https://youtu.be/RwmvrYWLulo)
+
+**Watch on YouTube: [https://youtu.be/RwmvrYWLulo](https://youtu.be/RwmvrYWLulo)**
 
 ## Features
 
