@@ -18,9 +18,9 @@ And it also supports creating seamless looping videos.
 
 The best way to learn how to use the Timeline and workflow is by watching the YouTube tutorial video:
 
-[![Watch the tutorial on YouTube](https://img.youtube.com/vi/RwmvrYWLulo/hqdefault.jpg)](https://youtu.be/RwmvrYWLulo)
+[![Watch the tutorial on YouTube](https://img.youtube.com/vi/kqP09NfJXaQ/hqdefault.jpg)](https://youtu.be/kqP09NfJXaQ)
 
-**Watch on YouTube: [https://youtu.be/RwmvrYWLulo](https://youtu.be/RwmvrYWLulo)**
+**Watch on YouTube: [https://youtu.be/RwmvrYWLulo](https://youtu.be/kqP09NfJXaQ)**
 
 ## Features
 
