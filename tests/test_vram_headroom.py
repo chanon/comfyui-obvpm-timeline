@@ -7,7 +7,9 @@ left raised after an interrupted run (which would quietly slow every
 later run in the session).
 
 Run from the pack folder:
-  C:/AI/ComfyUI/ComfyUI_windows_portable/python_embeded/python.exe -s -m unittest discover -s tests -v
+  python -m unittest discover -s tests -v
+(with the Python that runs ComfyUI -- on the Windows portable build,
+python_embeded/python.exe -s)
 """
 import importlib
 import os

@@ -1,4 +1,4 @@
-"""The pins pipeline: decide -> slice+execute (DESIGN.md section 4).
+"""The pins pipeline: decide -> slice+execute.
 
   H3MCtxPinSpec     spec builder: pure data, no tensor work
   H3MCtxApplyPins   slices (sole frame<->latent math site, via

@@ -2,7 +2,7 @@
 
 Every node in this subpackage that converts between pixel frames, video
 latent steps and audio latent steps goes through this module. One
-implementation, not ad-hoc math per node (DESIGN.md section 6).
+implementation, not ad-hoc math per node.
 
 The grids, mirrored from ComfyUI core (comfy_extras/nodes_minimax_h3.py,
 comfy/ldm/minimax/model.py):

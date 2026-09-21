@@ -10,7 +10,9 @@ exception, and these tests pin both halves of it -- the exception itself,
 and that a latent-grade join is judged exactly as before.
 
 Run from the pack folder:
-  C:/AI/ComfyUI/ComfyUI_windows_portable/python_embeded/python.exe -s -m unittest discover -s tests -v
+  python -m unittest discover -s tests -v
+(with the Python that runs ComfyUI -- on the Windows portable build,
+python_embeded/python.exe -s)
 """
 import importlib
 import json

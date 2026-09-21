@@ -10,7 +10,9 @@ which one leads on each side of the handover, and -- with a toy sampler --
 that the copies END identical although their noise never was.
 
 Run from the pack folder:
-  C:/AI/ComfyUI/ComfyUI_windows_portable/python_embeded/python.exe -s -m unittest discover -s tests -v
+  python -m unittest discover -s tests -v
+(with the Python that runs ComfyUI -- on the Windows portable build,
+python_embeded/python.exe -s)
 """
 import importlib
 import json

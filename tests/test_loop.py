@@ -5,7 +5,9 @@ torch import for real); the output folder and the sidecar reader are
 patched, so no clip files or sidecars are needed.
 
 Run from the pack folder:
-  C:/AI/ComfyUI/ComfyUI_windows_portable/python_embeded/python.exe -s -m unittest discover -s tests -v
+  python -m unittest discover -s tests -v
+(with the Python that runs ComfyUI -- on the Windows portable build,
+python_embeded/python.exe -s)
 """
 import importlib
 import json

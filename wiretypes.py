@@ -6,7 +6,7 @@ breaking it. Everything here is therefore prefixed `OBVPM_` -- decided
 2026-08-20, before the first release, which is the only moment the rename
 was free.
 
-That REVERSES an earlier decision for `MCTX` (DESIGN.md 4), which argued
+That REVERSES an earlier decision for `MCTX`, which argued
 for an unbranded name so other packs could emit and accept the same wire
 -- "the collision risk that motivates prefixed names is here the goal".
 The counter-argument won: a user looking at a graph should be able to see
@@ -31,7 +31,7 @@ Note what is NOT renamed: `mctx.FORMAT` ("mctx_v1") and the
 wires, and changing them would orphan every sidecar already written.
 """
 
-# latents + verified identity/lineage for one clip (DESIGN.md 4)
+# latents + verified identity/lineage for one clip
 MCTX = "OBVPM_H3_MCTX"
 
 # a list of pin DESCRIPTIONS -- pure data, chainable like LoRA stacks

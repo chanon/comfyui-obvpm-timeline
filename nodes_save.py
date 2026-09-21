@@ -1,4 +1,4 @@
-"""H3SaveVideoWithMCtx: MP4 + mctx sidecar, one transaction (DESIGN.md 2-4).
+"""H3SaveVideoWithMCtx: MP4 + mctx sidecar, one transaction.
 
 Owns its encode so the MP4 and the sidecar are written by one node with
 one trustworthy pairing hash -- deliberately NOT downstream of VHS or

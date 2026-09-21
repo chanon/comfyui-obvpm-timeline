@@ -1,4 +1,4 @@
-"""H3MCtxFromFrames: the pack's only pixels -> latents crossing (DESIGN.md 4).
+"""H3MCtxFromFrames: the pack's only pixels -> latents crossing.
 
 A pin is normally a direct latent slice out of a verified sidecar: exact,
 hash-checked, no VAE anywhere. Footage with no sidecar -- an import, an

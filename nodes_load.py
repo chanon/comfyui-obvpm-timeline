@@ -1,4 +1,4 @@
-"""H3LoadVideoWithMCtx: clip picker with sidecar verification (DESIGN.md 4).
+"""H3LoadVideoWithMCtx: clip picker with sidecar verification.
 
 Mirrors the core Load Video idea but browses the OUTPUT folder (where
 takes land) and adds mctx awareness: when a sidecar pairs with the file
@@ -230,8 +230,7 @@ def _create_pixel_pins(clip, create_pins, pin_window, at_frame=None,
 
     Nothing is resolved here -- not the frame count, not the fps, not
     even whether the file opens. Apply owns that, because Apply is where
-    the VAE and the target resolution are, and a spec is pure data
-    (DESIGN.md 4).
+    the VAE and the target resolution are, and a spec is pure data.
     """
     mode = _PIN_MODES[create_pins]
     if mode is None:
@@ -290,7 +289,7 @@ _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov")
 _SCAN_DEPTH = 3
 
 # hash cache: {abs_path: (size, mtime_ns, sha256)}. Disposable memoization,
-# never authority (DESIGN.md section 3).
+# never authority.
 _HASH_CACHE = {}
 
 

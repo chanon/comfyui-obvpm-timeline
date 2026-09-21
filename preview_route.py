@@ -28,8 +28,7 @@ beside itself under export_filename_prefix with the normal counter --
 the export is byte-identical to the preview by construction.
 
 These are stateless utility routes, NOT review gates: they drive no
-generation, hold no state, and keep the loop-less design intact
-(DESIGN.md section 1).
+generation, hold no state, and keep the loop-less design intact.
 """
 
 import functools

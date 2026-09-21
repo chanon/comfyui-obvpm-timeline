@@ -11,7 +11,9 @@ once placed right it still lost its first ten steps to clip 5's cut-away
 tail, because ownership knew no junction for a two-pin take either.
 
 Run from the pack folder:
-  C:/AI/ComfyUI/ComfyUI_windows_portable/python_embeded/python.exe -s -m unittest discover -s tests -v
+  python -m unittest discover -s tests -v
+(with the Python that runs ComfyUI -- on the Windows portable build,
+python_embeded/python.exe -s)
 """
 import importlib
 import json

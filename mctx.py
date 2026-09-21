@@ -1,4 +1,4 @@
-"""mctx_v1 sidecar files: read, write, hash, lineage (DESIGN.md sections 2-3).
+"""mctx_v1 sidecar files: read, write, hash, lineage.
 
 A take is a clip pair with the same basename:
 
@@ -288,7 +288,7 @@ def summarize_pins(pin_specs):
     clip = "prepends" (this clip sits BEFORE the junction at
     source_start). Anything the summary cannot express -- multiple pins,
     inside pins, image sources -- yields ("", "", 0) and consumers read
-    the full `pins` recipe instead (DESIGN.md section 3).
+    the full `pins` recipe instead.
     """
     specs = [s for s in (pin_specs or [])]
     if len(specs) != 1:
@@ -377,7 +377,7 @@ def scan_for_parent(folder, parent_id):
     """Find the sidecar whose self_id matches, header-scan only.
 
     Same-folder scan; returns the sidecar path or None. Missing parent is
-    "lineage unknown", never an error (DESIGN.md section 3). The slow
+    "lineage unknown", never an error. The slow
     hash-the-MP4s path is deliberately not implemented here -- callers
     decide when that cost is worth paying.
     """
