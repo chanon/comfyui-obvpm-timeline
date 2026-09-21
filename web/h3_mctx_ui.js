@@ -344,18 +344,7 @@ app.registerExtension({
 
             // Forward canvas gestures so the video doesn't swallow graph
             // navigation (core does the same via useCanvasInteractions).
-            container.addEventListener("wheel", (e) => {
-                const canvasEl = app.canvas?.canvas;
-                if (!canvasEl) return;
-                e.preventDefault();
-                e.stopPropagation();
-                const { clientX, clientY, deltaX, deltaY,
-                        ctrlKey, metaKey, shiftKey } = e;
-                canvasEl.dispatchEvent(new WheelEvent("wheel", {
-                    clientX, clientY, deltaX, deltaY,
-                    ctrlKey, metaKey, shiftKey,
-                }));
-            });
+            tlWheelToCanvas(container);
             const forwardMiddle = (e) => {
                 if (e.button === 1 || (e.buttons & 4)) {
                     const canvasEl = app.canvas?.canvas;
@@ -784,6 +773,56 @@ function tlPanWithMiddleButton(el) {
             if (e.button === 1) e.preventDefault();
         }, true);
     }
+}
+
+// The same for the WHEEL. A DOM widget is an overlay above the canvas, so a
+// wheel over it never reaches the graph: "leaving it to the canvas" means
+// the graph does not zoom while the cursor is on the node. So every wheel the
+// panel has no use for is handed over, as core does for its own widgets
+// (useCanvasInteractions.forwardEventToCanvas) -- on the whole container, in
+// the bubble phase, after the panel's own consumers have had their say:
+//   - one that called preventDefault (the ruler's zoom, ctrl+wheel over the
+//     strip) keeps it;
+//   - something under the cursor that can actually SCROLL that way keeps it
+//     (the strip sideways, a long text box), until it runs out.
+function tlScrollsThatWay(el, stop, dx, dy) {
+    const sideways = Math.abs(dx) > Math.abs(dy);
+    const delta = sideways ? dx : dy;
+    for (; el && el !== stop; el = el.parentElement) {
+        if (!(el instanceof HTMLElement)) continue;
+        const cs = getComputedStyle(el);
+        const flow = sideways ? cs.overflowX : cs.overflowY;
+        if (flow !== "auto" && flow !== "scroll") continue;
+        const pos = sideways ? el.scrollLeft : el.scrollTop;
+        const room = sideways ? el.scrollWidth - el.clientWidth
+                              : el.scrollHeight - el.clientHeight;
+        if (room > 1 && (delta < 0 ? pos > 0 : pos < room - 1)) return true;
+    }
+    return false;
+}
+
+function tlWheelToCanvas(el) {
+    el.addEventListener("wheel", (e) => {
+        if (e.defaultPrevented) return;
+        const canvas = app.canvas?.canvas;
+        if (!canvas) return;
+        // shift+wheel is the browser's sideways scroll
+        const dx = e.shiftKey && !e.deltaX ? e.deltaY : e.deltaX;
+        const dy = e.shiftKey && !e.deltaX ? 0 : e.deltaY;
+        if (!e.ctrlKey && !e.metaKey
+                && tlScrollsThatWay(e.target, el.parentElement, dx, dy)) {
+            return;
+        }
+        e.preventDefault();
+        e.stopPropagation();
+        const { clientX, clientY, deltaX, deltaY, deltaMode,
+                ctrlKey, metaKey, shiftKey, altKey } = e;
+        canvas.dispatchEvent(new WheelEvent("wheel", {
+            clientX, clientY, deltaX, deltaY, deltaMode,
+            ctrlKey, metaKey, shiftKey, altKey,
+            cancelable: true,
+        }));
+    }, { passive: false });
 }
 
 function tlProgressBar() {
@@ -3946,10 +3985,11 @@ app.registerExtension({
                 drawLinks(lastEntries);
                 setPlayhead(displayFrame() ?? heldFrame);
             });
-            // ctrl+wheel zooms about the cursor. Plain wheel is left to
-            // the canvas: the graph's own zoom is what people expect
-            // from a bare wheel over a node, and stealing it would make
-            // the timeline a trap to scroll past.
+            // ctrl+wheel zooms about the cursor. Plain wheel goes to the
+            // canvas (tlWheelToCanvas on the container hands it over): the
+            // graph's own zoom is what people expect from a bare wheel
+            // over a node, and stealing it would make the timeline a trap
+            // to scroll past.
             // Over the blocks a bare wheel belongs to the canvas, so
             // zooming there needs the modifier. Same smooth path.
             strip.addEventListener("wheel", (ev) => {
@@ -4290,20 +4330,10 @@ app.registerExtension({
                 configurable: true, get: () => undefined, set: () => {},
             });
 
-            // forward canvas gestures (wheel over the video area only;
-            // the strip keeps its own horizontal scrolling)
-            videoWrap.addEventListener("wheel", (e) => {
-                const canvasEl = app.canvas?.canvas;
-                if (!canvasEl) return;
-                e.preventDefault();
-                e.stopPropagation();
-                const { clientX, clientY, deltaX, deltaY,
-                        ctrlKey, metaKey, shiftKey } = e;
-                canvasEl.dispatchEvent(new WheelEvent("wheel", {
-                    clientX, clientY, deltaX, deltaY,
-                    ctrlKey, metaKey, shiftKey,
-                }));
-            });
+            // A wheel anywhere on the panel zooms the graph, except where
+            // the panel uses it itself: the ruler, ctrl+wheel over the
+            // strip, and the strip's own sideways scrolling.
+            tlWheelToCanvas(container);
 
             // ---- sequence editing (text widget = source of truth) -----
             function currentLines() {
@@ -9030,6 +9060,7 @@ function buildResultPreview(node) {
     widget.serialize = false;
     widget.options.serialize = false;
     tlPanWithMiddleButton(container);
+    tlWheelToCanvas(container);
     widget.computeLayoutSize = () => ({ minHeight: 220, minWidth: 240 });
     Object.defineProperty(widget, "width", {
         configurable: true, get: () => undefined, set: () => {},
