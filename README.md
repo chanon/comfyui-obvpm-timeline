@@ -6,6 +6,12 @@ The timeline node is like a mini video editor.
 
 And it also supports creating seamless looping videos.
 
+## Updates
+
+### 0.1.0 (2026-09-21)
+
+- First release.
+
 ## Watch the Tutorial
 
 The best way to learn how to use the Timeline and workflow is by watching the YouTube tutorial video:
