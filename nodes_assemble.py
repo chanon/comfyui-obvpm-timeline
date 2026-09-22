@@ -53,6 +53,7 @@ import time
 
 import folder_paths
 
+from . import compat
 from . import frames as fr
 from . import wiretypes as wt
 from . import levellock
@@ -1357,6 +1358,10 @@ class H3Timeline:
 
     def emit(self, sequence="", pin_state="", duration_seconds=8.0,
              upscaling=False, **_):
+        # First, before anything is read: the run stops here with what
+        # the install is missing and how to fix it, not downstream with
+        # a symptom (compat.py). The widget shows the same list.
+        compat.require()
         # A graph saved while this was the run_mode combo hands over its
         # string; "upscale" is the only value that meant on
         if isinstance(upscaling, str):
