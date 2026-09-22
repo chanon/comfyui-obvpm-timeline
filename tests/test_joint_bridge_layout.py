@@ -15,7 +15,6 @@ Run from the pack folder:
 (with the Python that runs ComfyUI -- on the Windows portable build,
 python_embeded/python.exe -s)
 """
-import importlib
 import json
 import os
 import sys
@@ -31,9 +30,8 @@ if pack is None:
     pack = types.ModuleType("obvpm_tl_test")
     pack.__path__ = [ROOT]
     sys.modules[pack.__name__] = pack
-nj = importlib.import_module("obvpm_tl_test.nodes_joint")
-fr = importlib.import_module("obvpm_tl_test.frames")
-
+from obvpm_tl_test import nodes_joint as nj
+from obvpm_tl_test import frames as fr
 RAMP = {"mask_ramp_frames": 10, "mask_ramp_edge": 0.4}
 
 

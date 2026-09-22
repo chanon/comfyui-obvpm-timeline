@@ -9,7 +9,6 @@ Run from the pack folder:
 (with the Python that runs ComfyUI -- on the Windows portable build,
 python_embeded/python.exe -s)
 """
-import importlib
 import json
 import os
 import sys
@@ -26,9 +25,9 @@ if COMFY not in sys.path:
 pack = types.ModuleType("obvpm_tl_test")
 pack.__path__ = [ROOT]
 sys.modules[pack.__name__] = pack
-na = importlib.import_module("obvpm_tl_test.nodes_assemble")
-levellock = importlib.import_module("obvpm_tl_test.levellock")
-preview_route = importlib.import_module("obvpm_tl_test.preview_route")
+from obvpm_tl_test import nodes_assemble as na
+from obvpm_tl_test import levellock as levellock
+from obvpm_tl_test import preview_route as preview_route
 import folder_paths  # noqa: E402  (ComfyUI's, on the path above)
 
 
@@ -150,7 +149,7 @@ class LoopTests(unittest.TestCase):
     # -- the joint render keeps the cut's wrap ---------------------------
 
     def test_joint_render_crops_to_the_wrap(self):
-        nj = importlib.import_module("obvpm_tl_test.nodes_joint")
+        from obvpm_tl_test import nodes_joint as nj
         # the joint's own parser must skip the directive like the cut's
         self.assertEqual(nj.parse_sequence("loop\na.mp4\nt.mp4"),
                          ["a.mp4", "t.mp4"])
@@ -177,7 +176,7 @@ class LoopTests(unittest.TestCase):
 
     def test_crop_blocks_slices_across_block_edges(self):
         import torch
-        nj = importlib.import_module("obvpm_tl_test.nodes_joint")
+        from obvpm_tl_test import nodes_joint as nj
         blocks = [torch.arange(10).view(10, 1, 1, 1),
                   torch.arange(10, 20).view(10, 1, 1, 1),
                   torch.arange(20, 30).view(10, 1, 1, 1)]
@@ -191,7 +190,7 @@ class LoopTests(unittest.TestCase):
     # -- pin keyframes are lineage, and a refine at another size drops them
 
     def test_resolved_pins_are_tagged_as_lineage(self):
-        np_ = importlib.import_module("obvpm_tl_test.nodes_pins")
+        from obvpm_tl_test import nodes_pins as np_
         # the shape apply() holds: kind + source_id at the top, the
         # recipe's source_kind inside spec
         resolved = {"kind": "clip", "source_id": "A", "place": "after",
@@ -209,7 +208,7 @@ class LoopTests(unittest.TestCase):
 
     def test_refine_drops_keyframes_at_another_resolution(self):
         import torch
-        nj = importlib.import_module("obvpm_tl_test.nodes_joint")
+        from obvpm_tl_test import nodes_joint as nj
         small = torch.zeros(1, 24, 12, 34, 60)
         big = torch.zeros(1, 24, 12, 68, 120)
         audio = torch.zeros(1, 32, 2, 65)

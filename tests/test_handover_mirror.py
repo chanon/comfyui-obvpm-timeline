@@ -11,7 +11,6 @@ Run from the pack folder:
 (with the Python that runs ComfyUI -- on the Windows portable build,
 python_embeded/python.exe -s)
 """
-import importlib
 import json
 import os
 import shutil
@@ -30,9 +29,8 @@ if pack is None:
     pack = types.ModuleType("obvpm_tl_test")
     pack.__path__ = [ROOT]
     sys.modules[pack.__name__] = pack
-nm = importlib.import_module("obvpm_tl_test.nodes_masked")
-fr = importlib.import_module("obvpm_tl_test.frames")
-
+from obvpm_tl_test import nodes_masked as nm
+from obvpm_tl_test import frames as fr
 GRID = [(covered, place, ramp, edge, deep)
         for covered in (1, 5, 22, 39, 56, 90, 100)
         for place in ("before", "after")

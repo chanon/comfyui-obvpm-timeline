@@ -178,7 +178,9 @@ def check_obvpm():
     capable = None
     if have is None:
         try:
-            module = __import__(presets.__module__, fromlist=["describe"])
+            # the module is already loaded (the class came from it), so
+            # this is a lookup, not an import
+            module = sys.modules[presets.__module__]
             capable = "hint" in module.describe("x: bool # h")[0]
         except Exception:
             capable = None

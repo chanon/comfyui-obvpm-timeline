@@ -11,7 +11,6 @@ Run from the pack folder:
 (with the Python that runs ComfyUI -- on the Windows portable build,
 python_embeded/python.exe -s)
 """
-import importlib
 import os
 import sys
 import types
@@ -28,10 +27,8 @@ if pack is None:
     pack = types.ModuleType("obvpm_tl_test")
     pack.__path__ = [ROOT]
     sys.modules[pack.__name__] = pack
-nb = importlib.import_module("obvpm_tl_test.nodes_budget")
-nj = importlib.import_module("obvpm_tl_test.nodes_joint")
-
-
+from obvpm_tl_test import nodes_budget as nb
+from obvpm_tl_test import nodes_joint as nj
 def lat(t, h, w):
     return {"latent": torch.zeros(1, 24, t, h, w)}
 

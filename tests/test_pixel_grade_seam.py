@@ -14,7 +14,6 @@ Run from the pack folder:
 (with the Python that runs ComfyUI -- on the Windows portable build,
 python_embeded/python.exe -s)
 """
-import importlib
 import json
 import os
 import sys
@@ -30,10 +29,8 @@ if pack is None:
     pack = types.ModuleType("obvpm_tl_test")
     pack.__path__ = [ROOT]
     sys.modules[pack.__name__] = pack
-na = importlib.import_module("obvpm_tl_test.nodes_assemble")
-pr = importlib.import_module("obvpm_tl_test.preview_route")
-
-
+from obvpm_tl_test import nodes_assemble as na
+from obvpm_tl_test import preview_route as pr
 def header(self_id, pins=()):
     return {"self_id": self_id, "pins": json.dumps(list(pins))}
 
@@ -119,7 +116,7 @@ class OverlapKept(unittest.TestCase):
                 "spec": {"place": place, "source_kind": kind, "mode": mode}}
 
     def test_sides(self):
-        ns = importlib.import_module("obvpm_tl_test.nodes_save")
+        from obvpm_tl_test import nodes_save as ns
         w = self.wired
         self.assertEqual(ns.rerendered_sides([w("before")]), set())
         self.assertEqual(ns.rerendered_sides([w("before", mode="both")]),
@@ -147,7 +144,8 @@ class FadeAtACut(unittest.TestCase):
     keeps the strict rule it always had."""
 
     def setUp(self):
-        self.xf = importlib.import_module("obvpm_tl_test.crossfade")
+        from obvpm_tl_test import crossfade
+        self.xf = crossfade
         self._available = self.xf.available
         self.xf.available = lambda path, tail=False: 39
 

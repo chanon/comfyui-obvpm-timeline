@@ -4,7 +4,6 @@ broken check never blocks, and the timeline node refuses on a problem.
 Run from the pack folder:
   python -m unittest discover -s tests -v
 """
-import importlib
 import os
 import sys
 import tempfile
@@ -17,13 +16,24 @@ if pack is None:
     pack = types.ModuleType("obvpm_tl_test")
     pack.__path__ = [ROOT]
     sys.modules[pack.__name__] = pack
-compat = importlib.import_module("obvpm_tl_test.compat")
+from obvpm_tl_test import compat
 
 
 def stub_registry(**classes):
     mod = types.ModuleType("nodes")
     mod.NODE_CLASS_MAPPINGS = dict(classes)
     sys.modules["nodes"] = mod
+    return mod
+
+
+def module_at(name, path, **attrs):
+    """A module the checks can locate: the version is read from the file
+    the class's module names, so a stand-in needs only __file__."""
+    mod = types.ModuleType(name)
+    mod.__file__ = path
+    for key, value in attrs.items():
+        setattr(mod, key, value)
+    sys.modules[name] = mod
     return mod
 
 
@@ -49,28 +59,19 @@ class Versions(unittest.TestCase):
             os.makedirs(os.path.join(tmp, "nodes"))
             with open(os.path.join(tmp, "pyproject.toml"), "w") as fh:
                 fh.write('[project]\nname = "x"\nversion = "0.2.2"\n')
-            path = os.path.join(tmp, "nodes", "mod.py")
-            with open(path, "w") as fh:
-                fh.write("class N:\n    pass\n")
-            spec = importlib.util.spec_from_file_location("obvpm_tl_test._fake", path)
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules[spec.name] = mod
-            spec.loader.exec_module(mod)
-            self.assertEqual(compat.pack_version(mod.N), (0, 2, 2))
+            mod = module_at("obvpm_tl_test._fake", os.path.join(tmp, "nodes", "mod.py"))
+            N = type("N", (), {"__module__": mod.__name__})
+            self.assertEqual(compat.pack_version(N), (0, 2, 2))
         # a pack without a pyproject must not answer with ComfyUI's:
         # the walk stops at the folder under custom_nodes
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "pyproject.toml"), "w") as fh:
                 fh.write('version = "9.9.9"\n')     # stands for ComfyUI's
             os.makedirs(os.path.join(tmp, "custom_nodes", "pack", "nodes"))
-            path = os.path.join(tmp, "custom_nodes", "pack", "nodes", "mod.py")
-            with open(path, "w") as fh:
-                fh.write("class N:\n    pass\n")
-            spec = importlib.util.spec_from_file_location("obvpm_tl_test._nopy", path)
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules[spec.name] = mod
-            spec.loader.exec_module(mod)
-            self.assertIsNone(compat.pack_version(mod.N))
+            mod = module_at("obvpm_tl_test._nopy",
+                            os.path.join(tmp, "custom_nodes", "pack", "nodes", "mod.py"))
+            N = type("N", (), {"__module__": mod.__name__})
+            self.assertIsNone(compat.pack_version(N))
         # a class whose module has no file has no version
         cls = type("Nowhere", (), {})
         cls.__module__ = "obvpm_tl_test._does_not_exist"
@@ -89,14 +90,9 @@ class ObvpmCheck(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "pyproject.toml"), "w") as fh:
                 fh.write('version = "0.2.2"\n')
-            path = os.path.join(tmp, "presets.py")
-            with open(path, "w") as fh:
-                fh.write("class ValuePresets:\n    pass\n")
-            spec = importlib.util.spec_from_file_location("obvpm_tl_test._old", path)
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules[spec.name] = mod
-            spec.loader.exec_module(mod)
-            stub_registry(**{"ValuePresets (obvpm)": mod.ValuePresets})
+            mod = module_at("obvpm_tl_test._old", os.path.join(tmp, "presets.py"))
+            stub_registry(**{"ValuePresets (obvpm)":
+                             type("ValuePresets", (), {"__module__": mod.__name__})})
             p = compat.check_obvpm()
             self.assertIsNotNone(p)
             self.assertIn("0.2.2 is installed", p.detail)
@@ -109,14 +105,9 @@ class ObvpmCheck(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "pyproject.toml"), "w") as fh:
                 fh.write('version = "0.2.3"\n')
-            path = os.path.join(tmp, "presets.py")
-            with open(path, "w") as fh:
-                fh.write("class ValuePresets:\n    pass\n")
-            spec = importlib.util.spec_from_file_location("obvpm_tl_test._new", path)
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules[spec.name] = mod
-            spec.loader.exec_module(mod)
-            stub_registry(**{"ValuePresets (obvpm)": mod.ValuePresets})
+            mod = module_at("obvpm_tl_test._new", os.path.join(tmp, "presets.py"))
+            stub_registry(**{"ValuePresets (obvpm)":
+                             type("ValuePresets", (), {"__module__": mod.__name__})})
             self.assertIsNone(compat.check_obvpm())
 
     def test_no_version_falls_back_to_asking_the_parser(self):
