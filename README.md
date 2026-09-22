@@ -89,6 +89,10 @@ git clone https://github.com/chanon/comfyui-obvpm-timeline
 Restart ComfyUI. No extra Python dependencies are required. A ComfyUI
 from 2026-08-13 or later is needed.
 
+## Workflow
+
+The workflow is available in the [workflows](https://github.com/chanon/comfyui-obvpm-timeline/tree/main/workflows) folder.
+
 ## Other Notes
 
 Every node in this pack is listed with **(obvpm)** after its name, so
