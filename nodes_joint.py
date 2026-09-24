@@ -1205,11 +1205,19 @@ class H3WindowHandler:
                       "on the wire; every window samples under the "
                       "conditioning given (wire H3 Joint Conditioning "
                       "for per-clip prompts)")
+        elif not use:
+            # one window, so no per-window owner: the sampler runs on
+            # the conditioning as wired (a timeline shorter than a window
+            # -- indexing the table with the None owner here was the
+            # TypeError every short upscale hit, 2026-09-23)
+            _LOG.info("obvpm.h3 context windows: the timeline fits one "
+                      "window, sampled under the conditioning wired in")
         else:
             for k, (s, e, j) in enumerate(windows):
                 _LOG.debug("obvpm.h3 context windows: window %d/%d steps "
-                          "%d..%d conditioned by clip %d (%s)", k + 1,
-                          len(windows), s, e, j, table["clips"][j])
+                          "%d..%d conditioned by clip %s (%s)", k + 1,
+                          len(windows), s, e, j,
+                          table["clips"][j] if j is not None else "as wired")
 
     def execute(self, calc_cond_batch, model, conds, x_in, timestep, model_options):
         import comfy.utils

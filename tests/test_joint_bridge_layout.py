@@ -118,5 +118,34 @@ class PlainChainsAreUnchanged(unittest.TestCase):
         self.assertEqual(layout["hard_hold"], [False, True])
 
 
+class ShortTimeline(unittest.TestCase):
+    """A timeline that fits one window is announced without an owner.
+
+    The one-window case hands _announce a window owned by None while a
+    conditioning table is present; indexing the table with it was the
+    TypeError every short upscale hit (2026-09-23, reported by a user).
+    """
+
+    def table(self):
+        return {"clips": ["a.mp4"], "spans": [(0, 20)], "conds": [None],
+                "owners": [0] * 20}
+
+    def test_one_window_with_a_table_does_not_index_by_none(self):
+        handler = nj.H3WindowHandler(39, 10)
+        with self.assertLogs("obvpm.h3", level="INFO") as logged:
+            handler._announce(20, False, [(0, 20, None)], self.table())
+        self.assertTrue(any("fits one window" in m for m in logged.output),
+                        logged.output)
+
+    def test_windows_with_owners_still_name_their_clip(self):
+        handler = nj.H3WindowHandler(39, 10)
+        windows = nj.layout_windows(20, 39, 10, self.table())
+        # a single window over a short timeline, owned by clip 0
+        self.assertEqual(windows, [(0, 20, 0)])
+        with self.assertLogs("obvpm.h3", level="DEBUG") as logged:
+            handler._announce(20, True, windows, self.table())
+        self.assertTrue(any("a.mp4" in m for m in logged.output), logged.output)
+
+
 if __name__ == "__main__":
     unittest.main()
