@@ -31,9 +31,8 @@ from .nodes_save import (
 )
 
 try:
-    from . import compat, preview_route
+    from . import preview_route
     preview_route.register()
-    compat.register()
 except Exception:  # headless/test runs have no PromptServer; nodes still work
     import logging
     logging.getLogger("obvpm.h3").info(

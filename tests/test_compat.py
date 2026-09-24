@@ -1,5 +1,6 @@
-"""The install checks: each names what is wrong and how to fix it, a
+"""The install floor: each check names what is wrong and how to fix it, a
 broken check never blocks, and the timeline node refuses on a problem.
+(The full per-workflow list lives in comfyui-obvpm's Compatibility Check.)
 
 Run from the pack folder:
   python -m unittest discover -s tests -v
@@ -35,15 +36,6 @@ def module_at(name, path, **attrs):
         setattr(mod, key, value)
     sys.modules[name] = mod
     return mod
-
-
-def node_with_inputs(*names, module=None):
-    def INPUT_TYPES():
-        return {"required": {n: ("INT",) for n in names}}
-    cls = type("Node", (), {"INPUT_TYPES": staticmethod(INPUT_TYPES)})
-    if module:
-        cls.__module__ = module
-    return cls
 
 
 class Versions(unittest.TestCase):
@@ -89,14 +81,14 @@ class ObvpmCheck(unittest.TestCase):
     def test_too_old_by_version(self):
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "pyproject.toml"), "w") as fh:
-                fh.write('version = "0.2.2"\n')
+                fh.write('version = "0.1.9"\n')
             mod = module_at("obvpm_tl_test._old", os.path.join(tmp, "presets.py"))
             stub_registry(**{"ValuePresets (obvpm)":
                              type("ValuePresets", (), {"__module__": mod.__name__})})
             p = compat.check_obvpm()
             self.assertIsNotNone(p)
-            self.assertIn("0.2.2 is installed", p.detail)
-            self.assertIn("0.2.3 or newer", p.detail)
+            self.assertIn("0.1.9 is installed", p.detail)
+            self.assertIn(compat.version_text(compat.MIN_OBVPM) + " or newer", p.detail)
             self.assertIn("Update", p.fix)
             self.assertEqual([l["label"] for l in p.links],
                              ["comfyui-obvpm releases", "comfyui-obvpm on the Comfy Registry"])
@@ -104,27 +96,19 @@ class ObvpmCheck(unittest.TestCase):
     def test_new_enough_by_version(self):
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "pyproject.toml"), "w") as fh:
-                fh.write('version = "0.2.3"\n')
+                fh.write('version = "%s"\n' % compat.version_text(compat.MIN_OBVPM))
             mod = module_at("obvpm_tl_test._new", os.path.join(tmp, "presets.py"))
             stub_registry(**{"ValuePresets (obvpm)":
                              type("ValuePresets", (), {"__module__": mod.__name__})})
             self.assertIsNone(compat.check_obvpm())
 
-    def test_no_version_falls_back_to_asking_the_parser(self):
-        # a copy without a pyproject: the parser is asked whether it
-        # reads a hint
-        for answer, expect_problem in (([{"name": "x", "hint": "h"}], False),
-                                       ([{"name": "x"}], True)):
-            mod = types.ModuleType("obvpm_tl_test._nover")
-            mod.describe = lambda schema, _a=answer: _a
-            cls = type("ValuePresets", (), {})
-            cls.__module__ = mod.__name__
-            sys.modules[mod.__name__] = mod
-            stub_registry(**{"ValuePresets (obvpm)": cls})
-            p = compat.check_obvpm()
-            self.assertEqual(p is not None, expect_problem, answer)
-            if p:
-                self.assertIn("cannot read", p.detail)
+    def test_no_version_is_not_a_problem(self):
+        # a copy without a pyproject: the version cannot be read, so it
+        # is let through rather than refused on a guess
+        cls = type("ValuePresets", (), {"__module__": "obvpm_tl_test._nowhere"})
+        stub_registry(**{"ValuePresets (obvpm)": cls})
+        self.assertIsNone(compat.check_obvpm())
+
 
     def test_the_real_installed_pack_passes(self):
         # the sibling checkout, when it is there
@@ -144,43 +128,9 @@ class ObvpmCheck(unittest.TestCase):
         self.assertEqual(compat.check_obvpm() is None, have >= compat.MIN_OBVPM)
 
 
-class UpscalerCheck(unittest.TestCase):
-    def test_original(self):
-        stub_registry(MinimaxH3LatentUpscaler3D=node_with_inputs(
-            "latent", "model_name", "mode", "align", "enable_temporal_chunking",
-            "force_unload", "device", "precision"))
-        self.assertIsNone(compat.check_upscaler())
-
-    def test_plus_fork(self):
-        stub_registry(MinimaxH3LatentUpscaler3D=node_with_inputs(
-            "latent", "model_name", "mode", "align", "keep_proportion",
-            "device", "precision", "offload_after_upscale"))
-        p = compat.check_upscaler()
-        self.assertEqual(p.title, "The wrong latent upscaler is installed")
-        self.assertIn("Plus", p.detail)
-        self.assertIn("device shows 'true'", p.detail)
-        self.assertIn("LBH-123-AI", p.fix)
-        self.assertEqual(p.links[0]["url"], "https://github.com/" + compat.UPSCALER_REPO)
-
-    def test_some_other_version_without_chunking(self):
-        stub_registry(MinimaxH3LatentUpscaler3D=node_with_inputs("latent", "scale"))
-        p = compat.check_upscaler()
-        self.assertEqual(p.title, "The latent upscaler has no temporal chunking")
-
-    def test_missing(self):
-        stub_registry()
-        self.assertIn("not installed", compat.check_upscaler().title)
-
-    def test_a_node_that_will_not_describe_itself_is_not_a_problem(self):
-        def INPUT_TYPES():
-            raise RuntimeError("no models folder here")
-        stub_registry(MinimaxH3LatentUpscaler3D=type("N", (), {"INPUT_TYPES": staticmethod(INPUT_TYPES)}))
-        self.assertIsNone(compat.check_upscaler())
-
-
 class ComfyCheck(unittest.TestCase):
     def test_versions(self):
-        for text, expect in (("0.32.0", True), ("0.33.0", False), ("0.36.0", False), ("main", False)):
+        for text, expect in (("0.34.0", True), ("0.35.0", False), ("0.37.0", False), ("main", False)):
             mod = types.ModuleType("comfyui_version")
             mod.__version__ = text
             sys.modules["comfyui_version"] = mod
@@ -190,8 +140,8 @@ class ComfyCheck(unittest.TestCase):
                 del sys.modules["comfyui_version"]
             self.assertEqual(p is not None, expect, text)
             if p:
-                self.assertIn("0.32.0", p.detail)
-                self.assertIn("0.33.0", p.detail)
+                self.assertIn("0.34.0", p.detail)
+                self.assertIn("0.35.0", p.detail)
 
 
 class Running(unittest.TestCase):
@@ -199,21 +149,12 @@ class Running(unittest.TestCase):
         def boom():
             raise RuntimeError("the check itself is broken")
         stub_registry()
-        found = compat.problems((boom, compat.check_rgthree))
-        self.assertEqual([p.key for p in found], ["rgthree"])
+        found = compat.problems((boom, compat.check_obvpm))
+        self.assertEqual([p.key for p in found], ["obvpm"])
 
     def test_all_checks_pass_on_a_complete_install(self):
-        stub_registry(**{
-            "ModelPreviewOverrideKJ": object, "MiniMaxH3TurboLoRA": object,
-            "SpectrumApplyMiniMaxH3": object, "Power Lora Loader (rgthree)": object,
-            "MinimaxH3LatentUpscaler3D": node_with_inputs("enable_temporal_chunking"),
-        })
-        # obvpm answered through the parser fallback
-        mod = types.ModuleType("obvpm_tl_test._ok")
-        mod.describe = lambda schema: [{"name": "x", "hint": "h"}]
-        sys.modules[mod.__name__] = mod
-        cls = type("ValuePresets", (), {})
-        cls.__module__ = mod.__name__
+        stub_registry()
+        cls = type("ValuePresets", (), {"__module__": "obvpm_tl_test._ok"})
         sys.modules["nodes"].NODE_CLASS_MAPPINGS["ValuePresets (obvpm)"] = cls
         self.assertEqual(compat.problems(), [])
         compat.require()                    # does not raise
@@ -224,16 +165,13 @@ class Running(unittest.TestCase):
             compat.require()
         text = str(caught.exception)
         self.assertIn("cannot run on this install yet", text)
-        for pack in ("comfyui-obvpm", "Comfyui_Minimax_h3_latent_Upscaler",
-                     "ComfyUI-KJNodes", "ComfyUI-MiniMax-H3-Turbo",
-                     "ComfyUI-Spectrum-MiniMax-H3", "rgthree-comfy"):
-            self.assertIn(pack, text)
+        self.assertIn("comfyui-obvpm is not installed", text)
         self.assertIn("Fix:", text)
         self.assertIn("https://github.com/", text)
 
-    def test_dict_shape_for_the_widget(self):
+    def test_dict_shape(self):
         stub_registry()
-        d = compat.check_kjnodes().as_dict()
+        d = compat.check_obvpm().as_dict()
         self.assertEqual(sorted(d), ["detail", "fix", "key", "links", "title"])
         self.assertEqual(sorted(d["links"][0]), ["label", "url"])
 

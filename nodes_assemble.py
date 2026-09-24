@@ -1358,9 +1358,10 @@ class H3Timeline:
 
     def emit(self, sequence="", pin_state="", duration_seconds=8.0,
              upscaling=False, **_):
-        # First, before anything is read: the run stops here with what
-        # the install is missing and how to fix it, not downstream with
-        # a symptom (compat.py). The widget shows the same list.
+        # First, before anything is read: the floor this pack itself
+        # needs (compat.py). A workflow's own Compatibility Check node
+        # carries the full list; this speaks only when that node could
+        # not load -- an obvpm too old to have it.
         compat.require()
         # A graph saved while this was the run_mode combo hands over its
         # string; "upscale" is the only value that meant on

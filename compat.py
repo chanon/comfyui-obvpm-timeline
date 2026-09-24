@@ -1,18 +1,14 @@
-"""What this pack's workflows need from the install, checked in one place.
+"""The floor this pack needs from the install, checked before a run.
 
-A workflow arrives with a list of node packs it uses, and ComfyUI Manager
-can install the missing ones. What nothing checks is whether the packs
-that ARE installed are the right ones: a pack too old to read the
-workflow's settings, or a fork that registers a node under the same
-name with different widgets, loads without a word and fails somewhere
-downstream with a message about the symptom.
-
-So every requirement is a `Check` here, run on demand by the timeline
-node (server side, before it does anything) and by its widget (which
-shows the problems instead of its controls). Each problem says what was
-found, what to do, and where to go. A check reads the install -- the
-node registry, a pack's pyproject, a node's declared inputs -- and never
-imports anything a workflow names.
+The full list of what a WORKFLOW needs -- the packs it uses, the fork
+that must not be installed under the same node name -- lives in the
+workflow itself, in comfyui-obvpm's Compatibility Check node, which
+shows every result on its face and refuses a run with the fixes. This
+module is the safety net under that: the two things the timeline pack
+itself cannot do without, checked server side by the Timeline node so
+that a user whose comfyui-obvpm is too old to HAVE the checker node
+still gets told what to update, rather than a failure somewhere
+downstream. No UI, no route: the node is the face.
 """
 
 import logging
@@ -24,13 +20,20 @@ _LOG = logging.getLogger("obvpm.h3")
 
 # ---------------------------------------------------------------- versions
 
-# ComfyUI: the pins pipeline needs core's native keyframe anchoring,
-# which shipped in v0.33.0 (2026-08-13).
-MIN_COMFYUI = (0, 33, 0)
-# comfyui-obvpm: the workflow's settings presets use `when` conditions
-# and `# hints`, which the Value Presets node reads from 0.2.3 on. An
-# older pack reads the hint as part of the default and refuses the run.
-MIN_OBVPM = (0, 2, 3)
+# ComfyUI: the pins pipeline needs core's native keyframe anchoring
+# (0.33); the shipped workflow's Model Optimization also uses core's
+# Model Sparse Attention node, which arrived in 0.35.0 (2026-09-09).
+MIN_COMFYUI = (0, 35, 0)
+# comfyui-obvpm: the shipped workflow names the pack's nodes by their
+# suffixed ids -- "Bundle (obvpm)" and the rest -- which 0.2.0
+# introduced; an older pack registers the bare names and every one of
+# those nodes loads as missing. 0.2.5 is the floor because it carries
+# fixes the timeline workflow runs into and that were reported against
+# this pack: presets not switching on frontend 1.53 (obvpm #12), Bundle
+# using translated pin names on a non-English frontend, and the circular
+# JSON error loading a saved video's workflow with Nodes 2.0 on
+# ComfyUI 0.36 (obvpm #13 / timeline #6).
+MIN_OBVPM = (0, 2, 5)
 
 GITHUB = "https://github.com/"
 MANAGER_HELP = ("In ComfyUI Manager: Custom Nodes Manager, find the pack, "
@@ -112,38 +115,7 @@ def pack_version(node_class):
     return None
 
 
-def declared_inputs(node_class):
-    """The input names a node class declares, or None if it will not say.
-
-    Both node APIs end up with an INPUT_TYPES classmethod (core builds
-    one for V3 nodes), so this is one call either way. Referenced
-    installed classes are trusted code, as they are for /object_info;
-    a class that raises while describing itself is reported as unknown
-    rather than as broken.
-    """
-    try:
-        spec = node_class.INPUT_TYPES()
-    except Exception:
-        return None
-    names = set()
-    for section in ("required", "optional"):
-        part = spec.get(section) if isinstance(spec, dict) else None
-        if isinstance(part, dict):
-            names.update(str(k) for k in part)
-    return names
-
-
 # ------------------------------------------------------------------ checks
-
-def _pack_missing(key, pack, node_id, used_for, repo):
-    return Problem(
-        key, "%s is not installed" % pack,
-        "The workflow uses its %s node (%s), and ComfyUI has no node "
-        "of that name." % (node_id, used_for),
-        MANAGER_HELP + " ComfyUI Manager's 'Install Missing Custom Nodes' "
-        "finds it as well.",
-        [("%s on GitHub" % pack, GITHUB + repo)])
-
 
 def check_comfyui():
     try:
@@ -155,8 +127,7 @@ def check_comfyui():
         return None
     return Problem(
         "comfyui", "ComfyUI is too old",
-        "This is ComfyUI %s; the workflow needs %s or newer (the timeline "
-        "runs on core's native keyframe anchoring, which arrived there)."
+        "This is ComfyUI %s; the timeline needs %s or newer."
         % (__version__, version_text(MIN_COMFYUI)),
         "Update ComfyUI (the Manager's 'Update ComfyUI', update.bat on the "
         "portable build, or git pull), then restart it.",
@@ -167,110 +138,32 @@ def check_obvpm():
     registry = _registry()
     presets = registry.get("ValuePresets (obvpm)")
     if presets is None:
-        return _pack_missing(
-            "obvpm", "comfyui-obvpm", "ValuePresets (obvpm)",
-            "the settings presets", "chanon/comfyui-obvpm")
+        return Problem(
+            "obvpm", "comfyui-obvpm is not installed",
+            "The workflow uses its nodes (settings presets, bundles, gates), "
+            "and ComfyUI has none of them.",
+            MANAGER_HELP + " ComfyUI Manager's 'Install Missing Custom Nodes' "
+            "finds it as well.",
+            [("comfyui-obvpm on GitHub", GITHUB + "chanon/comfyui-obvpm")])
+    # The pack is found by a suffixed id, so its being found at all
+    # already proves 0.2.0 or newer; the version is read to enforce the
+    # floor above. Unreadable (a copy without a pyproject -- every
+    # release and checkout has one): let it through rather than refuse
+    # on a guess.
     have = pack_version(presets)
-    # The version says what is installed; what the workflow actually
-    # needs is a parser that reads `when` and `# hint`. Asked directly
-    # when the version cannot be read, so a copy without a pyproject
-    # still gets a true answer.
-    capable = None
-    if have is None:
-        try:
-            # the module is already loaded (the class came from it), so
-            # this is a lookup, not an import
-            module = sys.modules[presets.__module__]
-            capable = "hint" in module.describe("x: bool # h")[0]
-        except Exception:
-            capable = None
-    if (have is not None and have >= MIN_OBVPM) or capable:
+    if have is None or have >= MIN_OBVPM:
         return None
-    found = ("comfyui-obvpm %s is installed" % version_text(have)
-             if have is not None else
-             "The installed comfyui-obvpm cannot read this workflow's "
-             "settings presets")
     return Problem(
         "obvpm", "comfyui-obvpm needs updating",
-        "%s; the workflow needs %s or newer. Its settings presets hide the "
-        "turbo LoRA fields while the loader is off and carry hover hints, "
-        "which an older pack reads as part of the values and refuses."
-        % (found, version_text(MIN_OBVPM)),
+        "comfyui-obvpm %s is installed; the workflow needs %s or newer."
+        % (version_text(have), version_text(MIN_OBVPM)),
         MANAGER_HELP + " Or, in custom_nodes/comfyui-obvpm: git pull.",
         [("comfyui-obvpm releases", GITHUB + "chanon/comfyui-obvpm/releases"),
          ("comfyui-obvpm on the Comfy Registry",
           "https://registry.comfy.org/publishers/chanon/nodes/comfyui-obvpm")])
 
 
-UPSCALER_REPO = "LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler"
-UPSCALER_FORK = "xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus"
-
-
-def check_upscaler():
-    registry = _registry()
-    upscaler = registry.get("MinimaxH3LatentUpscaler3D")
-    if upscaler is None:
-        return _pack_missing(
-            "upscaler", "Comfyui_Minimax_h3_latent_Upscaler",
-            "MinimaxH3LatentUpscaler3D", "the upscale pass", UPSCALER_REPO)
-    inputs = declared_inputs(upscaler)
-    if inputs is None or "enable_temporal_chunking" in inputs:
-        return None
-    fork = "keep_proportion" in inputs or "offload_after_upscale" in inputs
-    return Problem(
-        "upscaler",
-        "The wrong latent upscaler is installed"
-        if fork else "The latent upscaler has no temporal chunking",
-        ("The installed H3 Latent Upscaler 3D is the 'Plus' fork (%s), "
-         "which registers the same node name with different settings. "
-         "The workflow then loads it wrong -- device shows 'true' and "
-         "precision shows 'cuda' -- and the fork has no temporal chunking, "
-         "which the upscale pass relies on: without it, long sequences "
-         "come back with drifting, invented detail." % UPSCALER_FORK)
-        if fork else
-        ("The installed H3 Latent Upscaler 3D does not offer "
-         "enable_temporal_chunking, which the upscale pass relies on."),
-        "Uninstall the installed upscaler pack, install the original "
-        "(%s), restart ComfyUI and reload the workflow." % UPSCALER_REPO,
-        [("Comfyui_Minimax_h3_latent_Upscaler on GitHub", GITHUB + UPSCALER_REPO)])
-
-
-def check_kjnodes():
-    if "ModelPreviewOverrideKJ" in _registry():
-        return None
-    return _pack_missing("kjnodes", "ComfyUI-KJNodes", "ModelPreviewOverrideKJ",
-                         "the model preview override, the Set/Get nodes and "
-                         "the Sage attention patch", "kijai/ComfyUI-KJNodes")
-
-
-def check_turbo():
-    if "MiniMaxH3TurboLoRA" in _registry():
-        return None
-    return _pack_missing("turbo", "ComfyUI-MiniMax-H3-Turbo", "MiniMaxH3TurboLoRA",
-                         "the larryvrh turbo LoRA loader",
-                         "Larryvrh/ComfyUI-MiniMax-H3-Turbo")
-
-
-def check_spectrum():
-    if "SpectrumApplyMiniMaxH3" in _registry():
-        return None
-    return _pack_missing("spectrum", "ComfyUI-Spectrum-MiniMax-H3",
-                         "SpectrumApplyMiniMaxH3", "Spectrum acceleration",
-                         "xmarre/ComfyUI-Spectrum-MiniMax-H3")
-
-
-def check_rgthree():
-    if "Power Lora Loader (rgthree)" in _registry():
-        return None
-    return _pack_missing("rgthree", "rgthree-comfy", "Power Lora Loader (rgthree)",
-                         "the LoRA loader", "rgthree/rgthree-comfy")
-
-
-# Order = order shown. Core first, then the packs that must be RIGHT
-# (installed but wrong is the case nothing else reports), then the
-# packs that must be there.
-CHECKS = (check_comfyui, check_obvpm, check_upscaler, check_kjnodes,
-          check_turbo, check_spectrum, check_rgthree)
+CHECKS = (check_comfyui, check_obvpm)
 
 
 def problems(checks=CHECKS):
@@ -291,7 +184,7 @@ def problems(checks=CHECKS):
 
 def require():
     """Raise, naming every problem and its fix, unless the install can
-    run the workflow. Called by the timeline node before it does
+    run the timeline. Called by the Timeline node before it does
     anything, so a queued run stops with the reason instead of with a
     symptom somewhere downstream."""
     found = problems()
@@ -300,21 +193,3 @@ def require():
     raise RuntimeError(
         "obvpm.h3: this workflow cannot run on this install yet:\n\n"
         + "\n\n".join(p.as_text() for p in found))
-
-
-def register():
-    """GET /obvpm/h3/compat -> {"problems": [...]}. Guarded by the caller."""
-    from aiohttp import web
-    from server import PromptServer
-
-    @PromptServer.instance.routes.get("/obvpm/h3/compat")
-    async def _compat(request):
-        import asyncio
-        try:
-            # off the event loop: a node describing its inputs may scan
-            # a models folder
-            found = await asyncio.to_thread(problems)
-            return web.json_response({"problems": [p.as_dict() for p in found]})
-        except Exception as exc:
-            _LOG.exception("obvpm.h3: compat route failed")
-            return web.json_response({"error": str(exc)}, status=500)
