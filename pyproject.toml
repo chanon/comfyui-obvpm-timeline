@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-obvpm-timeline"
 description = "A timeline for MiniMax H3 video: generate a clip, then extend it, prepend to it or bridge between clips seamlessly from their saved latents. The Timeline node is a mini video editor to arrange, cut and preview them, make seamless loops, and upscale the whole sequence in one pass. Companion to comfyui-obvpm."
-version = "0.1.0"
+version = "0.1.1"
 license = { file = "LICENSE" }
 readme = "README.md"
 requires-python = ">=3.9"
@@ -20,3 +20,6 @@ Repository = "https://github.com/chanon/comfyui-obvpm-timeline"
 PublisherId = "chanon"
 DisplayName = "comfyui-obvpm-timeline"
 Icon = ""
+# the registry lists this as the supported ComfyUI version (core's Model
+# Sparse Attention node, used by the workflow, arrived in 0.35.0)
+requires-comfyui = ">=0.35.0"
