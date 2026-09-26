@@ -37,6 +37,66 @@ _VIDEO_EXTS = (".mp4",)
 # gigabyte on a long take for no gain.
 _ENCODE_CHUNK = 32
 
+# COLOUR. How RGB frames become YUV, and what the file says about it.
+#
+# Every take used to be converted with ffmpeg's default matrix (BT.601)
+# and carry no colour tags. ComfyUI/PyAV assume BT.601 for an untagged
+# file, so everything inside ComfyUI looked right -- but browsers (the
+# timeline's own preview), players and editors assume BT.709 for HD, and
+# showed our takes shifted: green 255 -> 216, foliage dE 8, skin warmer
+# (measured 2026-09-26, private/TASKS.md). Takes are now written like
+# core's Save Video (Create Video's color_space "sRGB"): the BT.709
+# matrix, TV range, and all four tags, so every reader agrees.
+#
+# The tags live in the codec extradata, and assembly splices pieces by
+# copying packets only when their extradata matches. So a piece written
+# to splice between frames of an OLD take (a bridge, empty space next to
+# it) is written the OLD way: callers pass the source's own colour, read
+# with source_colour() -- exactly as they pass its crf (source_crf).
+COLOUR_BT709 = "bt709"
+COLOUR_LEGACY = "legacy"
+_TAGS = ("setparams=range=tv:colorspace=bt709:color_primaries=bt709"
+         ":color_trc=iec61966-2-1")
+_COLOUR_CACHE = {}
+
+
+def colour_filter(colour, rgb_input=True):
+    """The ffmpeg -vf chain for `colour`, or None for the legacy encode.
+
+    RGB input is converted with the BT.709 matrix into TV range; YUV
+    planes (seam repairs) are only tagged -- they are already YUV, in
+    whatever matrix their source clip used. `setparams` is what makes the
+    tags stick: the -color_* output options alone set only the matrix
+    tag behind a scale filter (measured with ffmpeg 7.1)."""
+    if colour == COLOUR_LEGACY:
+        return None
+    if rgb_input:
+        return "scale=out_color_matrix=bt709:out_range=tv," + _TAGS
+    return _TAGS
+
+
+def source_colour(path):
+    """A clip's colour handling: COLOUR_BT709 when its video stream is
+    tagged BT.709, else COLOUR_LEGACY (every take made before 2026-09-26,
+    and footage that says nothing)."""
+    import av
+    try:
+        key = (os.path.abspath(path), os.stat(path).st_mtime_ns)
+    except OSError:
+        return COLOUR_BT709
+    if key not in _COLOUR_CACHE:
+        got = COLOUR_LEGACY
+        try:
+            with av.open(path) as c:
+                cc = c.streams.video[0].codec_context
+                if int(cc.colorspace) == 1:        # AVCOL_SPC_BT709
+                    got = COLOUR_BT709
+        except Exception:
+            pass
+        _COLOUR_CACHE[key] = got
+    return _COLOUR_CACHE[key]
+
+
 # memoised ffmpeg discovery: empty = not looked yet, [None] = none found
 _FFMPEG = []
 
@@ -93,7 +153,7 @@ def _write_audio_raw(audio, frames):
 
 
 def encode_mp4_stream(path, blocks, frames, height, width, audio, crf,
-                      metadata=None):
+                      metadata=None, colour=COLOUR_BT709):
     """Encode `frames` frames that arrive as an iterable of [n, H, W, 3]
     float blocks, without ever holding them all.
 
@@ -107,7 +167,8 @@ def encode_mp4_stream(path, blocks, frames, height, width, audio, crf,
     exe = _ffmpeg_exe()
     if exe:
         _encode_with_ffmpeg(exe, path, blocks, audio, crf, metadata=metadata,
-                            frames=frames, height=height, width=width)
+                            frames=frames, height=height, width=width,
+                            colour=colour)
         return
     import torch
     _LOG.warning("obvpm.h3: no ffmpeg binary, so %d frames are gathered in "
@@ -115,11 +176,12 @@ def encode_mp4_stream(path, blocks, frames, height, width, audio, crf,
                  "or set OBVPM_FFMPEG_PATH to stream instead", frames,
                  frames * height * width * 3 * 4 / 1e9)
     _encode_with_pyav(path, torch.cat([b for b in blocks], 0), audio, crf,
-                      metadata=metadata)
+                      metadata=metadata, colour=colour)
 
 
 def _encode_with_ffmpeg(exe, path, images, audio, crf, metadata=None,
-                        frames=None, height=None, width=None):
+                        frames=None, height=None, width=None,
+                        colour=COLOUR_BT709):
     """Pipe raw frames to ffmpeg (the mechanism VHS Video Combine uses).
 
     `images` is one [F, H, W, 3] tensor, or -- with `frames`, `height`
@@ -153,6 +215,9 @@ def _encode_with_ffmpeg(exe, path, images, audio, crf, metadata=None,
                 audio, frames)
             args += ["-f", "f32le", "-ar", str(sample_rate),
                      "-ac", str(channels), "-i", audio_path, "-c:a", "aac"]
+        vf = colour_filter(colour)
+        if vf:
+            args += ["-vf", vf]
         args += ["-c:v", "libx264", "-crf", str(int(crf)),
                  "-pix_fmt", "yuv420p"]
         if meta_path:
@@ -208,7 +273,8 @@ def _encode_with_ffmpeg(exe, path, images, audio, crf, metadata=None,
                 pass
 
 
-def _encode_with_pyav(path, images, audio, crf, metadata=None):
+def _encode_with_pyav(path, images, audio, crf, metadata=None,
+                      colour=COLOUR_BT709):
     """Core's own encoder, frame by frame in this process."""
     from comfy_api.input_impl import VideoFromComponents
     from comfy_api.util import VideoComponents
@@ -216,17 +282,27 @@ def _encode_with_pyav(path, images, audio, crf, metadata=None):
     components = VideoComponents(
         images=images, audio=audio, frame_rate=Fraction(fr.FPS))
     video = VideoFromComponents(components)
+    kwargs = {"crf": float(crf)}
+    if colour == COLOUR_BT709:
+        # core's own name for the BT.709 matrix + tags (Create Video's
+        # default); color_space=None keeps its old untagged encode
+        kwargs["color_space"] = "sRGB"
     if metadata:
-        try:
-            video.save_to(path, crf=float(crf), metadata=dict(metadata))
-            return
-        except TypeError:
-            # older comfy_api without the metadata kwarg: the clip still
-            # gets written, it just carries no workflow
-            _LOG.warning("obvpm.h3: this ComfyUI's video writer takes no "
-                         "metadata; the MP4 will carry no workflow (the "
-                         "sidecar still does)")
-    video.save_to(path, crf=float(crf))
+        kwargs["metadata"] = dict(metadata)
+    # an older comfy_api may not take every keyword: write the clip
+    # without what it cannot take, and say what is missing
+    import inspect
+    try:
+        accepted = inspect.signature(video.save_to).parameters
+    except (TypeError, ValueError):
+        accepted = kwargs
+    for key, missing in (("metadata", "the workflow (the sidecar still has it)"),
+                         ("color_space", "colour tags (default matrix, untagged)")):
+        if key in kwargs and key not in accepted:
+            kwargs.pop(key)
+            _LOG.warning("obvpm.h3: this ComfyUI's video writer takes no %s; "
+                         "the MP4 is written without %s", key, missing)
+    video.save_to(path, **kwargs)
 
 
 def _ffmetadata_file(tags):
@@ -825,7 +901,8 @@ class H3SaveVideoWithMCtx:
         return (video_path,)
 
     @staticmethod
-    def _encode_mp4(path, images, audio, crf, metadata=None):
+    def _encode_mp4(path, images, audio, crf, metadata=None,
+                    colour=COLOUR_BT709):
         """Encode the delivered clip. THE encode site for the whole pack.
 
         Assembly bridges and preview builds come through here too, so the
@@ -848,7 +925,7 @@ class H3SaveVideoWithMCtx:
         if exe:
             try:
                 _encode_with_ffmpeg(exe, path, images, audio, crf,
-                                    metadata=metadata)
+                                    metadata=metadata, colour=colour)
                 return
             except Exception:
                 _LOG.warning(
@@ -859,7 +936,8 @@ class H3SaveVideoWithMCtx:
                     os.remove(path)
                 except OSError:
                     pass
-        _encode_with_pyav(path, images, audio, crf, metadata=metadata)
+        _encode_with_pyav(path, images, audio, crf, metadata=metadata,
+                          colour=colour)
 
 
 class H3SaveMCtxForVideo:

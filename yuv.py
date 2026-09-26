@@ -123,24 +123,36 @@ def decode(path, upto=None):
     return y, u, v
 
 
-def encode(path, planes, crf, fps=None):
+def encode(path, planes, crf, fps=None, colour=None):
     """Encode planes as H.264, with the pack's exact encoder settings.
 
     The argument list has to stay in step with nodes_save's ffmpeg call:
     assembly stream-copies between the pieces this writes and the ones
     that come straight off disk, and `_mux_pieces` refuses to splice
     pieces whose codec extradata differs.
+
+    `colour` is the SOURCE clip's (nodes_save.source_colour): planes are
+    already YUV in whatever matrix that clip was written with, so they are
+    only tagged the same way -- never converted -- and the piece splices
+    with, and decodes like, the clip it came from. Required: a guess would
+    decode wrong in one direction or the other.
     """
     import numpy as np
-    from .nodes_save import _ffmpeg_exe
+    from .nodes_save import _ffmpeg_exe, colour_filter
 
+    if colour is None:
+        raise ValueError("yuv.encode needs the source clip's colour "
+                         "(nodes_save.source_colour)")
     y, u, v = planes
     n, h, w = y.shape
     args = [_ffmpeg_exe(), "-v", "error", "-nostdin", "-y",
             "-f", "rawvideo", "-pix_fmt", PIX, "-s", "%dx%d" % (w, h),
-            "-r", str(fps or fr.FPS), "-i", "-",
-            "-c:v", "libx264", "-crf", str(int(crf)),
-            "-pix_fmt", PIX, path]
+            "-r", str(fps or fr.FPS), "-i", "-"]
+    vf = colour_filter(colour, rgb_input=False)
+    if vf:
+        args += ["-vf", vf]
+    args += ["-c:v", "libx264", "-crf", str(int(crf)),
+             "-pix_fmt", PIX, path]
     p = subprocess.Popen(args, stdin=subprocess.PIPE,
                          stderr=subprocess.PIPE)
     try:

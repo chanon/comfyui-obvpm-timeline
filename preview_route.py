@@ -48,7 +48,8 @@ from . import levellock
 from . import mctx
 from . import nodes_assemble as na
 from . import yuv
-from .nodes_save import H3SaveVideoWithMCtx, folder_text
+from .nodes_save import (COLOUR_BT709, H3SaveVideoWithMCtx, folder_text,
+                         source_colour)
 
 _LOG = logging.getLogger("obvpm.h3")
 
@@ -93,6 +94,16 @@ def _decode_audio(path):
 def _decode_images(path):
     from comfy_api.input_impl import VideoFromFile
     return VideoFromFile(path).get_components().images
+
+
+def _neighbour_colour(entries, i):
+    """The colour handling of the real clip nearest entry i (the one
+    before it, else the one after): empty space is written to splice with
+    the clips around it (see nodes_save.source_colour)."""
+    for j in list(range(i - 1, -1, -1)) + list(range(i + 1, len(entries))):
+        if not entries[j].get("gap") and entries[j].get("path"):
+            return source_colour(entries[j]["path"])
+    return COLOUR_BT709
 
 
 def _gap_size(entries):
@@ -975,7 +986,7 @@ def build_preview(sequence, crf, probe=False, base_folder="",
                     bp = os.path.join(btd, "gap_%d.mp4" % i)
                     H3SaveVideoWithMCtx._encode_mp4(
                         bp, torch.zeros(int(e["gap"]), gap_h, gap_w, 3),
-                        None, crf)
+                        None, crf, colour=_neighbour_colour(entries, i))
                     pieces.append({"path": bp, "from": 0,
                                    "to": int(e["gap"])})
                     prog.step(prog.WORK, "building empty space")
@@ -1058,15 +1069,20 @@ def build_preview(sequence, crf, probe=False, base_folder="",
                     # _mux_pieces refuses the whole splice. See
                     # nodes_assemble.source_crf.
                     bcrf = na.source_crf(e["path"], crf)
+                    # ...and the clip's colour handling, for the same
+                    # reason: the tags are extradata too
+                    bcol = source_colour(e["path"])
                     if planes is not None:
                         # straight from planes to the encoder: nothing to
                         # compensate, because nothing was converted
-                        yuv.encode(bp, yuv.slice_planes(planes, a, b), bcrf)
+                        yuv.encode(bp, yuv.slice_planes(planes, a, b), bcrf,
+                                   colour=bcol)
                     else:
                         if imgs is None:  # decode only clips that bridge
                             imgs = _decode_images(e["path"])
                         H3SaveVideoWithMCtx._encode_mp4(
-                            bp, compensate(imgs[a:b]), None, bcrf)
+                            bp, compensate(imgs[a:b]), None, bcrf,
+                            colour=bcol)
                     pieces.append({"path": bp, "from": 0, "to": b - a})
                 prog.step(prog.WORK, work % _short(e))
             prog.emit("assembling")

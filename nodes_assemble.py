@@ -1574,10 +1574,13 @@ class H3Assemble:
                         else:
                             bp = os.path.join(btd,
                                               "bridge_%d_%d.mp4" % (i, a))
-                            # the clip's OWN crf, or the splice fails
+                            # the clip's OWN crf and colour, or the
+                            # splice fails (both live in the extradata)
+                            from .nodes_save import source_colour
                             H3SaveVideoWithMCtx._encode_mp4(
                                 bp, part[a - enter:b - enter], None,
-                                source_crf(e["path"], crf))
+                                source_crf(e["path"], crf),
+                                colour=source_colour(e["path"]))
                             pieces.append({"path": bp, "from": 0,
                                            "to": b - a})
                             n_bridge += b - a
