@@ -474,8 +474,36 @@ in the child's sidecar, the child from it on. A held head therefore
 stays the parent's rows and a cut-away tail never enters the joint.
 Every clip's copy of rows it does not own is compared and logged; a
 masked hard hold must match to the bit, and a difference there is
-warned about as a placement error. A timeline with a gap between
-clips is refused.
+warned about as a placement error.
+
+**Segments.** A joint latent is one continuous piece of film, which is
+right for clips joined by a seamless (green) seam and wrong across a
+hard cut. So the cut is split into **segments** at every join that is
+not a lineage link as the cut plays it: two unrelated clips (a gray
+seam), empty space (`~ N`), and a green seam whose frame was moved by a
+hand cut (that is a jump cut; before, the take was placed by its pin
+and the hand cut was silently ignored). Each segment becomes its own
+latent: the outputs are **lists**, one entry per segment, and ComfyUI
+runs every node after this one — the upscaler, the sampler and
+everything between — once per segment. The upscaler therefore never
+sees two scenes at once, and no sampling window spans a cut. A cut with
+no hard cuts is a list of one.
+
+**Cropped to the cut.** Each segment is cropped to the frames the cut
+shows of it — its first clip's enter to its last clip's exit — plus at
+least one 17-frame cycle of context each side. The crop starts on a
+51-frame boundary (51 frames are exactly 85 audio ticks, so every tick
+stays a whole number) and is clip-shaped (5k+2 latent steps). A take
+trimmed to a few seconds is no longer upscaled and refined whole, and
+the render keeps exactly the shown frames, the last clip's cut
+included. A clip's span may start before the crop or end after it; the
+rows outside are simply not in the latent.
+
+A **looping** cut in one piece keeps the whole joint (the loop take's
+tail is context for the wrap tie, see [H3 Context
+Windowing](#h3-context-windowing)) and the render crops to the wrap. A
+looping cut that also has hard cuts or empty space renders its wrap as
+a cut, untied, and says so.
 
 Measured 2026-09-07 (joint_all2): placing clips by the cut alone put
 clip 7 34 frames after its pin (held head rel diff 1.25) and let clip
@@ -486,9 +514,11 @@ first seam and four seconds of the wrong clip under the right audio.
 |---|---|---|
 | `sequence` | STRING | the timeline text — the Timeline's `sequence` output through the upscale gate |
 
-Outputs: `latent` (the joint raw AV latent, for the upscaler), `layout`
-(where each clip sits, for Joint Conditioning and Joint VAE Decode and Save). The
-layout is logged when the node runs.
+Outputs, one entry per segment: `latent` (the segment's joint raw AV
+latent, for the upscaler), `layout` (where each clip sits on it, the
+frames the render keeps, and any empty space before or after the
+segment, for Joint Conditioning and Joint VAE Decode and Save). Each
+segment's layout is logged when the node runs.
 
 ## H3 Joint Conditioning
 
@@ -640,6 +670,23 @@ under. The rendered cut is therefore a take: put it on a timeline by
 itself and the same upscale branch refines it again (4x from the
 sources), with H3 Joint Conditioning splicing its stored table back in.
 
+The node takes the **whole list** of segments in one call
+(`INPUT_IS_LIST`). Only the frames the cut shows are kept (the layout's
+`keep_frames`; the sidecar records the rest as head and tail, so raw and
+delivered frames keep their usual relation). A cut in one segment is
+written exactly as before, as `<prefix>_NNNNN.mp4`. A cut in several
+segments, or with empty space around it, is written as one take per
+segment — `<prefix>_NNNNN_s01.mp4`, `_s02`, …, each with its own
+sidecar and `.cond`, each refinable again on its own — and then
+**joined** into `<prefix>_NNNNN.mp4`: the picture is copied packet for
+packet (every segment comes from the same encoder settings), empty space
+is black, and the sound is encoded once for the whole cut, with each
+hard cut tapered on both sides like the timeline export's audio
+de-click (a `[audio_declick=off]` on the line after the cut turns that
+off). The joined file is a plain video with no sidecar — its segments
+are the takes. If the pieces will not splice, the joined cut is decoded
+and encoded again instead, and the log says so.
+
 | Input | Type | Notes |
 |---|---|---|
 | `samples` | LATENT | the sampler's output |
@@ -652,8 +699,9 @@ sources), with H3 Joint Conditioning splicing its stored table back in.
 | `layout` | JOINT (optional) | from Join Latents: the source clips and sequence lines are recorded in the sidecar, and a latent that is not that timeline is refused |
 | `source_audio` | LATENT (optional) | an AV latent whose **audio** is rendered instead of the sampled one — wire Join Latents' `latent` here when Audio Mask re-sampled the sound for lip sync. The sidecar stores the audio that was rendered |
 
-Output: `path`, the written MP4. Wire it to H3 MCtx Result Preview to
-watch the cut when the pass ends.
+Output: `path`, the finished MP4 (the joined file for a cut in several
+segments). Wire it to H3 MCtx Result Preview to watch the cut when the
+pass ends.
 
 **Decoded in windows, streamed to the encoder.** A timeline is long —
 1400 frames at 1920×1088 are 35 GB of float pixels — so the frames
