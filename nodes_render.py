@@ -269,46 +269,91 @@ class H3JointRender:
         cut_path = os.path.join(full_folder, "%s_%05d.mp4" % (filename, counter))
         gap_before = int((layouts[0] or {}).get("gap_before") or 0)
         gap_after = int((layouts[-1] or {}).get("gap_after") or 0)
-        if n == 1 and not gap_before and not gap_after:
-            self._write(samples[0], vae, audio_vae, window_seconds, crf,
-                        cut_path, conds[0], layouts[0], sources[0],
-                        prompt, extra_pnginfo)
-            return (cut_path,)
+        single = n == 1 and not gap_before and not gap_after
 
-        # several segments (or empty space around one): each is written as
-        # a take of its own, then the finished cut is joined from them
+        # every segment's soundtrack, cut to what it shows, before any
+        # picture: the joined cut needs the whole cut's sound, and so does
+        # anything else fed the frames as they are decoded
+        prepared = [self._prepare(samples[k], audio_vae, layouts[k], sources[k])
+                    for k in range(n)]
+        # the finished cut, part by part: empty space and segments in order
         parts = []
         for k in range(n):
             lay = layouts[k] or {}
             gap = int(lay.get("gap_before") or 0)
             if gap:
-                parts.append({"path": None, "frames": gap, "sound": None,
-                              "declick": True})
-            path = os.path.join(full_folder, "%s_%05d_s%02d.mp4"
-                                % (filename, counter, k + 1))
-            _LOG.info("obvpm.h3 render: segment %d of %d -> %s", k + 1, n,
-                      os.path.basename(path))
-            done = self._write(samples[k], vae, audio_vae, window_seconds, crf,
-                               path, conds[k], layouts[k], sources[k],
-                               prompt, extra_pnginfo,
-                               extra_meta={"segment": [k + 1, n],
-                                           "cut": os.path.basename(cut_path)})
-            parts.append({"path": path, "frames": done["frames"],
-                          "sound": done["sound"],
+                parts.append({"gap": True, "path": None, "frames": gap,
+                              "sound": None, "declick": True})
+            parts.append({"path": None, "segment": k,
+                          "frames": prepared[k]["hi"] - prepared[k]["lo"],
+                          "sound": prepared[k]["sound"],
                           "declick": _declick_into(lay)})
         if gap_after:
-            parts.append({"path": None, "frames": gap_after, "sound": None,
-                          "declick": True})
-        join_cut(parts, cut_path, crf, width, height)
+            parts.append({"gap": True, "path": None, "frames": gap_after,
+                          "sound": None, "declick": True})
+        sound = prepared[0]["sound"] if single else join_audio(parts)
+        blobs = nodes_save._workflow_blobs(prompt, extra_pnginfo)
+        sink = self._open_sink({
+            "base_folder": base_folder, "counter": counter,
+            "cut_path": cut_path, "width": width, "height": height,
+            "fps": fr.FPS,
+            "frames": sum(int(p["frames"]) for p in parts), "sound": sound,
+            "metadata": nodes_save._workflow_tags(blobs)})
+        try:
+            if single:
+                self._write(samples[0], vae, audio_vae, window_seconds, crf,
+                            cut_path, conds[0], layouts[0], sources[0],
+                            prompt, extra_pnginfo, prepared=prepared[0],
+                            sink=sink)
+            else:
+                # several segments (or empty space around one): each is
+                # written as a take of its own, then the finished cut is
+                # joined from them
+                for p in parts:
+                    if _is_gap(p):
+                        if sink is not None:
+                            for block in _black_blocks(p["frames"], height, width):
+                                sink.write(block)
+                        continue
+                    k = p["segment"]
+                    p["path"] = os.path.join(full_folder, "%s_%05d_s%02d.mp4"
+                                             % (filename, counter, k + 1))
+                    _LOG.info("obvpm.h3 render: segment %d of %d -> %s", k + 1,
+                              n, os.path.basename(p["path"]))
+                    self._write(samples[k], vae, audio_vae, window_seconds, crf,
+                                p["path"], conds[k], layouts[k], sources[k],
+                                prompt, extra_pnginfo,
+                                extra_meta={"segment": [k + 1, n],
+                                            "cut": os.path.basename(cut_path)},
+                                prepared=prepared[k], sink=sink)
+                join_cut(parts, cut_path, crf, width, height, audio=sound)
+        except BaseException:
+            if sink is not None:
+                sink.abort()
+            raise
+        if sink is not None:
+            try:
+                sink.close()
+            except RuntimeError as exc:
+                raise RuntimeError("H3 Joint VAE Decode and Save: %s. The upscale "
+                                   "itself was saved: %s" % (exc, cut_path)) from None
         return (cut_path,)
 
-    def _write(self, samples, vae, audio_vae, window_seconds, crf, video_path,
-               conditioning=None, layout=None, source_audio=None, prompt=None,
-               extra_pnginfo=None, extra_meta=None):
-        """One segment's latent -> its MP4 + sidecar (+ .cond): a take.
+    def _open_sink(self, ctx):
+        """Anything else to feed the finished cut's frames to, or None.
 
-        Returns {"frames": frames written, "sound": the AUDIO dict written}.
+        ctx: base_folder, counter, cut_path, width, height, fps, frames
+        (the whole cut's, empty space included), sound (the whole cut's
+        AUDIO), metadata. What it returns gets write(block) for every block of the
+        cut in order (float [n, H, W, 3], black for empty space), then
+        close() -- which raises RuntimeError when it failed -- or abort().
         """
+        return None
+
+    @staticmethod
+    def _prepare(samples, audio_vae, layout=None, source_audio=None):
+        """One segment's latent pair, the frames it keeps and its soundtrack
+        cut to them -- everything but the picture decode."""
         video, audio = avpack.unpack_av(samples, name="samples")
         if source_audio is not None:
             src = _audio_of(source_audio)
@@ -323,13 +368,42 @@ class H3JointRender:
                       "the sampled one")
         total_steps = int(video.shape[2])
         frames = fr.pixel_frames(total_steps)
-        width = int(video.shape[4]) * 16
-        height = int(video.shape[3]) * 16
         if layout and int(layout.get("total_steps", total_steps)) != total_steps:
             raise ValueError(
                 "H3 Joint VAE Decode and Save: the latent has %d steps but the joint "
                 "layout describes %d. Wire the sampler that refined THIS "
                 "timeline." % (total_steps, int(layout["total_steps"])))
+        sound = decode_audio(audio_vae, audio)
+        # the frames the cut SHOWS: a segment is laid out with a little
+        # context around them (and a looping cut with the loop take's tail
+        # rows, the opening again, as context for the refine); the FILE
+        # keeps only the shown frames
+        keep = (layout or {}).get("keep_frames")
+        lo, hi = (int(keep[0]), int(keep[1])) if keep else (0, frames)
+        if keep:
+            sr = int(sound["sample_rate"])
+            wf = sound["waveform"]
+            sound = {"waveform": wf[..., round(lo / fr.FPS * sr):
+                                     round(hi / fr.FPS * sr)],
+                     "sample_rate": sr}
+        return {"video": video, "audio": audio, "frames": frames,
+                "keep": keep, "lo": lo, "hi": hi, "sound": sound}
+
+    def _write(self, samples, vae, audio_vae, window_seconds, crf, video_path,
+               conditioning=None, layout=None, source_audio=None, prompt=None,
+               extra_pnginfo=None, extra_meta=None, prepared=None, sink=None):
+        """One segment's latent -> its MP4 + sidecar (+ .cond): a take.
+
+        `sink` (see _open_sink) is fed the same kept frames as they are
+        decoded. Returns {"frames": frames written, "sound": the AUDIO dict
+        written}.
+        """
+        p = prepared or self._prepare(samples, audio_vae, layout, source_audio)
+        video, audio, frames = p["video"], p["audio"], p["frames"]
+        keep, lo, hi, sound = p["keep"], p["lo"], p["hi"], p["sound"]
+        total_steps = int(video.shape[2])
+        width = int(video.shape[4]) * 16
+        height = int(video.shape[3]) * 16
 
         window_steps = fr.steps_for_seconds(window_seconds) or CHUNK
         plan = window_plan(total_steps, window_steps)
@@ -337,25 +411,15 @@ class H3JointRender:
                   "of up to %d steps -> %s", total_steps, frames, width, height,
                   len(plan), max(e - s for s, e, _, _ in plan), video_path)
 
-        sound = decode_audio(audio_vae, audio)
         blobs = nodes_save._workflow_blobs(prompt, extra_pnginfo)
-        # the frames the cut SHOWS: a segment is laid out with a little
-        # context around them (and a looping cut with the loop take's tail
-        # rows, the opening again, as context for the refine); the FILE
-        # keeps only the shown frames
-        keep = (layout or {}).get("keep_frames")
-        lo, hi = (int(keep[0]), int(keep[1])) if keep else (0, frames)
         blocks = decode_windows(vae, video, window_steps)
         if keep:
             from .nodes_joint import crop_blocks
             blocks = crop_blocks(blocks, lo, hi)
-            sr = int(sound["sample_rate"])
-            wf = sound["waveform"]
-            sound = {"waveform": wf[..., round(lo / fr.FPS * sr):
-                                     round(hi / fr.FPS * sr)],
-                     "sample_rate": sr}
             _LOG.info("obvpm.h3 render: keeping frames %d..%d of %d%s", lo, hi,
-                      frames, " (the loop's wrap)" if layout.get("loop") else "")
+                      frames, " (the loop's wrap)" if (layout or {}).get("loop") else "")
+        if sink is not None:
+            blocks = _tee(blocks, sink)
         nodes_save.encode_mp4_stream(
             video_path, blocks, hi - lo,
             height, width, sound, crf, metadata=nodes_save._workflow_tags(blobs))
@@ -429,6 +493,20 @@ def _each(value, n):
     return [value[i] if i < len(value) else value[-1] for i in range(n)]
 
 
+def _tee(blocks, sink):
+    """Pass decoded blocks through, feeding each to `sink` on the way."""
+    for block in blocks:
+        sink.write(block)
+        yield block
+
+
+def _is_gap(part):
+    """Is this part of the joined cut empty space? Marked `gap` by the
+    render; a part with neither a file nor a segment is one too."""
+    return bool(part.get("gap")) or (part.get("path") is None
+                                     and "segment" not in part)
+
+
 def _declick_into(layout):
     """The declick setting of the join in front of a segment: the seam
     settings of its first line (the clip after a join owns it, as in the
@@ -450,7 +528,7 @@ def join_audio(parts):
     from . import crossfade as xf
     rate, channels = None, None
     for p in parts:
-        if p.get("path") is None:
+        if _is_gap(p):
             continue
         if not p.get("sound"):
             return None
@@ -514,7 +592,7 @@ def _file_blocks(path, frames, chunk=16):
                            "expected %d" % (path, got, frames))
 
 
-def join_cut(parts, out_path, crf, width, height):
+def join_cut(parts, out_path, crf, width, height, audio=None):
     """Join written segments (and empty space) into one MP4.
 
     The picture is COPIED packet for packet -- every segment came out of
@@ -524,18 +602,20 @@ def join_cut(parts, out_path, crf, width, height):
     per-file AAC padding lands at a join. Empty space is black, encoded
     through the same encoder so it splices too. If the pieces will not
     splice, the cut is decoded and encoded again instead (slower, one
-    more generation of H.264, same result otherwise).
+    more generation of H.264, same result otherwise). `audio` is the
+    joined soundtrack when the caller already has it (join_audio).
     """
     import shutil
     import tempfile
     from . import nodes_assemble as na
-    audio = join_audio(parts)
+    if audio is None:
+        audio = join_audio(parts)
     total = sum(int(p["frames"]) for p in parts)
     tmp = tempfile.mkdtemp(prefix="obvpm_h3_join_")
     try:
         pieces = []
         for i, p in enumerate(parts):
-            if p.get("path") is None:
+            if _is_gap(p):
                 bp = os.path.join(tmp, "gap_%d.mp4" % i)
                 nodes_save.encode_mp4_stream(
                     bp, _black_blocks(p["frames"], height, width),
@@ -558,8 +638,8 @@ def join_cut(parts, out_path, crf, width, height):
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     _LOG.info("obvpm.h3 render: joined %d segment(s)%s into %s, %d frames "
-              "(picture %s)", sum(1 for p in parts if p.get("path")),
+              "(picture %s)", sum(1 for p in parts if not _is_gap(p)),
               (" and %d stretch(es) of empty space"
-               % sum(1 for p in parts if not p.get("path")))
-              if any(not p.get("path") for p in parts) else "",
+               % sum(1 for p in parts if _is_gap(p)))
+              if any(_is_gap(p) for p in parts) else "",
               out_path, total, how)

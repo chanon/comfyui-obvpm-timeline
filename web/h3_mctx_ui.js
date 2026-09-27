@@ -3285,6 +3285,14 @@ app.registerExtension({
                 // still hand it over until onConfigure coerces it
                 return v === true || v === "true" || v === "upscale";
             }
+            // The `upscaling` OUTPUT is this widget passed straight
+            // through (emit() returns it), so its value is known before a
+            // Run. comfyui-obvpm asks for it to resolve the switches it
+            // drives -- the engine settings selector picks the upscale or
+            // the generation preset by it -- without running anything.
+            node.obvpmStaticOutput = (slot) =>
+                node.outputs?.[slot]?.name === "upscaling"
+                    ? upscaleMode() : undefined;
             // A TOGGLE, not a two-value selector: the label is fixed and
             // the fill says whether it is on, exactly like snap cuts.
             // Generation is the resting state of this workflow, so it is
