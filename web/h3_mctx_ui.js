@@ -564,6 +564,44 @@ function tlApplyValues(liveNode, saved, report, apply, only) {
         return false;
     }
     let touched = false;
+    // A node that knows its own settings better than its raw widgets --
+    // Value Presets (comfyui-obvpm) answers per field and per preset,
+    // with the schema and presets rows unticked by default -- is asked
+    // for its rows, and applies the ticked ones itself.
+    if (typeof liveNode.obvpmRestoreRows === "function"
+            && typeof liveNode.obvpmRestoreApply === "function") {
+        let rows = [];
+        try {
+            rows = liveNode.obvpmRestoreRows(got.values) ?? [];
+        } catch (err) {
+            tldbg("restore: obvpmRestoreRows threw", liveNode.type, err);
+            report.skipped.push(`${tlNodeName(liveNode)} — could not `
+                + `compare its settings (see the console)`);
+            rows = null;
+        }
+        if (rows) {
+            const picked = new Set();
+            for (const row of rows) {
+                const key = `${liveNode.id}::${row.key}`;
+                if (only && !only.has(key)) continue;
+                touched = true;
+                picked.add(row.key);
+                report.changes.push({ id: liveNode.id, type: liveNode.type,
+                                      name: tlNodeName(liveNode), key: key,
+                                      what: row.what, from: row.from,
+                                      to: row.to, checked: row.checked !== false,
+                                      details: row.details ?? null });
+            }
+            if (apply && picked.size) {
+                try {
+                    liveNode.obvpmRestoreApply(got.values, picked);
+                } catch (err) {
+                    tldbg("restore: obvpmRestoreApply threw", liveNode.type, err);
+                }
+            }
+        }
+        return tlApplyMode(liveNode, saved, report, apply, only) || touched;
+    }
     for (const w of liveNode.widgets ?? []) {
         if (!(w.name in got.values)) continue;
         const v = got.values[w.name];
@@ -603,20 +641,22 @@ function tlApplyValues(liveNode, saved, report, apply, only) {
             tldbg("restore: widget callback threw", liveNode.type, w.name, err);
         }
     }
-    // bypass / mute / always -- explicitly requested, and it is just a
-    // number on the node (0 always, 2 never/mute, 4 bypass)
+    return tlApplyMode(liveNode, saved, report, apply, only) || touched;
+}
+
+// bypass / mute / always -- explicitly requested, and it is just a
+// number on the node (0 always, 2 never/mute, 4 bypass)
+function tlApplyMode(liveNode, saved, report, apply, only) {
     const modeKey = `${liveNode.id}::__mode__`;
-    if (typeof saved.mode === "number" && saved.mode !== liveNode.mode
-            && (!only || only.has(modeKey))) {
-        report.changes.push({ id: liveNode.id, type: liveNode.type,
-                              name: tlNodeName(liveNode), key: modeKey,
-                              what: "node state",
-                              from: TL_MODE[liveNode.mode] ?? liveNode.mode,
-                              to: TL_MODE[saved.mode] ?? saved.mode });
-        if (apply) liveNode.mode = saved.mode;
-        touched = true;
-    }
-    return touched;
+    if (typeof saved.mode !== "number" || saved.mode === liveNode.mode
+            || (only && !only.has(modeKey))) return false;
+    report.changes.push({ id: liveNode.id, type: liveNode.type,
+                          name: tlNodeName(liveNode), key: modeKey,
+                          what: "node state",
+                          from: TL_MODE[liveNode.mode] ?? liveNode.mode,
+                          to: TL_MODE[saved.mode] ?? saved.mode });
+    if (apply) liveNode.mode = saved.mode;
+    return true;
 }
 
 // A group's rect, live object or serialized -- Rectangle is indexable.
@@ -1517,6 +1557,62 @@ function tlAudioSeamDialog({ get, set, seams, onChange, onClose }) {
     return close;
 }
 
+// The collapsed details of a load-settings row: a toggle, which the
+// caller puts INSIDE the row (under its Current text -- a row of its own
+// started below the row's full height, a two-line node name included,
+// which read as a gap), then one row per thing that differs (a schema
+// field's default, a preset's value) in the dialog's OWN columns -- what
+// under Setting, the current and the take's under Current and New --
+// hidden until the toggle opens them, and a spacer closing the block.
+// Rows of the main table rather than a table inside a <details>, which
+// could not line up with the columns above it.
+function tlDetailsRows(details, PAL) {
+    const cell = (text, style) => {
+        const td = document.createElement("td");
+        Object.assign(td.style, { padding: "2px 10px 2px 0", verticalAlign: "top" });
+        if (text != null) {
+            const d = document.createElement("div");
+            d.textContent = String(text);
+            Object.assign(d.style, { whiteSpace: "pre-wrap", overflowWrap: "anywhere",
+                                     lineHeight: "1.4", fontSize: "12px",
+                                     maxHeight: "min(200px, 30vh)", overflowY: "auto" },
+                          style || {});
+            td.appendChild(d);
+        }
+        return td;
+    };
+    const toggle = document.createElement("div");
+    const label = details.summary || details.lines.length + " change(s)";
+    Object.assign(toggle.style, { cursor: "pointer", color: PAL.sub, fontSize: "12px",
+                                  userSelect: "none", marginTop: "3px",
+                                  width: "fit-content" });
+    toggle.title = "Show or hide what differs";
+
+    const lines = details.lines.map((line) => {
+        const tr = document.createElement("tr");
+        tr.append(cell(null),
+                  cell(line.what, { color: PAL.sub, paddingLeft: "12px", maxHeight: "none" }),
+                  cell(line.from, { opacity: "0.7" }),
+                  cell(line.to, {}),
+                  cell(null));
+        return tr;
+    });
+    let open = false;
+    const show = () => {
+        toggle.textContent = (open ? "▾ " : "▸ ") + label;
+        for (const tr of lines) tr.style.display = open ? "" : "none";
+    };
+    toggle.addEventListener("click", () => { open = !open; show(); });
+    show();
+    // air after the block, open or closed, before the next row
+    const spacer = document.createElement("tr");
+    const gap = document.createElement("td");
+    gap.colSpan = 5;
+    Object.assign(gap.style, { height: "10px", padding: "0" });
+    spacer.appendChild(gap);
+    return { toggle, rows: [...lines, spacer] };
+}
+
 function tlLoadDialog({ clip, keyword, plan, pinRole }) {
     return new Promise((resolve) => {
         // Theme colours only. themePalette() has no `bg`/`accent` keys --
@@ -1672,7 +1768,9 @@ function tlLoadDialog({ clip, keyword, plan, pinRole }) {
             };
             const box = document.createElement("input");
             box.type = "checkbox";
-            box.checked = true;
+            // a row can ask to start unticked (a Value Presets schema or
+            // preset: the node's design, not the take's settings)
+            box.checked = c.checked !== false;
             box.title = "Apply this change";
             Object.assign(box.style, { cursor: "pointer", margin: "0" });
             boxes.set(c.key, box);
@@ -1693,15 +1791,27 @@ function tlLoadDialog({ clip, keyword, plan, pinRole }) {
                 mk(tlValueText(c.from), { opacity: "0.7" }),
                 mk(tlValueText(c.to), {}),
                 tick);
+            // A row's details (what changed inside a schema or a preset)
+            // sit on a row of their own under it, collapsed: the row is
+            // the decision, the details are there when wanted.
+            const more = c.details?.lines?.length
+                ? tlDetailsRows(c.details, PAL) : null;
+            // the toggle sits in the row itself, under the Current text
+            if (more) tr.children[2].appendChild(more.toggle);
+            const extra = more ? more.rows : [];
             // dim a row the user has opted out of, so the table shows
             // what will happen rather than what was proposed
-            box.addEventListener("change", () => {
-                for (const td of tr.children) {
-                    td.style.opacity = box.checked ? "1" : "0.4";
+            const dim = () => {
+                for (const row of [tr, ...extra]) {
+                    for (const td of row.children) {
+                        td.style.opacity = box.checked ? "1" : "0.4";
+                    }
                 }
-            });
+            };
+            box.addEventListener("change", dim);
             lastNode = c.name;
-            tbody.appendChild(tr);
+            tbody.append(tr, ...extra);
+            dim();
         }
         table.appendChild(tbody);
         body.appendChild(table);
