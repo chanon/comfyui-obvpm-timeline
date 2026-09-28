@@ -37,11 +37,12 @@ Full history in [workflows/README.md](workflows/README.md)
 
 ### comfyui-obvpm-timeline Custom Node Pack Updates
 
-#### Latest HEAD
+#### 0.1.2-preview.2 (2026-09-28)
 
 - Fixed ([#15](https://github.com/chanon/comfyui-obvpm-timeline/issues/15)): clips could show **no mctx** (and extends fell back to the pixel route, with no loop option) although their `.mctx.safetensors` was right beside them, when the browser could not read the sidecar itself. The server now answers for it, and a clip without a usable sidecar says why in its tooltip: no sidecar, a sidecar that no longer matches the video, or one that could not be read.
 - Takes extended or prepended from a clip in another folder now record where that clip was, so Result Preview can show them together instead of the take alone.
 - A `base_folder` typed with backslashes (`projects\my_project`) now works like `projects/my_project`. The Timeline's clip menu used to find nothing in it.
+- The Timeline's upscale toggle can now be read before a run. With [comfyui-obvpm](https://github.com/chanon/comfyui-obvpm) 0.2.10-preview.1 or newer, the workflow shows which engine settings the next run will use: Override Bundle Values shows their values, and the Value Presets the run will not use are faded.
 
 #### 0.1.2-preview.1 (2026-09-26)
 
