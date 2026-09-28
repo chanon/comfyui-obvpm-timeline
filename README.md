@@ -37,9 +37,9 @@ Full history in [workflows/README.md](workflows/README.md)
 
 ### comfyui-obvpm-timeline Custom Node Pack Updates
 
-#### Latest HEAD
+#### 0.1.2-preview.3 (2026-09-28)
 
-- Load settings: a Value Presets node ([comfyui-obvpm](https://github.com/chanon/comfyui-obvpm), a version newer than 0.2.10-preview.1) is listed setting by setting instead of as raw widget text. Each changed value is its own row. A changed schema, and each workflow preset that differs, is one row, unticked by default, with what changed inside it (per field: type, default, `when`, tooltip; per preset: its values) behind a collapsed toggle. Loading the preset label no longer puts that preset's stored values over the take's own.
+- Load settings: a Value Presets node ([comfyui-obvpm](https://github.com/chanon/comfyui-obvpm), 0.2.10-preview.2 or newer) is listed setting by setting instead of as raw widget text. Each changed value is its own row. A changed schema, and each workflow preset that differs, is one row, unticked by default, with what changed inside it (per field: type, default, `when`, tooltip; per preset: its values) behind a collapsed toggle. Loading the preset label no longer puts that preset's stored values over the take's own.
 
 #### 0.1.2-preview.2 (2026-09-28)
 
