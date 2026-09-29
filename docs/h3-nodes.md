@@ -251,7 +251,7 @@ export). The node itself:
 
 | Input | Type | Notes |
 |---|---|---|
-| `sequence` | STRING | one output-relative clip per line, in playback order; ` @ N` forces an entry frame; `# ` comments. Hidden behind the widget, hand-editable via ✎ |
+| `sequence` | STRING | one output-relative clip per line, in playback order; ` @ N` forces an entry frame; `# ` comments. Hidden behind the widget, hand-editable via ✎. **split** on the cut row turns one line into two complementary `@ enter..exit` lines at the playhead |
 | `base_folder` | STRING | output-relative folder this node works in: scopes the clip picker, seam suggestions and new-clip detection, and holds the preview file and exports |
 | `preview_filename` | STRING | name of the single overwritten full-preview file; give each Timeline node its own if you use several |
 | `export_filename_prefix` | STRING | prefix for the export button, with the usual counter |

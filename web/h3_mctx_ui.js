@@ -4347,6 +4347,36 @@ app.registerExtension({
                 if (lastHighlight < 0) return;
                 setCut(lastHighlight, { enter: null, exit: null });
             });
+            const splitBtn = document.createElement("button");
+            splitBtn.textContent = "split";
+            splitBtn.title = "Split the clip under the playhead into two "
+                + "blocks at this frame (same file, two play ranges). "
+                + "S while the strip is focused does the same.";
+            Object.assign(splitBtn.style, {
+                borderRadius: "4px", padding: "1px 9px",
+                font: "11px/16px sans-serif", whiteSpace: "nowrap",
+                flexShrink: "0",
+            });
+            splitBtn.addEventListener("click", () => applyPlayheadSplit());
+            splitBtn.addEventListener("mouseenter", () => {
+                if (splitBtn.dataset.on === "1") {
+                    splitBtn.style.background = TL_ROLE.extend.hover;
+                }
+            });
+            splitBtn.addEventListener("mouseleave", () => {
+                if (splitBtn.dataset.on === "1") {
+                    splitBtn.style.background = TL_ROLE.extend.bg;
+                }
+            });
+            function paintCutBtn(b, ok, P) {
+                b.dataset.on = ok ? "1" : "0";
+                b.style.background = ok ? TL_ROLE.extend.bg : "none";
+                b.style.border = "1px solid "
+                    + (ok ? "transparent" : P.edge);
+                b.style.color = ok ? "#fff" : P.text;
+                b.style.opacity = ok ? "1" : "0.5";
+                b.style.cursor = ok ? "pointer" : "not-allowed";
+            }
             function updateCutRow() {
                 const has = selectedHasCut();
                 uncutBtn.style.display = has ? "block" : "none";
@@ -4356,15 +4386,9 @@ app.registerExtension({
                 for (const [b, side] of [[cutLeftBtn, "left"],
                                          [cutRightBtn, "right"]]) {
                     const t = playheadCut(side);
-                    const ok = !!t && !t.blocked;
-                    b.dataset.on = ok ? "1" : "0";
-                    b.style.background = ok ? TL_ROLE.extend.bg : "none";
-                    b.style.border = "1px solid "
-                        + (ok ? "transparent" : P.edge);
-                    b.style.color = ok ? "#fff" : P.text;
-                    b.style.opacity = ok ? "1" : "0.5";
-                    b.style.cursor = ok ? "pointer" : "not-allowed";
+                    paintCutBtn(b, !!t && !t.blocked, P);
                 }
+                paintCutBtn(splitBtn, !!playheadSplit(), P);
             }
             // Two spacers rather than auto margins on `uncut`: hiding
             // an auto-margined element removes its margins too, which
@@ -4375,8 +4399,8 @@ app.registerExtension({
                 d.style.flex = "1";
                 return d;
             };
-            cutRow.append(cutLeftBtn, cutSpacer(), uncutBtn, cutSpacer(),
-                          cutRightBtn);
+            cutRow.append(cutLeftBtn, cutSpacer(), splitBtn, uncutBtn,
+                          cutSpacer(), cutRightBtn);
             const progress = tlProgressBar();
             const dropProgress = tlOnProgress(
                 () => String(widgetValue("preview_filename", "")
@@ -6532,6 +6556,81 @@ app.registerExtension({
                               ? Math.min(hi, Math.max(0, snapped))
                               : Math.max(lo, Math.min(e.frames, snapped)));
             }
+
+            // Split is not a trim: the clip stays on the strip twice,
+            // with complementary @ ranges, so the file is unchanged and
+            // assemble already plays each line as its own [enter, exit).
+            // Allowed in the middle of a chain -- the lineage joins at
+            // the ends stay on the two pieces; the new join is the same
+            // take cut in two, not a sidecar neighbour.
+            function playheadSplit() {
+                const f = displayFrame();
+                if (f == null || !cumStarts.length) return null;
+                const i = clipAt(Math.max(0, Math.round(f)));
+                const e = lastEntries?.[i];
+                if (!e || e.gap != null) return null;
+                const within = Math.max(0, Math.round(f) - cumStarts[i])
+                    + e.enter;
+                const lo = e.enter + 1;
+                const hi = (e.exit ?? e.frames) - 1;
+                if (!(hi >= lo)) return null;
+                if (within < lo || within > hi) return null;
+                return { idx: i, at: within, lo, hi };
+            }
+
+            function applyPlayheadSplit() {
+                const t = playheadSplit();
+                if (!t) return;
+                const e = lastEntries[t.idx];
+                // One frame for both halves. Exit-phase snap so the
+                // left piece's new tail is pin-ready for an extend,
+                // matching cut-right.
+                let at = tlSnapCut(t.at, e.meta, snapOn(), "exit");
+                at = Math.min(t.hi, Math.max(t.lo, at));
+                if (at <= e.enter || at >= (e.exit ?? e.frames)) {
+                    app.extensionManager?.toast?.add?.({
+                        severity: "info", summary: "H3 Timeline",
+                        detail: "Move the playhead into the clip to split "
+                            + "it -- an edge leaves nothing on one side.",
+                        life: 5000,
+                    });
+                    return;
+                }
+                const left = {
+                    clip: e.clip, gap: null,
+                    enterOverride: e.enterOverride,
+                    exitOverride: at,
+                    seamOpts: e.seamOpts || {},
+                };
+                const right = {
+                    clip: e.clip, gap: null,
+                    enterOverride: at,
+                    exitOverride: e.exitOverride,
+                    seamOpts: {},
+                };
+                const lines = currentLines();
+                const map = entryLines();
+                const atLine = map[t.idx];
+                if (atLine == null) return;
+                lines.splice(atLine, 1, tlFormatLine(left),
+                             tlFormatLine(right));
+                setSequence(lines.join("\n"));
+            }
+
+            strip.tabIndex = 0;
+            strip.addEventListener("pointerdown", (ev) => {
+                if (ev.target.closest("button, input, select, textarea")) {
+                    return;
+                }
+                strip.focus({ preventScroll: true });
+            });
+            strip.addEventListener("keydown", (ev) => {
+                if (ev.key !== "s" && ev.key !== "S") return;
+                if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+                ev.preventDefault();
+                ev.stopPropagation();
+                applyPlayheadSplit();
+            });
 
             // The pin continues from the CUT, not from the clip's own
             // edge -- so pin_state has to carry it. Derived from the
