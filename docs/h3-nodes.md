@@ -252,7 +252,7 @@ export). The node itself:
 | Input | Type | Notes |
 |---|---|---|
 | `sequence` | STRING | one output-relative clip per line, in playback order; ` @ N` forces an entry frame; `# ` comments. Hidden behind the widget, hand-editable via ✎ |
-| `base_folder` | STRING | output-relative folder this node works in: scopes the clip picker, seam suggestions and new-clip detection, and holds the preview file and exports |
+| `base_folder` | STRING | output-relative folder this node works in: scopes the clip picker, seam suggestions and new-clip detection, and holds the preview file and exports. **new** clears the strip and lets you pick or create a folder. **open…** is a folder picker (drill into subfolders, or search) and loads `obvpm_h3_timeline.sequence` from the folder you open; edits are auto-saved back to that file. When this input is wired, open and new write the chosen folder back to the source widget (subgraph `project_folder`, PrimitiveString, Set/Get). Disabled only when the wire cannot be read |
 | `preview_filename` | STRING | name of the single overwritten full-preview file; give each Timeline node its own if you use several |
 | `export_filename_prefix` | STRING | prefix for the export button, with the usual counter |
 | `crf` | INT | H.264 quality for re-encoded seam bridges and the export |

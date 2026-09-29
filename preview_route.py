@@ -48,6 +48,7 @@ from . import levellock
 from . import mctx
 from . import nodes_assemble as na
 from . import yuv
+from . import timeline_store
 from .nodes_save import H3SaveVideoWithMCtx, folder_text
 
 _LOG = logging.getLogger("obvpm.h3")
@@ -1416,7 +1417,73 @@ def register():
                            type(exc).__name__, exc)
             return web.json_response({"error": str(exc)}, status=400)
 
+    @PromptServer.instance.routes.post("/obvpm/h3/list_folders")
+    async def _list_folders(request):
+        import asyncio
+        try:
+            data = await request.json()
+            query = str(data.get("query", "") or "")
+            if query.strip():
+                folders = await asyncio.to_thread(
+                    timeline_store.search_output_folders, query)
+                return web.json_response({
+                    "folders": folders,
+                    "truncated": len(folders) >= timeline_store._SEARCH_LIMIT,
+                })
+            if "parent" in data:
+                listing = await asyncio.to_thread(
+                    timeline_store.browse_folder, str(data.get("parent") or ""))
+                return web.json_response(listing)
+            folders = await asyncio.to_thread(
+                timeline_store.list_output_folders)
+            return web.json_response({
+                "folders": folders,
+                "truncated": len(folders) >= timeline_store._SEARCH_LIMIT,
+            })
+        except Exception as exc:
+            _LOG.exception("obvpm.h3: list_folders failed: %s: %s",
+                           type(exc).__name__, exc)
+            return web.json_response({"error": str(exc)}, status=400)
+
+    @PromptServer.instance.routes.post("/obvpm/h3/ensure_folder")
+    async def _ensure_folder(request):
+        import asyncio
+        try:
+            data = await request.json()
+            folder = await asyncio.to_thread(
+                timeline_store.ensure_folder,
+                str(data.get("base_folder", "") or ""))
+            return web.json_response({"folder": folder})
+        except Exception as exc:
+            _LOG.exception("obvpm.h3: ensure_folder failed: %s: %s",
+                           type(exc).__name__, exc)
+            return web.json_response({"error": str(exc)}, status=400)
+
+    @PromptServer.instance.routes.post("/obvpm/h3/timeline_state")
+    async def _timeline_state(request):
+        import asyncio
+        try:
+            data = await request.json()
+            base = str(data.get("base_folder", ""))
+            action = str(data.get("action", "load"))
+            if action == "save":
+                await asyncio.to_thread(
+                    timeline_store.save_state,
+                    base, str(data.get("sequence", "")))
+                return web.json_response({"ok": True})
+            seq = await asyncio.to_thread(timeline_store.load_state, base)
+            return web.json_response({
+                "found": seq is not None,
+                "sequence": seq if seq is not None else "",
+            })
+        except Exception as exc:
+            _LOG.exception("obvpm.h3: timeline_state failed: %s: %s",
+                           type(exc).__name__, exc)
+            return web.json_response({"error": str(exc)}, status=400)
+
     _LOG.info("obvpm.h3: preview/export/delete/workflow routes registered "
               "(/obvpm/h3/preview_cut, /obvpm/h3/export, "
               "/obvpm/h3/delete_take, /obvpm/h3/video_workflow, "
-              "/obvpm/h3/seam_levels, /obvpm/h3/clip_meta)")
+              "/obvpm/h3/seam_levels, /obvpm/h3/clip_meta, "
+              "/obvpm/h3/list_folders, /obvpm/h3/ensure_folder, "
+              "/obvpm/h3/timeline_state)")
