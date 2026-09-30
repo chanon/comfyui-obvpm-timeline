@@ -2046,6 +2046,68 @@ const TL_UPSCALE_HOVER = "rgba(38,132,144,0.95)";
 // unwired, the Timeline stays outside execution.
 const TL_REGISTRY = new Map();
 
+// ---- spacebar: play / pause ------------------------------------------------
+// Each Timeline registers {node, el, toggle}; one document listener picks
+// the timeline a Space is meant for and calls its toggle (which plays the
+// full build when there is one, quick otherwise -- see spaceToggle).
+//
+// It acts on the key going DOWN (auto-repeats ignored). Waiting for a
+// clean tap -- released quickly, pointer still -- to leave ComfyUI's
+// held-Space canvas pan alone dropped real presses whenever the hand
+// moved the mouse a little; the pan still works, it now also toggles.
+// The keydown itself is left alone, so the canvas still sees it. Typing
+// keeps its Space, and so does a focused control that is not the
+// timeline's own (a dialog button, a menu); a focused timeline button
+// would otherwise be clicked by the same Space, so that click is
+// cancelled (Chrome clicks a button on the Space keyUP).
+//
+// Which timeline: the one under the pointer, else the one selected, else
+// the only one in the graph on screen. Keyed by NODE, not id: ids repeat
+// across workflows, and a removed node keeps its graph reference.
+const TL_SPACE = new Map();
+const tlSpaceIs = (ev) => ev.code === "Space" || ev.key === " ";
+let tlSpaceHandled = false;       // the keyup of a Space we acted on
+function tlSpaceTarget(ev) {
+    const el = ev.target instanceof Element ? ev.target : null;
+    if (el?.closest("input, textarea, select, [contenteditable]"
+            + ":not([contenteditable='false'])")) {
+        return null;
+    }
+    const g = app.canvas?.graph;
+    const alive = [...TL_SPACE.values()].filter((t) => g && t.node.graph === g
+        && g.getNodeById?.(t.node.id) === t.node);
+    if (!alive.length) return null;
+    const ctl = el?.closest("button, a, [role='button'], [role='menuitem'], "
+        + "[role='option'], [role='dialog']");
+    if (ctl && !alive.some((t) => t.el.contains(ctl))) return null;
+    const hover = alive.find((t) => t.el.matches(":hover"));
+    if (hover) return hover;
+    const sel = alive.filter((t) => app.canvas?.selected_nodes?.[t.node.id]
+        === t.node);
+    if (sel.length === 1) return sel[0];
+    return alive.length === 1 ? alive[0] : null;
+}
+if (!window.__obvpmTlSpace) {
+    window.__obvpmTlSpace = true;
+    document.addEventListener("keydown", (ev) => {
+        if (!tlSpaceIs(ev) || ev.repeat) return;
+        tlSpaceHandled = false;
+        if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey) return;
+        const t = tlSpaceTarget(ev);
+        if (!t) return;
+        const onButton = ev.target instanceof Element
+            && !!ev.target.closest("button");
+        if (onButton) ev.preventDefault();  // the button's own click
+        tlSpaceHandled = onButton;
+        t.toggle();
+    }, true);
+    document.addEventListener("keyup", (ev) => {
+        if (!tlSpaceIs(ev) || !tlSpaceHandled) return;
+        tlSpaceHandled = false;
+        ev.preventDefault();                // Chrome clicks on keyup
+    }, true);
+}
+
 // Dormant, like DEBUG above: flip on when hunting timeline bugs. The
 // call sites stay -- they are the map of where past bugs lived.
 const TL_DEBUG = false;
@@ -4450,15 +4512,85 @@ app.registerExtension({
                 const z = r.width / (el.offsetWidth || 1) || 1;
                 return (ev.clientX - r.left) / z + strip.scrollLeft;
             }
-            // The ruler IS the scale, so a bare wheel over it zooms --
-            // no modifier, and no argument with the canvas, which never
-            // sees a wheel there anyway.
-            ruler.addEventListener("wheel", (ev) => {
-                if (!totalFrames) return;
+            // The timeline's wheel, all in one place:
+            //   - SIDEWAYS (a mouse's thumb / tilt wheel, Shift + wheel; a
+            //     touchpad swipe sends the same event) over the ruler or
+            //     the strip moves the playhead: the distance scrolled is
+            //     the distance it travels on screen, and the strip follows
+            //     it. It used to pan a zoomed strip, or go to the canvas;
+            //     following the playhead still reaches all of the cut.
+            //   - up/down over the RULER zooms: the ruler IS the scale, so
+            //     no modifier is needed there;
+            //   - Ctrl / Cmd + wheel over the strip zooms too;
+            //   - a bare up/down wheel over the strip is left alone, so it
+            //     reaches the canvas (tlWheelToCanvas): the graph's own
+            //     zoom is what people expect from a bare wheel over a
+            //     node, and stealing it would make the timeline a trap to
+            //     scroll past.
+            // Listened for on WINDOW, capture phase: the very first
+            // listener there is. In Nodes 2.0 the node's own wheel
+            // handling passed a wheel over it to the canvas before any
+            // listener on the ruler or the strip saw it, so ruler zoom
+            // never worked there (the memory's "the wheel never reaches a
+            // widget").
+            let jogAcc = 0;
+            // how far the playhead travels per pixel scrolled: 1 (the
+            // same distance on screen) was too quick on a thumb wheel
+            const TL_JOG_GAIN = 0.5;
+            function keepInView(f) {
+                const x = frameToX(f);
+                const w = strip.clientWidth || 0;
+                const margin = Math.min(40, w / 4);
+                if (x < strip.scrollLeft + margin) {
+                    strip.scrollLeft = Math.max(0, x - margin);
+                } else if (x > strip.scrollLeft + w - margin) {
+                    strip.scrollLeft = x - w + margin;
+                }
+            }
+            const onTimelineWheel = (ev) => {
+                if (!(ev.target instanceof Node)
+                        || !timelineWrap.contains(ev.target)) return;
+                const zoomKey = ev.ctrlKey || ev.metaKey;
+                const overRuler = ruler.contains(ev.target);
+                // shift+wheel is the browser's own sideways scroll
+                const dx = ev.shiftKey && !ev.deltaX ? ev.deltaY : ev.deltaX;
+                const dy = ev.shiftKey && !ev.deltaX ? 0 : ev.deltaY;
+                const sideways = !!dx && Math.abs(dx) > Math.abs(dy);
+                if (zoomKey || (overRuler && !sideways)) {
+                    if (!totalFrames) return;
+                    ev.preventDefault();
+                    ev.stopImmediatePropagation();
+                    zoomBy(wheelFactor(ev),
+                           anchorFrom(ev, overRuler ? ruler : strip));
+                    return;
+                }
+                if (!sideways) return;
                 ev.preventDefault();
-                ev.stopPropagation();
-                zoomBy(wheelFactor(ev), anchorFrom(ev, ruler));
-            }, { passive: false });
+                ev.stopImmediatePropagation();
+                if (!totalFrames) return;
+                const unit = ev.deltaMode === 1 ? 16
+                    : ev.deltaMode === 2 ? 400 : 1;
+                // screen px -> layout px (the canvas zoom scales the
+                // widget) -> frames
+                const r = timelineWrap.getBoundingClientRect();
+                const z = r.width / (timelineWrap.offsetWidth || 1) || 1;
+                jogAcc += (dx * unit * TL_JOG_GAIN / z) / (scaleNow() || 1);
+                const step = Math.trunc(jogAcc);
+                if (!step) return;
+                jogAcc -= step;
+                const from = displayFrame() ?? heldFrame ?? 0;
+                const f = Math.max(0, Math.min(Math.round(from) + step,
+                                               Math.max(totalFrames - 1, 0)));
+                // like the ruler: prefer the seamless file when built
+                if (single && playIdx < 0 && !usingSingle) usingSingle = true;
+                heldFrame = f;
+                seekGlobal(f);
+                keepInView(f);
+                drawRuler();
+                setPlayhead(f);
+            };
+            window.addEventListener("wheel", onTimelineWheel,
+                                    { passive: false, capture: true });
 
             zoomInBtn.addEventListener("click", (ev) => {
                 ev.stopPropagation();
@@ -4480,20 +4612,6 @@ app.registerExtension({
                 drawLinks(lastEntries);
                 setPlayhead(displayFrame() ?? heldFrame);
             });
-            // ctrl+wheel zooms about the cursor. Plain wheel goes to the
-            // canvas (tlWheelToCanvas on the container hands it over): the
-            // graph's own zoom is what people expect from a bare wheel
-            // over a node, and stealing it would make the timeline a trap
-            // to scroll past.
-            // Over the blocks a bare wheel belongs to the canvas, so
-            // zooming there needs the modifier. Same smooth path.
-            strip.addEventListener("wheel", (ev) => {
-                if (!ev.ctrlKey && !ev.metaKey) return;
-                if (!totalFrames) return;
-                ev.preventDefault();
-                ev.stopPropagation();
-                zoomBy(wheelFactor(ev), anchorFrom(ev, strip));
-            }, { passive: false });
 
             function drawRuler() {
                 const w = timelineWrap.clientWidth || 300;
@@ -5437,6 +5555,26 @@ app.registerExtension({
             // the playhead is driven by the clock until the gap is spent.
             let gapTimer = null;
             let gapRaf = 0;
+            // a gap is PLAYING while its clock runs -- both videos are
+            // paused then, so "is it playing?" has to ask this too
+            let gapRunning = false;
+            let gapAt = 0;              // the frame the gap clock is on
+            function stopGapClock() {
+                clearTimeout(gapTimer);
+                cancelAnimationFrame(gapRaf);
+                if (gapRunning) {
+                    gapRunning = false;
+                    updateButtons();
+                }
+            }
+            // pause INSIDE a gap: keep the frame it had reached, so play
+            // (and the ruler) carries on from there
+            function pauseGap() {
+                stopGapClock();
+                seekTargetF = gapAt;
+                heldFrame = gapAt;
+                setPlayhead(gapAt);
+            }
             function playGap(i, offset = 0, autoplay = true) {
                 const item = playlist[i];
                 const total = Math.max(0, (item.gap ?? 0) - offset);
@@ -5446,7 +5584,8 @@ app.registerExtension({
                 }
                 highlight(i);
                 seekTargetF = null;
-                setPlayhead(cumStarts[i] + offset);
+                gapAt = cumStarts[i] + offset;
+                setPlayhead(gapAt);
                 // Load the clip on the far side WHILE the blank runs.
                 // Without this the gap ends onto an empty <video>, which
                 // has to start loading from scratch -- playback stalls
@@ -5458,12 +5597,16 @@ app.registerExtension({
                 const t0 = performance.now();
                 const tick = () => {
                     const done = (performance.now() - t0) / 1000 * TL_FPS;
-                    setPlayhead(cumStarts[i] + offset + Math.min(done, total));
+                    gapAt = cumStarts[i] + offset + Math.min(done, total);
+                    setPlayhead(gapAt);
                     if (done < total) gapRaf = requestAnimationFrame(tick);
                 };
                 gapRaf = requestAnimationFrame(tick);
+                gapRunning = true;
+                updateButtons();
                 gapTimer = setTimeout(() => {
                     cancelAnimationFrame(gapRaf);
+                    gapRunning = false;
                     for (const v of vids) v.style.visibility = "";
                     playAt(i + 1);
                 }, (total / TL_FPS) * 1000);
@@ -5601,15 +5744,14 @@ app.registerExtension({
                     // ignored in quick play even though the model had it.
                     playIdx = -1;
                     cancelAnimationFrame(rafId);
-                    clearTimeout(gapTimer);
+                    stopGapClock();
                     for (const v of vids) v.pause();
                     clearLevelFilter();
                     return;
                 }
                 usingSingle = false;
                 playIdx = i;
-                clearTimeout(gapTimer);
-                cancelAnimationFrame(gapRaf);
+                stopGapClock();
                 for (const v of vids) v.style.visibility = "";
                 if (playlist[i].gap != null) {
                     playGap(i, offset, autoplay);
@@ -5997,8 +6139,11 @@ app.registerExtension({
                 const quickInUse = !usingSingle && playIdx >= 0;
                 quickBtn.style.display = single && !quickInUse ? "none" : "";
             }
+            function isPlaying() {
+                return gapRunning || (activeStarted() && !vids[act].paused);
+            }
             function updateButtons() {
-                const playing = activeStarted() && !vids[act].paused;
+                const playing = isPlaying();
                 quickBtn.textContent =
                     !usingSingle && playing ? "⏸ quick" : "▶ quick";
                 if (!fullBtn.disabled) {
@@ -6011,9 +6156,16 @@ app.registerExtension({
                 v.addEventListener("play", updateButtons);
                 v.addEventListener("pause", updateButtons);
             }
-            quickBtn.addEventListener("click", () => {
+            function toggleQuick() {
                 const v = vids[act];
-                if (!usingSingle && playIdx >= 0) {
+                // inside empty space both videos are paused and a clock
+                // runs: pause that, and resume from where it stopped
+                if (gapRunning) {
+                    pauseGap();
+                    return;
+                }
+                if (!usingSingle && playIdx >= 0
+                        && playlist[playIdx]?.gap == null) {
                     if (v.paused) tryPlay(v);
                     else v.pause();
                     return;
@@ -6022,7 +6174,30 @@ app.registerExtension({
                 const f = resumeFrame();
                 const k = clipAt(f);
                 playAt(k, f - cumStarts[k]);
-            });
+            }
+            quickBtn.addEventListener("click", toggleQuick);
+            // Spacebar (see TL_SPACE): pause whatever is playing; else
+            // play from the playhead -- the full build when there is a
+            // current one (never started by Space: a build takes a while
+            // and is ▶ full's to ask for), quick otherwise.
+            //
+            // "Playing" is asked of the PLAYERS themselves, not of the
+            // mode bookkeeping (usingSingle / act / playIdx): when those
+            // disagreed with a player that was running, a press "played"
+            // what was already playing -- nothing happened, and only the
+            // next press paused. Pausing stops every player and the gap
+            // clock, whichever of them was running.
+            function spaceToggle() {
+                if (gapRunning || vids.some((v) => !v.paused)) {
+                    if (gapRunning) pauseGap();
+                    for (const v of vids) v.pause();
+                    updateButtons();
+                    return;
+                }
+                if (single) fullBtn.click();
+                else toggleQuick();
+            }
+            TL_SPACE.set(node, { node, el: container, toggle: spaceToggle });
             fullBtn.addEventListener("click", () => {
                 const v = vids[act];
                 if (usingSingle && single && v._single === single.url) {
@@ -6217,8 +6392,7 @@ app.registerExtension({
                     // the preview flickered between the clip, the cut
                     // and nothing at all.
                     cancelAnimationFrame(rafId);
-                    clearTimeout(gapTimer);
-                    cancelAnimationFrame(gapRaf);
+                    stopGapClock();
                     for (const vv of vids) vv.pause();
                     const played = Math.max(1, (e.exit ?? e.frames) - e.enter);
                     // The SCALE, not the block's measured width.
@@ -7715,10 +7889,15 @@ app.registerExtension({
                 // playlist -- without this, resuming after an edit plays
                 // the stale chain until a seek forces a reload.
                 const playlistSig = JSON.stringify(playlist);
+                // an EDIT (not the first render): the picture must follow
+                // it, see the end of refresh
+                const edited = lastPlaylistSig != null
+                    && playlistSig !== lastPlaylistSig;
                 if (playlistSig !== lastPlaylistSig) {
                     lastPlaylistSig = playlistSig;
                     single = null;
                     usingSingle = false;
+                    stopGapClock();
                     for (const v of vids) {
                         v.pause();
                         v._item = null;
@@ -8309,6 +8488,14 @@ app.registerExtension({
                     : Math.max(0, Math.min(keepFrame,
                                            Math.max(0, totalFrames - 1)));
                 setPlayhead(heldFrame);
+                // The edit unloaded the players, but they still showed
+                // the OLD cut's picture until the ruler was touched.
+                // Show the new cut's frame under the playhead now
+                // (paused, as the edit left it); no playhead yet: its
+                // first frame. Not mid-drag -- the drag shows its own.
+                if (edited && totalFrames && cutPin == null) {
+                    seekGlobal(heldFrame ?? 0);
+                }
                 updateCutRow();
                 requestAnimationFrame(() => {
                     strip.scrollLeft = keepScroll;   // after layout settles
@@ -8697,11 +8884,15 @@ app.registerExtension({
                     border: "1px solid " + PAL.edge,
                 });
                 infoRow.appendChild(frame);
-                if (!e) {
+                // Empty space is selected too, whenever quick play runs
+                // into it -- and it has no clip to describe. Reading one
+                // threw here, which aborted the gap before its clock
+                // started: quick play stopped dead at every gap.
+                if (!e || e.gap != null) {
                     // no caption when empty -- one line in the SAME
                     // style as the "selected clip" caption
                     const d = document.createElement("span");
-                    d.textContent = "no clip selected";
+                    d.textContent = e ? "empty space" : "no clip selected";
                     Object.assign(d.style, {
                         color: PAL.sub, fontSize: "10px",
                         letterSpacing: "0.05em",
@@ -9010,6 +9201,10 @@ app.registerExtension({
                 rulerRO.disconnect();
                 themeMO.disconnect();
                 TL_REGISTRY.delete(node.id);
+                TL_SPACE.delete(node);
+                window.removeEventListener("wheel", onTimelineWheel,
+                                           { capture: true });
+                stopGapClock();
                 dropProgress();
                 for (const v of vids) {
                     v.pause();
