@@ -9331,6 +9331,19 @@ app.registerExtension({
                 fixOpts: () => fixOpts(),
                 crf: () => crfValue(),
                 has: (clip) => lastEntries.some((e) => e.clip === clip),
+                // What this cut plays of a clip: the part `part` names,
+                // or the clip when it stands in the cut once; null when
+                // that is not one entry. The Result Preview shows a
+                // take's neighbours to these edges (rpFarCuts).
+                partSpan: (clip, part) => {
+                    const es = lastEntries.filter((e) => e.gap == null
+                        && e.clip === clip);
+                    const e = part ? es.find((x) => x.part === part)
+                        : es.length === 1 ? es[0] : null;
+                    return e ? { enter: Number(e.enter) || 0,
+                                 exit: e.exit == null ? null : Number(e.exit) }
+                        : null;
+                },
                 // Where the SAME join sits here: those two clips, in
                 // that order, next to each other. -1 when they are not,
                 // which is the only safe answer -- a join is a PAIR,
@@ -9428,13 +9441,11 @@ const rpDismissed = (clip) => rpStore().decided[clip] === RP_DISMISSED;
 function rpStore() {
     try {
         const s = JSON.parse(localStorage.getItem(RP_STORE_KEY) || "{}");
-        return {
-            decided: (s && typeof s.decided === "object" && s.decided) || {},
-            seam: (s && typeof s.seam === "object" && s.seam) || {},
-            live: (s && typeof s.live === "object" && s.live) || {},
-        };
+        const map = (k) => (s && typeof s[k] === "object" && s[k]) || {};
+        return { decided: map("decided"), seam: map("seam"),
+                 live: map("live"), cleared: map("cleared") };
     } catch (err) {
-        return { decided: {}, seam: {}, live: {} };
+        return { decided: {}, seam: {}, live: {}, cleared: {} };
     }
 }
 function rpStoreWrite(s) {
@@ -9449,8 +9460,26 @@ function rpStoreWrite(s) {
     try {
         localStorage.setItem(RP_STORE_KEY, JSON.stringify({
             decided: trim(s.decided), seam: trim(s.seam), live: s.live,
+            cleared: trim(s.cleared ?? {}),
         }));
     } catch (err) { /* private mode, quota: forget quietly */ }
+}
+// cleared[scope] = the server file time (mtime_ms) of the take a preview
+// was cleared of, by delete or dismiss. On open the preview shows a take
+// only when it is newer: after deleting the newest take, the one before it
+// is not what the preview was showing, and turning up on a refresh it
+// reads as a result nobody asked for. A run's own result always shows.
+function rpClearedHides(scope, d) {
+    if (!scope || d?.mtime_ms == null) return false;
+    const at = rpStore().cleared[scope];
+    return at != null && Number(d.mtime_ms) <= Number(at);
+}
+function rpMarkCleared(scope, d) {
+    if (!scope || d?.mtime_ms == null) return;
+    const s = rpStore();
+    delete s.cleared[scope];
+    s.cleared[scope] = Number(d.mtime_ms);
+    rpStoreWrite(s);
 }
 // ---- whose run was that? -------------------------------------------
 // ComfyUI delivers `executed` by NODE ID into whichever workflow is open
@@ -10188,11 +10217,52 @@ function buildResultPreview(node) {
     // (preview_route._seam_plan), so this needs nothing new server-side
     // -- and it means the Result Preview and the export go through one
     // format, not two.
-    function rpSequenceText(d) {
+    // `far` (rpFarCuts) adds a neighbour's far edge to its line.
+    function rpSequenceText(d, far) {
         const clips = d.sequence.split("\n");
-        return clips.map((c, k) => c +
+        return clips.map((c, k) => c + (far?.[k] ?? "") +
             (k > 0 ? tlFormatSeamOpts(rpJoinOpts(clips, k)) : ""))
             .join("\n");
+    }
+    // The far edges of a take's neighbours, as the timeline plays them.
+    // The take's record says where it JOINS each neighbour (the server
+    // derives that side from it) but nothing about the rest of the cut, so
+    // a neighbour used to play out to its file's far end -- the right half
+    // of a 30 s clip split into short parts previewed as 25 s of context.
+    // The owning timeline's other edge of that part is written into the
+    // line instead: the part the take recorded, or the clip when it stands
+    // in the cut once. No timeline holding it: the whole clip, as before.
+    function rpFarCuts(d, clips, metas) {
+        const far = clips.map(() => "");
+        const ti = clips.indexOf(d.clip);
+        const meta = ti >= 0 ? metas[ti] : null;
+        if (!meta) return far;
+        const span = (clip, side) => {
+            const part = tlTakePart(meta, side)?.part ?? null;
+            for (const t of tlMatchesFor(clip)) {
+                const s = t.partSpan?.(clip, part);
+                if (s) return s;
+            }
+            return null;
+        };
+        const ph = (k) => Number(metas[k]?.pinned_head_frames) || 0;
+        // the parent it extends: that part's START (its end is the join)
+        const ex = tlExtendParent(meta);
+        if (ex && ti > 0 && metas[ti - 1]?.self_id === ex.id) {
+            const s = span(clips[ti - 1], "after");
+            if (s && s.enter > 0 && s.enter < ex.join - ph(ti - 1)) {
+                far[ti - 1] = ` @ ${s.enter}`;
+            }
+        }
+        // the clip it prepends into: that part's END (its start is the join)
+        const pr = tlPrependChild(meta);
+        if (pr && ti + 1 < clips.length && metas[ti + 1]?.self_id === pr.id) {
+            const s = span(clips[ti + 1], "before");
+            if (s && s.exit != null && s.exit > pr.join - ph(ti + 1)) {
+                far[ti + 1] = ` @ ..${s.exit}`;
+            }
+        }
+        return far;
     }
     // What this join inherits when it says nothing of its own: the
     // owning Timeline's setting, or the shared default when no Timeline
@@ -10453,7 +10523,8 @@ function buildResultPreview(node) {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
-                        sequence: rpSequenceText(d), crf: rpCrf(d.clip),
+                        sequence: rpSequenceText(d, rpFarCuts(d, clips, metas)),
+                        crf: rpCrf(d.clip),
                         base_folder: d.clip.includes("/")
                             ? d.clip.slice(0, d.clip.lastIndexOf("/")) : "",
                         preview_filename: RP_PREVIEW_NAME,
@@ -10777,6 +10848,7 @@ function buildResultPreview(node) {
         if (!current?.clip) return;
         const gone = current.clip;
         decide(RP_DISMISSED);
+        rpMarkCleared(rpScopeFolder(node), current);
         clearView("dismissed " + gone.split("/").pop());
     });
     delBtn.addEventListener("click", async () => {
@@ -10795,6 +10867,8 @@ function buildResultPreview(node) {
             tlMetaCache.delete(gone);
             tlFramesCache.delete(gone);
             for (const t of TL_REGISTRY.values()) t.forget(gone);
+            // a refresh must not bring the take before it up instead
+            rpMarkCleared(rpScopeFolder(node), current);
             clearView("deleted " + gone);
         } catch (err) {
             status.style.color = "#de5b5b";
@@ -10828,7 +10902,8 @@ function buildResultPreview(node) {
     // found" error for something the user did on purpose. Check first and
     // say it plainly instead.
     async function restoreResult(d) {
-        if (!d?.clip || rpDismissed(d.clip)) return;
+        if (!d?.clip || rpDismissed(d.clip)
+                || rpClearedHides(rpScopeFolder(node), d)) return;
         const clips = String(d.sequence || d.clip)
             .split("\n").map((c) => c.trim()).filter(Boolean);
         const sizes = await Promise.all(
@@ -10885,8 +10960,11 @@ function buildResultPreview(node) {
             tldbg("result preview: latest result unavailable:", err);
         }
         // a run may have delivered its own result while this was asked.
-        // The newest take dismissed: show nothing, never an older take
-        if (!d?.clip || current || !node.graph || rpDismissed(d.clip)) return;
+        // The newest take dismissed, or no newer than what this preview
+        // was last cleared of (rpClearedHides): show nothing, never an
+        // older take
+        if (!d?.clip || current || !node.graph || rpDismissed(d.clip)
+                || rpClearedHides(scope, d)) return;
         node._h3ShowResult(d);
     }
     // Workflows saved before the preview stopped keeping anything in them

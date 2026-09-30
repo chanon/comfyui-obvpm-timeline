@@ -222,6 +222,12 @@ class ResultPreviewFindsAParentElsewhere(OutputFolder):
         got = self.take("V_Project/clip_00001.mp4", recorded=False)
         self.assertEqual(got["parent"], "V_Project/clip_00001.mp4")
 
+    def test_the_payload_carries_the_takes_file_time(self):
+        # by the server's clock, in ms: a cleared preview compares it
+        got = self.take("V_Project/clip_00001.mp4", recorded=False)
+        st = os.stat(os.path.join(self.root, "V_Project", "clip_00002.mp4"))
+        self.assertEqual(got["mtime_ms"], st.st_mtime_ns // 1_000_000)
+
 
 class BackslashFolders(OutputFolder):
     def test_folder_text(self):

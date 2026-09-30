@@ -372,10 +372,19 @@ class H3ResultPreview:
                          "found (not in its folder, and no recorded path "
                          "leads to it); previewing the take alone",
                          rel, relation)
+        # the take's file time, by the SERVER's clock: a preview that was
+        # cleared (delete, dismiss) remembers the time of what it cleared
+        # and shows a take on open only when it is newer. Names cannot say
+        # that -- a deleted take's number is reused by the next save.
+        try:
+            mtime_ms = os.stat(ap).st_mtime_ns // 1_000_000
+        except OSError:
+            mtime_ms = None
         return {"ui": {"h3_result": [{
             "clip": rel, "parent": parent_rel, "parent2": parent2_rel,
             "relation": relation, "sequence": sequence,
             "seam": seam, "seam2": seam2, "render": render,
+            "mtime_ms": mtime_ms,
         }]}}
 
 
