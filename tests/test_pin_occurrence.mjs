@@ -47,7 +47,8 @@ const body = [
         "TL_GROUP", "TL_WINDOW_PHASE"].map(liftConst),
     ...["tlIsEntryLine", "tlSplitSeamOpts", "tlFormatSeamOpts", "tlParseSequence",
         "tlFormatLine", "tlPins", "tlExtendParent", "tlPrependChild",
-        "tlPartEntry", "tlOccOf", "tlTakePart", "tlJoinFits", "tlParentIdx",
+        "tlPartEntry", "tlOccOf", "tlTakePart", "tlJoinFits", "tlWindowEdge",
+        "tlParentIdx", "reconcileCut",
         "tlOccupant", "linkedMeta", "pinState", "pinIdx", "pinAt", "givePart",
         "pinRoleAt", "pinHasRoleAt", "impliesLoop", "pinName", "setBridge",
         "togglePinAt", "syncPinCut", "currentLines", "entryLines",
@@ -357,6 +358,58 @@ const cutOf = (es) => { ui.render(es); ui.syncPinCut(es); return ui.pinState()?.
     const moved = [ent("a.mp4", A, 0, 30, { exit: 30 }, "a1"),
                    ent("a.mp4", A, 60, null, { enter: 60 }, "a2")];
     assert.equal(ui.tlParentIdx(moved, fromCut, "after"), 0);
+}
+
+// ---- a bridge into the right half of a split: its START follows the take ------
+// (the reported case, clip_00009: queued with the right part cut at 132; the
+// grid moved the window start to 136 and the soft hold hands over at 149, so
+// the part kept replaying 132..148 after the take)
+{
+    const S = { self_id: "s", delivered_frames: 200, pinned_head_frames: 0 };
+    const bridge = (cut2) => ({ self_id: "t", relation: "", delivered_frames: 76,
+        pinned_head_frames: 39, pins: JSON.stringify([
+            { source_id: "s", source_kind: "clip", source_start: 17, source_frames: 39,
+              place: "before", mode: "masked", tl_part: "a1", tl_cut: 56 },
+            { source_id: "s", source_kind: "clip", source_start: 136, source_frames: 39,
+              place: "after", mode: "both", mask_ramp_frames: 10, mask_ramp_edge: 0.4,
+              tl_part: "a2", tl_cut: cut2 }]) });
+    const cut = (enter) => [ent("s.mp4", S, 0, 56, { exit: 56 }, "a1"),
+                            ent("s.mp4", S, enter, 192, { enter, exit: 192 }, "a2")];
+    const reset = () => { cuts.length = 0; asked.length = 0; };
+    set(null);
+    // the part still fits: the grid moved the WINDOW 4 frames, the soft
+    // hold's 13 more are not the grid's doing
+    assert.equal(ui.tlJoinFits(cut(132)[1], bridge(132), "before"), true);
+    assert.equal(ui.tlParentIdx(cut(132), bridge(132), "before"), 1);
+    // unchanged since queued: the start follows the take quietly, the
+    // extend side (already at its join) is left alone
+    ui.render(cut(132));
+    reset();
+    assert.match(await ui.reconcileParentCut(bridge(132)),
+                 /starts at 149 instead of 132, where this take hands over/);
+    assert.deepEqual([cuts, asked.length], [[[1, { enter: 149 }]], 0]);
+    // changed while the take generated: asked, and OK puts it at the join
+    ui.render(cut(120));
+    reset();
+    answers.push(true);
+    assert.match(await ui.reconcileParentCut(bridge(132)), /again/);
+    assert.deepEqual(cuts, [[1, { enter: 149 }]]);
+    assert.match(asked[0].message, /hands over at frame 149/);
+    // already at the join: nothing to do
+    ui.render(cut(149));
+    reset();
+    assert.equal(await ui.reconcileParentCut(bridge(149)), null);
+    assert.deepEqual([cuts, asked.length], [[], 0]);
+    // an older prepend take (no part recorded): only the pin proves the cut
+    const old = { self_id: "u", relation: "prepends", parent_id: "s",
+                  parent_join_frame: 149, delivered_frames: 50, pinned_head_frames: 0 };
+    ui.render(cut(132));
+    reset();
+    assert.equal(await ui.reconcileParentCut(old), null, "no pin: left alone");
+    set({ source: "s.mp4", part: "a2", role: "prepend", cut: 132 });
+    assert.match(await ui.reconcileParentCut(old), /starts at 149 instead of 132/);
+    assert.deepEqual(cuts, [[1, { enter: 149 }]]);
+    set(null);
 }
 
 // ---- repeated ids from a copied line: later copies get fresh ones ------------

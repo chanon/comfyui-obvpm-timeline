@@ -2615,21 +2615,44 @@ function tlTakePart(meta, side) {
 // An edge that is not cut (the clip's own end, or a derived one) takes
 // any join inside the part: the join then decides where it exits, as it
 // always has. `side` "after" = the take extends entry e, "before" = it
-// prepends into it. Mirrors reconcileParentCut's grid rule.
+// prepends into it. Mirrors reconcileCut's grid rule.
+//
+// The grid moves the take's WINDOW, not its join: a soft hold hands over
+// some frames inside the window (h3_handover), so a prepend's join can lie
+// a whole group past the cut while its window start moved only a frame or
+// two. A cut is therefore compared with the window edge (tlWindowEdge).
 function tlJoinFits(e, meta, side) {
     const link = side === "after" ? tlExtendParent(meta)
                                   : tlPrependChild(meta);
     if (!e?.meta || !link || link.id !== e.meta.self_id) return false;
-    const at = link.join - (Number(e.meta.pinned_head_frames) || 0);
+    const ph = Number(e.meta.pinned_head_frames) || 0;
+    const at = link.join - ph;
+    const w = tlWindowEdge(meta, side) - ph;
     const frames = Number(e.frames ?? e.meta.delivered_frames) || 0;
     if (side === "after") {
         const cut = e.exitOverride;
-        if (cut != null) return at <= cut && cut - at < TL_GROUP;
+        if (cut != null) return w <= cut && cut - w < TL_GROUP;
         return at > (e.enterOverride ?? 0) && at <= frames;
     }
     const cut = e.enterOverride;
-    if (cut != null) return at >= cut && at - cut < TL_GROUP;
+    if (cut != null) return w >= cut && w - cut < TL_GROUP;
     return at < (e.exitOverride ?? frames);
+}
+// Where a take's pinned window meets its neighbour, in the neighbour's
+// sidecar frames: an extend's window END (side "after"), a prepend's
+// window START (side "before") -- the edge the 17-frame grid moves. A take
+// whose recipe says nothing about it falls back to its join.
+function tlWindowEdge(meta, side) {
+    const place = side === "after" ? "before" : "after";
+    const p = tlPins(meta).find((s) => s.place === place &&
+        s.source_kind === "clip" && s.source_id);
+    if (!p) {
+        const link = side === "after" ? tlExtendParent(meta)
+                                      : tlPrependChild(meta);
+        return link ? link.join : 0;
+    }
+    const start = Number(p.source_start) || 0;
+    return side === "after" ? start + (Number(p.source_frames) || 0) : start;
 }
 // Which occurrence of a take's PARENT the take belongs to. `side`
 // "after" = the parent it extends, "before" = the clip it prepends
@@ -6322,7 +6345,7 @@ app.registerExtension({
                         tag.textContent = space == null
                             ? `${latest}f · ${(latest / TL_FPS).toFixed(2)}s`
                             : `${latest}f · `
-                              + `${(space / TL_FPS).toFixed(1)}s space`;
+                              + `${(space / TL_FPS).toFixed(2)}s space`;
                         // it is centred on the guide, so keep half of it
                         // clear of either end of the scrollable content
                         const half = (tag.offsetWidth || 60) / 2;
@@ -7445,11 +7468,11 @@ app.registerExtension({
                     background: "none",
                 });
                 block.title = `empty space, ${played} frames `
-                    + `(${(played / TL_FPS).toFixed(1)}s)\n`
+                    + `(${(played / TL_FPS).toFixed(2)}s)\n`
                     + "black in the preview and the export -- generate a "
                     + "bridge to fill it. Hover for its controls.";
                 const cap = document.createElement("div");
-                cap.textContent = `${(played / TL_FPS).toFixed(1)}s`;
+                cap.textContent = `${(played / TL_FPS).toFixed(2)}s`;
                 Object.assign(cap.style, {
                     font: "10px sans-serif", opacity: "0.8",
                     whiteSpace: "nowrap",
@@ -7785,7 +7808,7 @@ app.registerExtension({
                     sub.style.opacity = "0.65";
                     sub.style.font = "10px sans-serif";
                     sub.textContent = played > 0
-                        ? `${(played / TL_FPS).toFixed(1)}s` : "?";
+                        ? `${(played / TL_FPS).toFixed(2)}s` : "?";
                     const mini = (label, title, fn, active) => {
                         const b = document.createElement("button");
                         b.textContent = label;
@@ -8149,12 +8172,13 @@ app.registerExtension({
                             // On the clip's own START, not at the
                             // pointer: that edge IS the thing being
                             // moved, and it is where the cut drag puts
-                            // its readout too. Seconds to one decimal,
-                            // the way the empty block labels itself, so
-                            // the two numbers can be compared.
+                            // its readout too. Seconds to two decimals,
+                            // the way the empty block labels itself (and
+                            // the total below the strip), so the numbers
+                            // can be compared.
                             dragTag.textContent = frames
                                 ? `${frames}f · `
-                                  + `${(frames / TL_FPS).toFixed(1)}s space`
+                                  + `${(frames / TL_FPS).toFixed(2)}s space`
                                 : "no space";
                             const gx = block.offsetLeft + shift;
                             const half = (dragTag.offsetWidth || 60) / 2;
@@ -9108,65 +9132,104 @@ app.registerExtension({
             //   - the cut was changed while the take generated: that was
             //     a decision, so it is ASKED about, never overwritten.
             // An older take has none of this and keeps the old proof.
+            //
+            // Both sides: a take that PREPENDS (a prepend, or a bridge's
+            // tail) hands over to its child at a frame the grid and a
+            // soft hold decide, just as an extend leaves its parent at
+            // one, and the child's start cut has to move there the same
+            // way -- left alone it replays the frames between (the right
+            // half of a split always has such a cut).
             async function reconcileParentCut(meta) {
-                const ex = tlExtendParent(meta);
-                if (!ex) return null;
+                const notes = [await reconcileCut(meta, "after"),
+                               await reconcileCut(meta, "before")]
+                    .filter(Boolean);
+                return notes.length ? notes.join("; ") : null;
+            }
+            // side "after" = the clip the take extends (its exit cut),
+            // "before" = the clip it prepends into (its enter cut)
+            async function reconcileCut(meta, side) {
+                const tail = side === "after";
+                const link = tail ? tlExtendParent(meta)
+                                  : tlPrependChild(meta);
+                if (!link) return null;
                 const st = pinState();
-                const rec = tlTakePart(meta, "after");
-                const i = tlParentIdx(lastEntries, meta, "after",
-                    st && st.role !== "prepend" ? pinIdx(st) : -1);
+                const rec = tlTakePart(meta, side);
+                // which pin named this side: an extend's (or a bridge's
+                // first) source, a prepend's source, a bridge's source2
+                const pinned = !st ? -1
+                    : tail ? (st.role !== "prepend" ? pinIdx(st) : -1)
+                    : st.role === "prepend" ? pinIdx(st)
+                    : st.role === "bridge" ? pinIdx(st, true) : -1;
+                const pinCut = !st ? null
+                    : !tail && st.role === "bridge" ? st.cut2 : st.cut;
+                const i = tlParentIdx(lastEntries, meta, side, pinned);
                 const e = i >= 0 ? lastEntries[i] : null;
                 if (!e) return null;
                 // delivered coordinates, exactly as tlDeriveSeam maps
-                // them: the parent's own pinned head offsets the join
-                const exitF = ex.join
+                // them: the clip's own pinned head offsets the join
+                const joinF = link.join
                     - (Number(e.meta.pinned_head_frames) || 0);
                 const delivered = Number(e.meta.delivered_frames) || 0;
-                const was = e.exitOverride;
-                // a join at the clip's own end needs no cut at all
-                const wanted = exitF === delivered ? null : exitF;
+                const was = tail ? e.exitOverride : e.enterOverride;
+                // a join at the clip's own edge needs no cut at all
+                const wanted = joinF === (tail ? delivered : 0) ? null : joinF;
+                const patch = (v) => (tail ? { exit: v } : { enter: v });
+                const ends = tail ? "ends" : "starts";
+                const edge = tail ? "its end" : "its start";
+                const verb = tail ? "continues from" : "hands over at";
+                const where = tail ? "where this take continues from"
+                                   : "where this take hands over";
                 if (rec && e.part !== rec.part) {
-                    if (tlJoinFits(e, meta, "after")) return null;
+                    if (tlJoinFits(e, meta, side)) return null;
                     return `the part of ${clipBase(e.clip)} this take `
-                        + "continued is no longer in the cut; it goes after "
-                        + `${partLabel(i)}, which ends elsewhere, so that `
-                        + "join plays as a cut";
+                        + (tail ? "continued" : "leads into")
+                        + ` is no longer in the cut; it goes `
+                        + `${tail ? "after" : "before"} ${partLabel(i)}, `
+                        + `which ${ends} elsewhere, so that join plays as a cut`;
                 }
                 if (rec) {
                     if ((was ?? null) === (rec.cut ?? null)) {
-                        if (was == null || was === exitF) return null;
-                        setCut(i, { exit: wanted });
-                        return `${partLabel(i)} now ends at ${exitF}`
-                            + ` instead of ${was}: the 17-frame grid moved`
-                            + " the take's start";
+                        if (was == null || was === joinF) return null;
+                        setCut(i, patch(wanted));
+                        return `${partLabel(i)} now ${ends} at ${joinF}`
+                            + ` instead of ${was}, ${where}`
+                            + (tail ? " (the 17-frame grid moved the take's"
+                                      + " start)" : "");
                     }
                     if ((was ?? null) === wanted) return null;
-                    const from = rec.cut == null ? "its end" : `frame ${rec.cut}`;
-                    const now = was == null ? "its end" : `frame ${was}`;
-                    const back = wanted == null ? "its end" : `frame ${exitF}`;
+                    const from = rec.cut == null ? edge : `frame ${rec.cut}`;
+                    const now = was == null ? edge : `frame ${was}`;
+                    const back = wanted == null ? edge : `frame ${joinF}`;
                     if (await tlAskChoice({
                             title: `${partLabel(i)} was cut again`,
                             message: `It was cut at ${from} when this take `
                                 + `was queued, and is cut at ${now} now. The `
-                                + `take continues from ${back}.\n\n`
+                                + `take ${verb} ${back}.\n\n`
                                 + `Cut it at ${back} again and the join is `
                                 + "seamless. Keep your cut and the join plays "
                                 + "as a cut.",
                             yes: `Cut at ${back} again`,
                             no: "Keep my cut",
                         })) {
-                        setCut(i, { exit: wanted });
-                        return `${partLabel(i)} cut at ${back} again, where `
-                            + "this take continues from";
+                        setCut(i, patch(wanted));
+                        return `${partLabel(i)} cut at ${back} again, ${where}`;
                     }
                     return `kept your cut on ${partLabel(i)}; this take `
-                        + `continues from ${back}, so that join plays as a cut`;
+                        + `${verb} ${back}, so that join plays as a cut`;
                 }
-                if (was == null || was === exitF) return null;
+                if (was == null || was === joinF) return null;
                 // Two ways to be sure this cut is the one the take was
                 // asked to continue from -- it only takes one.
-                const thePinsCut = !!st && pinIdx(st) === i
-                    && Number(st.cut) === was;
+                const thePinsCut = pinned === i && Number(pinCut) === was;
+                if (!tail) {
+                    // a prepend's older take: only the pin proves it (the
+                    // grid arithmetic below is the extend's)
+                    if (!thePinsCut) return null;
+                    setCut(i, patch(wanted));
+                    return `${partLabel(i)} now starts at ${joinF}`
+                        + ` instead of ${was}, where this take hands over`;
+                }
+                const exitF = joinF;
                 // The pin is gone after a reload, but the arithmetic
                 // still proves it: the take's join is exactly where the
                 // 17-frame grid would have moved THIS cut -- on the
@@ -9247,7 +9310,7 @@ app.registerExtension({
                         : Math.max(0, Math.round(Number(hole.gap) || 0) - took);
                     if (left > 0) {
                         ls[map[gi]] = `~ ${left}`;
-                        filled = `, ${(left / TL_FPS).toFixed(1)}s of empty `
+                        filled = `, ${(left / TL_FPS).toFixed(2)}s of empty `
                             + "space left";
                     } else {
                         ls.splice(map[gi], 1);
@@ -9325,11 +9388,20 @@ app.registerExtension({
 // A run finishes -> the Python node returns {clip, parent, relation,
 // sequence} -> this widget shows the pair as two blocks with the seam
 // pill between them and plays the sequence as ONE server-built smart
-// cut (the same /obvpm/h3/preview_cut the Timeline uses, its own
-// preview file). Nothing of it is kept in the workflow: see
-// RP_STORE_KEY for where the result and the rest come from instead.
+// cut (the same /obvpm/h3/preview_cut the Timeline uses, into
+// RP_PREVIEW_NAME). A rendered cut is played as it is: see rpPlaysAsIs.
+// Nothing of it is kept in the workflow: see RP_STORE_KEY for where the
+// result and the rest come from instead.
 const RP_NODE = "H3ResultPreview";
 const RP_PREVIEW_NAME = "obvpm_h3_result";
+// A rendered cut (H3 Joint VAE Decode and Save) is the finished file and
+// has no neighbours, so "building its preview" only re-encoded a copy of
+// it -- a second generation of the very pixels being judged, seconds of
+// work and a second file of the same size. The browser plays it directly.
+// That also leaves the take previews as the only builders of
+// RP_PREVIEW_NAME, so one shared name is enough (the build lock in
+// preview_route keeps two builds of it from colliding).
+const rpPlaysAsIs = (d) => d?.render === "joint" && !String(d.sequence ?? "").includes("\n");
 
 // ---- nothing in the workflow ----------------------------------------------
 // A Result Preview keeps NOTHING in the workflow. It used to keep its
@@ -9380,19 +9452,6 @@ function rpStoreWrite(s) {
         }));
     } catch (err) { /* private mode, quota: forget quietly */ }
 }
-// A preview's OWN preview file. The take preview and the upscale preview
-// sit in the same project folder, and with one shared name each build
-// overwrote the other's file and cache key, so both rebuilt on every look
-// and two builds racing on one file failed ("cannot find the file
-// specified"). Named after the Save prefix it watches; the node id when
-// that cannot be read.
-function rpPreviewName(node) {
-    const scope = rpScopeFolder(node);
-    const base = scope ? String(scope).split("/").pop() : "";
-    const tail = (base || "node" + node?.id).replace(/[^A-Za-z0-9_-]/g, "_");
-    return `${RP_PREVIEW_NAME}_${tail}`;
-}
-
 // ---- whose run was that? -------------------------------------------
 // ComfyUI delivers `executed` by NODE ID into whichever workflow is open
 // (app.ts: getNodeByExecutionId(rootGraph, ...)) and wipes stored outputs
@@ -9984,7 +10043,7 @@ function buildResultPreview(node) {
     btnRow.append(addTlBtn, delBtn, dismissBtn);
 
     const rpProgress = tlProgressBar();
-    const dropRpProgress = tlOnProgress(() => rpPreviewName(node), rpProgress);
+    const dropRpProgress = tlOnProgress(() => RP_PREVIEW_NAME, rpProgress);
     container.append(liveImg, liveVideo, video, strip, rpProgress.el, btnRow, status);
     const widget = node.addDOMWidget("mctx_result", "div", container,
                                      { hideOnZoom: false });
@@ -10371,28 +10430,43 @@ function buildResultPreview(node) {
             strip.appendChild(bEl);
         });
 
-        rpProgress.arm("preparing…");
+        const viewUrl = (filename, subfolder, type, v) => api.apiURL(
+            `/view?filename=${encodeURIComponent(filename)}` +
+            `&subfolder=${encodeURIComponent(subfolder)}` +
+            `&type=${encodeURIComponent(type ?? "output")}` +
+            `&v=${encodeURIComponent(v ?? "")}`);
         try {
-            const resp = await api.fetchApi("/obvpm/h3/preview_cut", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    sequence: rpSequenceText(d), crf: rpCrf(d.clip),
-                    base_folder: d.clip.includes("/")
-                        ? d.clip.slice(0, d.clip.lastIndexOf("/")) : "",
-                    preview_filename: rpPreviewName(node),
-                    ...rpFixOpts(d.clip),
-                }),
-            });
-            if (!resp.ok) throw new Error(await resp.text());
-            const r = await resp.json();
-            if (seq !== reqSeq) return;
-            starts = r.starts;
-            video.src = api.apiURL(
-                `/view?filename=${encodeURIComponent(r.filename)}` +
-                `&subfolder=${encodeURIComponent(r.subfolder)}` +
-                `&type=${encodeURIComponent(r.type ?? "output")}` +
-                `&v=${encodeURIComponent(r.v ?? "")}`);
+            let src;
+            if (rpPlaysAsIs(d)) {
+                // the finished file itself; its size is the cache buster,
+                // since a deleted take's name is reused by the next save
+                const size = await serverFileSize(d.clip).catch(() => null);
+                if (seq !== reqSeq) return;
+                if (size === null) throw new Error(d.clip + " not found");
+                const at = d.clip.lastIndexOf("/");
+                src = viewUrl(d.clip.slice(at + 1),
+                              at >= 0 ? d.clip.slice(0, at) : "", "output", size);
+                starts = [0];
+            } else {
+                rpProgress.arm("preparing…");
+                const resp = await api.fetchApi("/obvpm/h3/preview_cut", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        sequence: rpSequenceText(d), crf: rpCrf(d.clip),
+                        base_folder: d.clip.includes("/")
+                            ? d.clip.slice(0, d.clip.lastIndexOf("/")) : "",
+                        preview_filename: RP_PREVIEW_NAME,
+                        ...rpFixOpts(d.clip),
+                    }),
+                });
+                if (!resp.ok) throw new Error(await resp.text());
+                const r = await resp.json();
+                if (seq !== reqSeq) return;
+                starts = r.starts;
+                src = viewUrl(r.filename, r.subfolder, r.type, r.v);
+            }
+            video.src = src;
             video.style.display = "block";
             // The strip already says who relates to whom and how well, so
             // the status line normally stays quiet. It does have to
