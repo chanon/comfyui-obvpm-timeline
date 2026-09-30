@@ -189,8 +189,9 @@ class H3ResultPreview:
         # The measurement version rides along so that changing how seams
         # are judged re-runs every preview once. Without it a clip whose
         # file has not moved keeps showing a verdict from the old metric
-        # for good: the node is cached, show() is never called again, and
-        # the widget restores the payload saved in the workflow. Bump
+        # for good: the node is cached, and show() is never called again
+        # (the widget's latest_result lookup is keyed on the same version,
+        # so it re-judges too). Bump
         # _MEASURE_VERSION whenever the numbers or thresholds change.
         try:
             st = os.stat(cls._abs(path))
@@ -376,3 +377,66 @@ class H3ResultPreview:
             "relation": relation, "sequence": sequence,
             "seam": seam, "seam2": seam2, "render": render,
         }]}}
+
+
+# ---------------------------------------------------------------------------
+# what a Result Preview shows when its workflow is opened
+#
+# Its result is not stored in the workflow any more: that made every
+# finished run an undo step (and an undo brought an older result back),
+# changed the file on every run, and shipped the author's last result in
+# every workflow they shared. So a preview that opens with nothing from
+# this session asks for the newest take its Save node writes: the newest
+# `<prefix>_NNNNN.mp4` -- a joint render's `_s01` segments and an HQ
+# copy's `<prefix>_hq_...` do not match -- judged exactly as a run would
+# have judged it (show()). Cached per file state, because the seam
+# measurement decodes frames and a workflow is opened far more often
+# than a take changes.
+# ---------------------------------------------------------------------------
+
+_LATEST_CACHE = {}
+_LATEST_CACHE_MAX = 64
+
+
+def latest_result(prefix):
+    """The payload a run would have shown for the newest take under
+    `prefix` ("folder/name", output-relative), or None."""
+    import posixpath
+    import re
+    p = str(prefix or "").replace("\\", "/").strip().strip("/")
+    if not p:
+        return None
+    folder, base = posixpath.split(p)
+    if not base:
+        return None
+    root = os.path.abspath(folder_paths.get_output_directory())
+    d = os.path.abspath(os.path.join(root, folder))
+    if os.path.commonpath([root, d]) != root:
+        raise ValueError("latest_result: %r escapes the output folder"
+                         % prefix)
+    if not os.path.isdir(d):
+        return None
+    take = re.compile(r"^%s_\d+\.mp4$" % re.escape(base))
+    best = None
+    for name in os.listdir(d):
+        if not take.match(name):
+            continue
+        full = os.path.join(d, name)
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        if best is None or st.st_mtime_ns > best[1].st_mtime_ns:
+            best = (full, st)
+    if best is None:
+        return None
+    full, st = best
+    rel = os.path.relpath(full, root).replace(os.sep, "/")
+    key = (rel, st.st_size, st.st_mtime_ns, _MEASURE_VERSION)
+    hit = _LATEST_CACHE.get(key)
+    if hit is None:
+        hit = H3ResultPreview().show(rel)["ui"]["h3_result"][0]
+        _LATEST_CACHE[key] = hit
+        while len(_LATEST_CACHE) > _LATEST_CACHE_MAX:
+            _LATEST_CACHE.pop(next(iter(_LATEST_CACHE)))
+    return hit

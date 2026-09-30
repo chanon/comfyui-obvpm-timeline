@@ -9326,71 +9326,71 @@ app.registerExtension({
 // sequence} -> this widget shows the pair as two blocks with the seam
 // pill between them and plays the sequence as ONE server-built smart
 // cut (the same /obvpm/h3/preview_cut the Timeline uses, its own
-// preview file). The payload rides node.properties so it survives a
-// workflow save/reload.
+// preview file). Nothing of it is kept in the workflow: see
+// RP_STORE_KEY for where the result and the rest come from instead.
 const RP_NODE = "H3ResultPreview";
 const RP_PREVIEW_NAME = "obvpm_h3_result";
 
-// ---- out of undo/redo -------------------------------------------------
-// What a Result Preview shows (the last result, whether it was added or
-// dismissed, its seam tuning, the live-preview toggle) is not an edit to
-// the workflow, so it must not be undone. The frontend's undo history is
-// whole-graph snapshots (ChangeTracker: activeState + undoQueue +
-// redoQueue, each a rootGraph.serialize()), and a node's properties ride
-// in them -- so a finished run became an undo step, and Ctrl+Z on an
-// unrelated edit brought back an older result. Leaving the properties out
-// of the snapshots is not an option: saving writes the same activeState.
-// So every snapshot is brought into line with the node instead: after
-// each change, the node's h3_* properties are copied into all of them.
-// A preview change then differs from no step (no undo entry of its own),
-// and restoring any step restores the preview as it is NOW. Node position
-// and size stay ordinary, undoable layout. Silently a no-op on a frontend
-// without these fields.
-function rpOutOfHistory(node) {
-    const tracker = app.extensionManager?.workflow?.activeWorkflow?.changeTracker;
-    const graph = node?.graph;
-    if (!tracker || !graph) return;
-    const root = app.rootGraph ?? app.graph;
-    const inRoot = graph === root;
-    // a node inside a subgraph lives in that subgraph's definition
-    if (!inRoot && graph.rootGraph !== root) return;   // another workflow
-    // Mid-load the active tracker may still be the PREVIOUS workflow's
-    // (the new graph is configured before the pointer moves), and two
-    // workflows share node ids -- so only a tracker whose snapshots are
-    // of THIS graph is touched. The load itself then snapshots the node
-    // as it is.
-    if (tracker.constructor?.isLoadingGraph) return;
-    if (tracker.activeState?.id && root?.id
-            && tracker.activeState.id !== root.id) {
-        return;
+// ---- nothing in the workflow ----------------------------------------------
+// A Result Preview keeps NOTHING in the workflow. It used to keep its
+// last result, the add/dismiss decision, its seam tuning and the live-
+// preview toggle on node.properties -- which made every finished run an
+// undo step (and an undo on an unrelated edit brought an older result
+// back), changed the workflow file on every run, and shipped the author's
+// last result inside every workflow they shared.
+//   - the result: this session's own (RP_RESULTS), or else the newest take
+//     its Save node writes, asked of the server when the workflow opens
+//     (/obvpm/h3/latest_result);
+//   - the decision, the seam tuning, the toggle: this browser's storage,
+//     keyed by the take (or by the preview's scope for the toggle).
+// Workflows saved before this still carry those properties; they are read
+// once into storage and otherwise ignored -- never deleted from the node,
+// because deleting them would itself be an edit (an undo step, and the
+// unsaved mark on every old workflow opened).
+const RP_STORE_KEY = "obvpm.h3.result_preview";
+const RP_STORE_MAX = 300;          // takes remembered per map, oldest dropped
+// decided[clip]: 1 = added (or a decision stored before dismissals were
+// told apart), RP_DISMISSED = dismissed -- not shown again on open
+const RP_DISMISSED = "dismissed";
+const rpDismissed = (clip) => rpStore().decided[clip] === RP_DISMISSED;
+function rpStore() {
+    try {
+        const s = JSON.parse(localStorage.getItem(RP_STORE_KEY) || "{}");
+        return {
+            decided: (s && typeof s.decided === "object" && s.decided) || {},
+            seam: (s && typeof s.seam === "object" && s.seam) || {},
+            live: (s && typeof s.live === "object" && s.live) || {},
+        };
+    } catch (err) {
+        return { decided: {}, seam: {}, live: {} };
     }
-    const props = {};
-    for (const [k, v] of Object.entries(node.properties ?? {})) {
-        if (k.startsWith("h3_")) props[k] = v == null ? v : JSON.parse(JSON.stringify(v));
-    }
-    const id = String(node.id);
-    const patch = (state) => {
-        const nodes = inRoot ? state?.nodes
-            : (state?.definitions?.subgraphs ?? [])
-                .find((s) => s.id === graph.id)?.nodes;
-        const n = (nodes ?? []).find((x) => String(x.id) === id);
-        if (!n) return;
-        n.properties = { ...(n.properties ?? {}) };
-        for (const [k, v] of Object.entries(props)) {
-            if (v === undefined) delete n.properties[k];
-            else n.properties[k] = v == null ? v : JSON.parse(JSON.stringify(v));
+}
+function rpStoreWrite(s) {
+    // insertion order is age: re-set keys move to the end, the oldest go
+    const trim = (m) => {
+        const keys = Object.keys(m);
+        for (const k of keys.slice(0, Math.max(0, keys.length - RP_STORE_MAX))) {
+            delete m[k];
         }
+        return m;
     };
     try {
-        patch(tracker.activeState);
-        for (const s of tracker.undoQueue ?? []) patch(s);
-        for (const s of tracker.redoQueue ?? []) patch(s);
-        // the unsaved-changes dot still follows it: a new result is
-        // worth saving, it just is not worth undoing
-        tracker.updateModified?.();
-    } catch (err) {
-        tldbg("result preview: could not keep it out of undo:", err);
-    }
+        localStorage.setItem(RP_STORE_KEY, JSON.stringify({
+            decided: trim(s.decided), seam: trim(s.seam), live: s.live,
+        }));
+    } catch (err) { /* private mode, quota: forget quietly */ }
+}
+// A preview's OWN preview file. The take preview and the upscale preview
+// sit in the same project folder, and with one shared name each build
+// overwrote the other's file and cache key, so both rebuilt on every look
+// and two builds racing on one file failed ("cannot find the file
+// specified"). Named after the Save prefix it watches; the node id when
+// that cannot be read.
+function rpPreviewName(node) {
+    const scope = rpScopeFolder(node);
+    const base = scope ? String(scope).split("/").pop() : "";
+    const tail = (base || "node" + node?.id).replace(/[^A-Za-z0-9_-]/g, "_");
+    return `${RP_PREVIEW_NAME}_${tail}`;
 }
 
 // ---- whose run was that? -------------------------------------------
@@ -9972,7 +9972,8 @@ function buildResultPreview(node) {
         borderColor: "#1f5c38",
     });
     const dismissBtn = rpBtn("dismiss",
-        "Hide these buttons (the preview and the take stay)");
+        "Clear this result from the preview (the take stays on disk) "
+        + "-- it will not come back when the workflow is opened again");
     const delBtn = rpBtn("✕ delete",
         "Delete this take (MP4 + sidecar) -- for rejected seeds");
     // destructive action wears red; dismiss stays neutral
@@ -9983,7 +9984,7 @@ function buildResultPreview(node) {
     btnRow.append(addTlBtn, delBtn, dismissBtn);
 
     const rpProgress = tlProgressBar();
-    const dropRpProgress = tlOnProgress(() => RP_PREVIEW_NAME, rpProgress);
+    const dropRpProgress = tlOnProgress(() => rpPreviewName(node), rpProgress);
     container.append(liveImg, liveVideo, video, strip, rpProgress.el, btnRow, status);
     const widget = node.addDOMWidget("mctx_result", "div", container,
                                      { hideOnZoom: false });
@@ -10066,43 +10067,33 @@ function buildResultPreview(node) {
     //
     // Keyed by the clip to the RIGHT of the join, exactly as the
     // sequence line keys them, so handing them over is a lookup and not
-    // a translation. On node.properties so a workflow save keeps them
-    // alongside the h3_result payload they describe.
+    // a translation. In this browser's storage, not the workflow (see
+    // RP_STORE_KEY); the map handed over is the part of it for the clips
+    // on screen.
     function rpAllSeamOpts() {
-        const o = node.properties?.h3_seam_opts;
-        return (o && typeof o === "object") ? o : {};
+        const seam = rpStore().seam;
+        const out = {};
+        const clips = String(current?.sequence || current?.clip || "")
+            .split("\n").map((c) => c.trim()).filter(Boolean);
+        for (const c of clips) {
+            if (seam[c] && typeof seam[c] === "object") out[c] = seam[c];
+        }
+        return out;
     }
     function rpSeamOptsFor(clip) {
-        return rpAllSeamOpts()[clip] || {};
+        return rpStore().seam[clip] || {};
     }
     function rpWriteSeamOpts(clip, own) {
-        const all = { ...rpAllSeamOpts() };
-        if (own && Object.keys(own).length) all[clip] = own;
-        else delete all[clip];
-        node.properties.h3_seam_opts = all;
-        rpOutOfHistory(node);
+        const s = rpStore();
+        delete s.seam[clip];
+        if (own && Object.keys(own).length) s.seam[clip] = own;
+        rpStoreWrite(s);
     }
     function rpSetSeamOpt(clip, key, value) {
         const own = { ...rpSeamOptsFor(clip) };
         if (value === undefined || value === null) delete own[key];
         else own[key] = value;
         rpWriteSeamOpts(clip, own);
-    }
-    // A new take is a new question; settings named for clips that are no
-    // longer on screen would otherwise accumulate in the workflow file
-    // forever. Keys still in the sequence survive, so flipping back and
-    // forth between takes does not lose them.
-    function rpPruneSeamOpts(clips) {
-        const keep = new Set(clips);
-        const all = rpAllSeamOpts();
-        const next = {};
-        for (const [k, v] of Object.entries(all)) {
-            if (keep.has(k)) next[k] = v;
-        }
-        if (Object.keys(next).length !== Object.keys(all).length) {
-            node.properties.h3_seam_opts = next;
-            rpOutOfHistory(node);
-        }
     }
     // Once a join exists in a Timeline too, THAT is where its settings
     // live -- editing a private copy here would show a repaired picture
@@ -10255,7 +10246,6 @@ function buildResultPreview(node) {
         const clips = d.sequence.split("\n");
         const metas = await Promise.all(clips.map((c) => tlClipMeta(c)));
         if (seq !== reqSeq) return;
-        rpPruneSeamOpts(clips);
         clips.forEach((c, k) => {
             if (k > 0) {
                 // pill = the RELATION; under it the MEASURED verdict
@@ -10390,7 +10380,7 @@ function buildResultPreview(node) {
                     sequence: rpSequenceText(d), crf: rpCrf(d.clip),
                     base_folder: d.clip.includes("/")
                         ? d.clip.slice(0, d.clip.lastIndexOf("/")) : "",
-                    preview_filename: RP_PREVIEW_NAME,
+                    preview_filename: rpPreviewName(node),
                     ...rpFixOpts(d.clip),
                 }),
             });
@@ -10492,10 +10482,12 @@ function buildResultPreview(node) {
     }
     // a live frame is shown only for the run being timed: the event is
     // global, and another workflow's sampling must not paint here
-    // Per node, saved in the workflow: a preview on the refine branch
-    // shares the one event stream with the generation branch's, and
-    // its owner may not want the sampler's frames there at all.
-    const liveWanted = () => node.properties?.h3_live_preview !== false;
+    // Per preview, kept by the Save prefix it watches in this browser's
+    // storage (see RP_STORE_KEY): a preview on the refine branch shares
+    // the one event stream with the generation branch's, and its owner
+    // may not want the sampler's frames there at all.
+    const liveKey = () => rpScopeFolder(node) ?? "#" + node.id;
+    const liveWanted = () => rpStore().live[liveKey()] !== false;
     const onLivePreview = (e) => {
         const data = e?.detail;
         if (!data || runStartedAt === null || !liveWanted()) return;
@@ -10631,34 +10623,51 @@ function buildResultPreview(node) {
         });
     }
     // The decision taken on a take (added, or dismissed) is kept BY CLIP
-    // in the node's properties, so it survives a reload, a workflow
-    // switch and the restore of the same result: the same take never
-    // asks twice. A new take is a new decision; a deleted one is gone.
-    const decided = () => !!current &&
-        node.properties?.h3_decided === current.clip;
-    function decide() {
-        node.properties = node.properties || {};
-        node.properties.h3_decided = current?.clip ?? null;
-        rpOutOfHistory(node);
+    // in this browser's storage (see RP_STORE_KEY), so it survives a
+    // reload, a workflow switch and the restore of the same result: the
+    // same take never asks twice. A new take is a new decision. A dismissal
+    // is recorded as such (RP_DISMISSED): a dismissed take is not shown
+    // again when the workflow opens, an added one is.
+    const decided = () => !!current && !!rpStore().decided[current.clip];
+    function decide(how = 1) {
+        if (!current?.clip) return;
+        const s = rpStore();
+        delete s.decided[current.clip];
+        s.decided[current.clip] = how;
+        rpStoreWrite(s);
+    }
+    // an empty preview, saying why: after a delete or a dismiss
+    function clearView(text) {
+        current = null;
+        ++reqSeq; // a build still in flight must not bring it back
+        video.pause();
+        video.removeAttribute("src");
+        video.load();
+        video.style.display = "none";
+        strip.replaceChildren();
+        strip.style.display = "none";
+        btnRow.style.display = "none";
+        rpCloseSeamDialog(false);
+        status.style.color = PAL.sub;
+        status.textContent = text;
     }
     function updateActionBtns() {
-        if (decided()) {
-            btnRow.style.display = "none";
-            return;
-        }
-        // a take that already sits in a timeline is neither addable
-        // nor safe to delete from here; a rendered cut is the final
-        // product, not a take for a timeline
-        const inTl = current && [...TL_REGISTRY.values()]
+        // a decided take asks nothing more; a take that already sits in
+        // a timeline is neither addable nor safe to delete from here; a
+        // rendered cut is the final product, not a take for a timeline
+        const open = !!current && !decided();
+        const inTl = open && [...TL_REGISTRY.values()]
             .some((t) => t.has?.(current.clip));
-        const canAdd = !!(current && !inTl && current.render !== "joint" &&
-            tlMatchesFor(current.clip).length);
-        const canDel = !!(current && !inTl);
+        const canAdd = open && !inTl && current.render !== "joint" &&
+            tlMatchesFor(current.clip).length > 0;
+        const canDel = open && !inTl;
         addTlBtn.style.display = canAdd ? "" : "none";
         delBtn.style.display = canDel ? "" : "none";
-        // with nothing to accept or reject the row would hold only
-        // dismiss -- nothing worth dismissing, so hide the whole row
-        btnRow.style.display = canAdd || canDel ? "flex" : "none";
+        // dismiss clears whatever is on screen, decided or not -- an
+        // added take (or one decided before dismissals were told apart)
+        // would otherwise come back on every open with no way to clear it.
+        // Not over the live picture: that result is not on screen
+        btnRow.style.display = current && !liveUrl ? "flex" : "none";
     }
     // timelines register/unregister (and their sequences change) as
     // the user works; re-check on hover so the row is honest at the
@@ -10682,18 +10691,19 @@ function buildResultPreview(node) {
         // the timeline's own refresh is async, so has() still answers
         // with the OLD sequence here -- but the offer just succeeded,
         // so the take is in a timeline now: hide directly, and remember
-        // the decision so the row stays down for this take
+        // the decision so they stay down for this take (dismiss stays)
         decide();
         addTlBtn.style.display = "none";
         delBtn.style.display = "none";
-        btnRow.style.display = "none"; // dismiss alone is no row
     });
     dismissBtn.addEventListener("click", () => {
-        // just tuck the buttons away; the preview itself stays. Sticky
-        // for this take (hover re-checks and reloads must not resurrect
-        // an explicitly dismissed row)
-        decide();
-        btnRow.style.display = "none";
+        // clear the result, not just the buttons: a take left on screen
+        // turns up again on every reopen with nothing saying which run it
+        // was. Sticky for this take (see RP_DISMISSED); the file stays.
+        if (!current?.clip) return;
+        const gone = current.clip;
+        decide(RP_DISMISSED);
+        clearView("dismissed " + gone.split("/").pop());
     });
     delBtn.addEventListener("click", async () => {
         if (!current) return;
@@ -10711,18 +10721,7 @@ function buildResultPreview(node) {
             tlMetaCache.delete(gone);
             tlFramesCache.delete(gone);
             for (const t of TL_REGISTRY.values()) t.forget(gone);
-            current = null;
-            node.properties.h3_result = null;
-            rpOutOfHistory(node);
-            video.pause();
-            video.removeAttribute("src");
-            video.load();
-            video.style.display = "none";
-            strip.replaceChildren();
-            strip.style.display = "none";
-            btnRow.style.display = "none";
-            status.style.color = PAL.sub;
-            status.textContent = "deleted " + gone;
+            clearView("deleted " + gone);
         } catch (err) {
             status.style.color = "#de5b5b";
             status.textContent = "delete failed: " +
@@ -10743,9 +10742,6 @@ function buildResultPreview(node) {
         if (key === lastShownKey && now - lastShownAt < 2000) return;
         lastShownKey = key;
         lastShownAt = now;
-        node.properties = node.properties || {};
-        node.properties.h3_result = d;
-        rpOutOfHistory(node);
         void render(d);
     };
 
@@ -10753,12 +10749,12 @@ function buildResultPreview(node) {
     // background: its `executed` event never reached this node (the node
     // wasn't in the open graph) and ComfyUI's own output store was wiped
     // by the workflow switch, so RP_RESULTS is the only surviving copy.
-    // Restoring a payload from an earlier session means its clips may be
-    // gone -- deleting a rejected take is routine, and the preview build
-    // would fail with a "clip not found" error for something the user did
-    // on purpose. Check first and say it plainly instead.
+    // A cached payload may name clips deleted since -- deleting a rejected
+    // take is routine, and the preview build would fail with a "clip not
+    // found" error for something the user did on purpose. Check first and
+    // say it plainly instead.
     async function restoreResult(d) {
-        if (!d?.clip) return;
+        if (!d?.clip || rpDismissed(d.clip)) return;
         const clips = String(d.sequence || d.clip)
             .split("\n").map((c) => c.trim()).filter(Boolean);
         const sizes = await Promise.all(
@@ -10768,12 +10764,8 @@ function buildResultPreview(node) {
             node._h3ShowResult(d);
             return;
         }
-        node.properties = node.properties || {};
         if (missing.includes(d.clip)) {
-            // the take itself is gone: nothing left to show, and keeping
-            // the payload would resurrect this every time it loads
-            node.properties.h3_result = null;
-            rpOutOfHistory(node);
+            // the take itself is gone: nothing left to show
             status.style.color = PAL.sub;
             status.textContent =
                 d.clip.split("/").pop() + " was deleted";
@@ -10788,15 +10780,67 @@ function buildResultPreview(node) {
         });
     }
 
+    // true when this session holds a result for this preview
     function adoptCachedResult() {
-        if (rpScopeFolder(node) === null) return; // can't tell whose result
+        if (rpScopeFolder(node) === null) return false; // can't tell whose
         // newest first, matched by the same rule that gates live events
         for (let i = RP_RESULTS.length - 1; i >= 0; i--) {
             if (rpAccepts(node, RP_RESULTS[i])) {
                 void restoreResult(RP_RESULTS[i]);
-                return;
+                return true;
             }
         }
+        return false;
+    }
+    // Nothing from this session: the newest take this preview's Save
+    // node writes, judged by the server exactly as a run would have
+    // judged it (nodes_result.latest_result). Nothing is stored, so
+    // opening the workflow again asks again.
+    async function adoptLatestResult() {
+        const scope = rpScopeFolder(node);
+        if (!scope) return;
+        let d = null;
+        try {
+            const resp = await api.fetchApi("/obvpm/h3/latest_result", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ prefix: scope }),
+            });
+            if (resp.ok) d = (await resp.json())?.result ?? null;
+        } catch (err) {
+            tldbg("result preview: latest result unavailable:", err);
+        }
+        // a run may have delivered its own result while this was asked.
+        // The newest take dismissed: show nothing, never an older take
+        if (!d?.clip || current || !node.graph || rpDismissed(d.clip)) return;
+        node._h3ShowResult(d);
+    }
+    // Workflows saved before the preview stopped keeping anything in them
+    // carry the decision, the seam tuning and the live toggle as node
+    // properties: carried into storage once, never removed from the node
+    // (see RP_STORE_KEY). What storage already has wins.
+    function adoptOldProperties(p) {
+        if (!p) return;
+        const s = rpStore();
+        let changed = false;
+        if (typeof p.h3_decided === "string" && p.h3_decided
+                && !s.decided[p.h3_decided]) {
+            s.decided[p.h3_decided] = 1;
+            changed = true;
+        }
+        if (p.h3_seam_opts && typeof p.h3_seam_opts === "object") {
+            for (const [c, o] of Object.entries(p.h3_seam_opts)) {
+                if (!s.seam[c] && o && typeof o === "object") {
+                    s.seam[c] = o;
+                    changed = true;
+                }
+            }
+        }
+        if (p.h3_live_preview === false && s.live[liveKey()] === undefined) {
+            s.live[liveKey()] = false;
+            changed = true;
+        }
+        if (changed) rpStoreWrite(s);
     }
     const prevMenu = node.getExtraMenuOptions;
     node.getExtraMenuOptions = function (canvas, options) {
@@ -10804,9 +10848,9 @@ function buildResultPreview(node) {
         options.push({
             content: (liveWanted() ? "✓ " : "") + "Live preview while sampling",
             callback: () => {
-                this.properties ??= {};
-                this.properties.h3_live_preview = !liveWanted();
-                rpOutOfHistory(this);
+                const s = rpStore();
+                s.live[liveKey()] = !liveWanted();
+                rpStoreWrite(s);
                 if (!liveWanted()) {
                     liveClear();
                     if (video.getAttribute("src")) video.style.display = "block";
@@ -10835,19 +10879,11 @@ function buildResultPreview(node) {
         // Deferred as a whole: links aren't wired up yet during configure,
         // so the scope can't be read until the graph settles.
         setTimeout(() => {
-            const saved = this.properties?.h3_result;
-            if (saved && !rpAccepts(this, saved)) {
-                // The payload is saved INTO the workflow file, so a result
-                // captured from another workflow before scope checking
-                // existed comes back on every load. Drop it for good.
-                tldbg("result preview: dropping saved result", saved.clip,
-                      "— this node watches", rpScopeFolder(this));
-                this.properties.h3_result = null;
-                rpOutOfHistory(this);
-            } else if (saved) {
-                void restoreResult(saved);
-            }
-            adoptCachedResult();
+            // An `h3_result` a workflow saved before is NOT shown: it is
+            // whatever that file last showed, possibly on another machine.
+            // This session's own result wins, else the newest take on disk.
+            adoptOldProperties(this.properties);
+            if (!adoptCachedResult()) void adoptLatestResult();
             // Joining a run that is already in flight: the start event
             // fired before this node existed, so ask the queue instead.
             void rpQueueOwns(rpScopeFolder(this), null).then((owns) => {

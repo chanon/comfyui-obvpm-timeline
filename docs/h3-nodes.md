@@ -373,9 +373,11 @@ the join computed from the take's own latents, rated `seamless` /
 timeline is involved. Buttons: **+ add to timeline** (shown when a
 Timeline node matching the clip's folder exists; inserts at the
 lineage-derived position), **✕ delete** (removes the take's MP4 and
-sidecar from disk, after confirmation), **dismiss** (hides the
-buttons). A decision sticks to its take: once added or dismissed, that
-take never asks again, through reloads and workflow switches. A cut
+sidecar from disk, after confirmation), **dismiss** (clears the result
+from the preview; the take stays on disk; offered for any result on
+screen, added or not). A decision sticks to its take: once added,
+that take never asks again, and once dismissed it is not shown again,
+through reloads and workflow switches. A cut
 from H3 Joint VAE Decode and Save is the finished product, so the
 preview offers delete and dismiss for it but not add to timeline.
 
