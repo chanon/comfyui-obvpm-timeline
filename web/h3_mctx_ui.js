@@ -1927,6 +1927,82 @@ function tlLoadDialog({ clip, keyword, plan, pinRole }) {
     });
 }
 
+// A question with two answers, on the same overlay and palette as the
+// load-settings dialog -- never window.confirm: that blocks the page, is
+// not implemented at all in some hosts (ComfyUI Desktop is Electron), and
+// looks foreign. Resolves true for `yes`, false for `no`; Escape and a
+// click outside answer `no`, the choice that changes nothing.
+function tlAskChoice({ title, message, yes, no }) {
+    return new Promise((resolve) => {
+        const PAL = themePalette();
+        const BG = (typeof LiteGraph !== "undefined"
+            && LiteGraph.NODE_DEFAULT_BGCOLOR) || PAL.rest;
+        const FG = (typeof LiteGraph !== "undefined"
+            && LiteGraph.NODE_TEXT_COLOR) || PAL.text;
+        const overlay = document.createElement("div");
+        Object.assign(overlay.style, {
+            position: "fixed", inset: "0", zIndex: "10000",
+            background: "rgba(0,0,0,0.5)", display: "flex",
+            alignItems: "center", justifyContent: "center",
+            font: "13px sans-serif",
+        });
+        const panel = document.createElement("div");
+        Object.assign(panel.style, {
+            background: BG, color: FG,
+            border: "1px solid " + PAL.edge, borderRadius: "8px",
+            boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
+            width: "min(520px, 92vw)", padding: "16px 18px",
+            display: "flex", flexDirection: "column", gap: "12px",
+        });
+        const h = document.createElement("div");
+        h.textContent = title;
+        Object.assign(h.style, { fontSize: "15px", fontWeight: "600" });
+        const body = document.createElement("div");
+        body.textContent = message;
+        Object.assign(body.style, { whiteSpace: "pre-wrap", lineHeight: "1.5" });
+        const foot = document.createElement("div");
+        Object.assign(foot.style, { display: "flex", gap: "10px",
+                                    justifyContent: "flex-end" });
+        const mkBtn = (label, primary) => {
+            const b = document.createElement("button");
+            b.textContent = label;
+            Object.assign(b.style, {
+                background: primary ? PAL.active : BG,
+                color: primary ? PAL.activeText : FG,
+                border: "1px solid " + (primary ? "transparent" : PAL.edge),
+                borderRadius: "4px", padding: "6px 16px", cursor: "pointer",
+                font: "13px/19px sans-serif", whiteSpace: "nowrap",
+            });
+            return b;
+        };
+        const noBtn = mkBtn(no, false);
+        const yesBtn = mkBtn(yes, true);
+        foot.append(noBtn, yesBtn);
+        panel.append(h, body, foot);
+        overlay.appendChild(panel);
+        let done = false;
+        const close = (value) => {
+            if (done) return;
+            done = true;
+            document.removeEventListener("keydown", onKey, true);
+            overlay.remove();
+            resolve(value);
+        };
+        function onKey(ev) {
+            if (ev.key === "Escape") { ev.stopPropagation(); close(false); }
+            else if (ev.key === "Enter") { ev.stopPropagation(); close(true); }
+        }
+        document.addEventListener("keydown", onKey, true);
+        overlay.addEventListener("mousedown", (ev) => {
+            if (ev.target === overlay) close(false);
+        });
+        noBtn.addEventListener("click", () => close(false));
+        yesBtn.addEventListener("click", () => close(true));
+        document.body.appendChild(overlay);
+        yesBtn.focus();
+    });
+}
+
 // The take's own pin options: what the Timeline was set to when that
 // clip was generated. Restored regardless of the group keyword -- it is
 // this node's own state, and it is the setting that reproduces the take.
@@ -2020,6 +2096,47 @@ const TL_SEAM_ORDER = ["level_lock", "level_lock_frames",
                        "crossfade", "crossfade_frames", "audio_declick"];
 const TL_TRUE = ["1", "on", "true", "yes"];
 const TL_FALSE = ["0", "off", "false", "no"];
+// A PART ID rides in the same brackets, first: `clip.mp4 @ 40..80
+// [id=k3x9]` (mirrors nodes_assemble.PART_KEY / line_part). It names the
+// LINE, so a pin -- and the take made from it -- can say which part of a
+// file it continues when the file stands in the cut more than once. It
+// is written only where a pin or a split needs it.
+const TL_PART_KEY = "id";
+const TL_PART_RE = /^[A-Za-z0-9_-]{1,24}$/;
+// A new id no line in `taken` already uses. Random rather than counted:
+// a counter would hand a deleted part's id to the next new part, and a
+// take recorded against the old one would then find its way to the new.
+function tlNewPart(taken) {
+    for (;;) {
+        const id = Math.random().toString(36).slice(2, 6);
+        if (id.length === 4 && !taken.has(id)) return id;
+    }
+}
+
+// A part id names ONE line, but copying a line in the text editor copies
+// its id too, and then only the first copy could ever be pinned. The
+// first keeps the id; each later line repeating it gets a fresh one.
+// Every other line is returned exactly as written.
+function tlDedupeParts(text) {
+    const lines = String(text ?? "").split("\n");
+    const all = new Set();
+    for (const raw of lines) {
+        const p = tlSplitSeamOpts(raw.trim()).part;
+        if (p) all.add(p);
+    }
+    const seen = new Set();
+    return lines.map((raw) => {
+        const t = raw.trim();
+        if (!tlIsEntryLine(t) || TL_GAP_RE.test(t)) return raw;
+        const p = tlSplitSeamOpts(t).part;
+        if (!p) return raw;
+        if (!seen.has(p)) { seen.add(p); return raw; }
+        const [e] = tlParseSequence(t);
+        e.part = tlNewPart(all);
+        all.add(e.part);
+        return tlFormatLine(e);
+    }).join("\n");
+}
 
 // An unknown key or unreadable value is DROPPED, not refused: a wrong
 // setting degrades to the timeline's default, while an unknown ENTRY
@@ -2027,14 +2144,19 @@ const TL_FALSE = ["0", "off", "false", "no"];
 // deliberately does not.
 function tlSplitSeamOpts(line) {
     const m = line.match(TL_OPTS_RE);
-    if (!m) return { head: line, seam: {} };
+    if (!m) return { head: line, seam: {}, part: null };
     const seam = {};
+    let part = null;
     for (const token of m[2].split(/\s+/)) {
         if (!token) continue;
         const at = token.indexOf("=");
         if (at < 0) continue;
         const key = token.slice(0, at);
         const raw = token.slice(at + 1).trim();
+        if (key === TL_PART_KEY) {
+            if (TL_PART_RE.test(raw)) part = raw;
+            continue;
+        }
         const kind = TL_SEAM_KEYS[key];
         if (!kind) continue;
         if (kind === "bool") {
@@ -2045,13 +2167,12 @@ function tlSplitSeamOpts(line) {
         }
         if (/^-?\d+$/.test(raw)) seam[key] = Number(raw);
     }
-    return { head: m[1].trim(), seam };
+    return { head: m[1].trim(), seam, part };
 }
 
-function tlFormatSeamOpts(seam) {
-    if (!seam) return "";
-    const parts = [];
-    for (const key of TL_SEAM_ORDER) {
+function tlFormatSeamOpts(seam, part = null) {
+    const parts = part ? [TL_PART_KEY + "=" + part] : [];
+    for (const key of seam ? TL_SEAM_ORDER : []) {
         const v = seam[key];
         if (v === undefined || v === null) continue;
         parts.push(key + "=" + (TL_SEAM_KEYS[key] === "bool"
@@ -2190,10 +2311,10 @@ function tlParseSequence(text) {
         if (g) {
             out.push({ clip: null, gap: Number(g[1]),
                        enterOverride: null, exitOverride: null,
-                       seamOpts: {} });
+                       seamOpts: {}, part: null });
             continue;
         }
-        const { head, seam } = tlSplitSeamOpts(line);
+        const { head, seam, part } = tlSplitSeamOpts(line);
         const m = head.match(TL_LINE_RE);
         // seamOpts, NOT seam: `entry.seam` is already the DERIVED seam
         // descriptor ({kind, note}) that drawLinks paints the boundary
@@ -2204,7 +2325,7 @@ function tlParseSequence(text) {
         out.push({ clip: m[1].trim(), gap: null,
                    enterOverride: m[2] === undefined ? null : Number(m[2]),
                    exitOverride: m[3] === undefined ? null : Number(m[3]),
-                   seamOpts: seam });
+                   seamOpts: seam, part });
     }
     return out;
 }
@@ -2440,25 +2561,129 @@ function tlCanCut(entries, i, side, linked) {
 // even though C no longer sits after B and nothing would replace it.
 // Occupancy is positional AND live: the immediate neighbour on that
 // side, with the link actually joining them there.
-//   side "after"  -> the clip following `sourceClip` (an extend)
+//   side "after"  -> the clip following entry `k` (an extend)
 //   side "before" -> the clip preceding it (a prepend)
-function tlOccupant(entries, sourceClip, side, linked) {
+function tlOccupant(entries, k, side, linked) {
     const list = entries ?? [];
-    const k = list.findIndex((e) => e.clip === sourceClip);
-    if (k < 0) return null;
+    if (k == null || k < 0) return null;
     const j = side === "after" ? k + 1 : k - 1;
     const src = list[k], occ = list[j];
     if (!occ || occ.gap != null || !occ.meta || !src?.meta) return null;
-    if (occ.clip === sourceClip) return null;
+    if (occ.clip === src.clip) return null;
     const live = side === "after"
         ? linked(src.meta, occ.meta) : linked(occ.meta, src.meta);
     return live ? { idx: j, entry: occ } : null;
 }
 
+// A pin names an ENTRY, not a file. The same file can stand in the
+// sequence more than once -- a split clip -- and each occurrence starts
+// and ends somewhere else, so "extend this clip" has to say which one.
+// pin_state carries it as `part` (for `source`) and `part2` (for
+// `source2`): the line's part id ([id=...], see TL_PART_KEY). The id
+// travels with its line through every edit -- moves, trims, splits of
+// OTHER parts, deletes of other parts -- which a position would not.
+// A pin without one (written before part ids) names the file's first
+// entry, as it always did. A pin whose part has left the cut names
+// nothing, and is cleared rather than moved onto a different part.
+function tlPartEntry(entries, clip, part) {
+    if (!clip || !entries) return -1;
+    return entries.findIndex((e) => e.gap == null && e.clip === clip
+        && (part ? e.part === part : true));
+}
+// Which occurrence of a file entry i is (0 = the first), for labels.
+function tlOccOf(entries, i) {
+    const clip = entries?.[i]?.clip;
+    if (!clip) return 0;
+    let n = 0;
+    for (let j = 0; j < i; j++) if (entries[j].clip === clip) n++;
+    return n;
+}
+// The part a TAKE was generated from, as its recipe records it (see
+// nodes_assemble._stamp_part): {part, cut} for the side it extends
+// ("after") or prepends into ("before"); null for a take made before
+// part ids, or from a line that had none. `cut` is the cut the run was
+// QUEUED at -- null for the clip's own edge.
+function tlTakePart(meta, side) {
+    const place = side === "after" ? "before" : "after";
+    const p = tlPins(meta).find((s) => s.place === place && s.tl_part);
+    return p ? { part: String(p.tl_part),
+                 cut: p.tl_cut == null ? null : Number(p.tl_cut) } : null;
+}
+// Does a take's join land on THIS part's edge? The 17-frame grid may
+// have moved it (an extend's window only ever shifts EARLIER, less than
+// a group; a prepend's only LATER), so "on the edge" is that one group.
+// An edge that is not cut (the clip's own end, or a derived one) takes
+// any join inside the part: the join then decides where it exits, as it
+// always has. `side` "after" = the take extends entry e, "before" = it
+// prepends into it. Mirrors reconcileParentCut's grid rule.
+function tlJoinFits(e, meta, side) {
+    const link = side === "after" ? tlExtendParent(meta)
+                                  : tlPrependChild(meta);
+    if (!e?.meta || !link || link.id !== e.meta.self_id) return false;
+    const at = link.join - (Number(e.meta.pinned_head_frames) || 0);
+    const frames = Number(e.frames ?? e.meta.delivered_frames) || 0;
+    if (side === "after") {
+        const cut = e.exitOverride;
+        if (cut != null) return at <= cut && cut - at < TL_GROUP;
+        return at > (e.enterOverride ?? 0) && at <= frames;
+    }
+    const cut = e.enterOverride;
+    if (cut != null) return at >= cut && at - cut < TL_GROUP;
+    return at < (e.exitOverride ?? frames);
+}
+// Which occurrence of a take's PARENT the take belongs to. `side`
+// "after" = the parent it extends, "before" = the clip it prepends
+// into. In order:
+//   1. the part id its recipe carries, when that part is still in the
+//      cut AND the take's join still lands on its edge (tlJoinFits);
+//   2. else a part whose edge the join does land on, nearest -- the
+//      recorded part may have been SPLIT since the take was queued, and
+//      the edge it continues from (the clip's end, or a cut) now belongs
+//      to the other half, which kept no claim to the id;
+//   3. else the recorded part after all: nothing fits because ITS cut
+//      was moved while the take generated, which reconcileParentCut
+//      asks about;
+//   4. else, for a take without a recorded part, the nearest edge.
+// The pinned occurrence only breaks a tie (the same file listed twice
+// with the same cut): a take added later from the Result Preview need
+// not be the one the current pin asked for.
+function tlParentIdx(entries, meta, side, pinnedIdx = -1) {
+    const link = side === "after" ? tlExtendParent(meta)
+                                  : tlPrependChild(meta);
+    if (!link || !entries) return -1;
+    const rec = tlTakePart(meta, side);
+    const own = rec ? entries.findIndex((e) => e.gap == null
+        && e.part === rec.part && e.meta?.self_id === link.id) : -1;
+    if (own >= 0 && tlJoinFits(entries[own], meta, side)) return own;
+    const off = (i) => {
+        const e = entries[i];
+        const ph = Number(e.meta.pinned_head_frames) || 0;
+        const edge = side === "after"
+            ? (e.exit ?? e.frames ?? Number(e.meta.delivered_frames))
+            : (e.enter ?? 0);
+        return Math.abs(Number(edge) - (link.join - ph));
+    };
+    const nearest = (keep) => {
+        let best = -1;
+        entries.forEach((e, i) => {
+            if (!e.meta || e.meta.self_id !== link.id || !keep(e)) return;
+            if (best < 0 || off(i) < off(best)
+                    || (off(i) === off(best) && i === pinnedIdx)) {
+                best = i;
+            }
+        });
+        return best;
+    };
+    const fits = nearest((e) => tlJoinFits(e, meta, side));
+    if (fits >= 0) return fits;
+    if (own >= 0) return own;
+    return nearest(() => true);
+}
+
 function tlFormatLine(e) {
     if (e.gap != null) return `~ ${Math.max(1, Math.round(e.gap))}`;
     const a = e.enterOverride, b = e.exitOverride;
-    const t = tlFormatSeamOpts(e.seamOpts);
+    const t = tlFormatSeamOpts(e.seamOpts, e.part ?? null);
     if (a == null && b == null) return `${e.clip}${t}`;
     if (b == null) return `${e.clip} @ ${a}${t}`;
     if (a == null) return `${e.clip} @ ..${b}${t}`;
@@ -3093,7 +3318,6 @@ app.registerExtension({
             // scaffolding included, but only the kept span reaches the
             // timeline, so you need both spans and where they sit.
             function durBreakdown(f, secs, wired, masks, plan) {
-                const name = (p) => String(p || "").split("/").pop();
                 const span = (a, b) => secTxt(a) + "-" + secTxt(b);
                 const L = [];
                 L.push((wired ? "Driven by a wire: " : "Asked ")
@@ -3112,7 +3336,7 @@ app.registerExtension({
                     L.push("What the run is made of:");
                     if (plan.head) {
                         L.push("  " + span(0, plan.head) + "  " + plan.head
-                               + "f pinned from " + name(st.source)
+                               + "f pinned from " + pinName(st)
                                + " (context; trimmed off)");
                     }
                     const freeTo = f - plan.tailWin;
@@ -3121,8 +3345,7 @@ app.registerExtension({
                     if (plan.tailWin) {
                         L.push("  " + span(freeTo, f) + "  " + plan.tailWin
                                + "f pinned into "
-                               + name(st.role === "bridge"
-                                      ? st.source2 : st.source)
+                               + pinName(st, st.role === "bridge")
                                + (plan.runway
                                   ? " (the first " + plan.runway
                                     + "f of it are delivered)"
@@ -3668,10 +3891,16 @@ app.registerExtension({
                 });
                 ta.value = String(seqWidget.value || "");
                 let deb = null;
+                // compared against what was last APPLIED, not the widget:
+                // the widget holds the text with repeated ids renamed
+                // (tlDedupeParts), which the textarea does not show --
+                // rewriting it under the cursor would fight the typing
+                let applied = ta.value;
                 const apply = () => {
                     deb = null;
-                    if (ta.value !== seqWidget.value) {
-                        setSequence(ta.value);
+                    if (ta.value !== applied) {
+                        applied = ta.value;
+                        setSequence(tlDedupeParts(ta.value));
                     }
                 };
                 ta.addEventListener("input", () => {
@@ -3711,37 +3940,95 @@ app.registerExtension({
                     return null;
                 }
             }
-            // which pin role a given clip carries under the current
-            // state (a bridge gives its extend side to `source` and its
-            // prepend side to `source2`)
-            function pinRoleFor(clip, st) {
-                if (!st) return null;
-                if (st.role === "bridge") {
-                    return st.source === clip ? "extend"
-                        : st.source2 === clip ? "prepend" : null;
-                }
-                return st.source === clip ? st.role : null;
+            // The entry a pin names (see tlPartEntry): `source` by
+            // default, `source2` with second=true; -1 when that part is
+            // not in `es`. `es` defaults to the rendered list -- a render
+            // in progress passes its own, since lastEntries is still the
+            // previous one until it finishes.
+            function pinIdx(st, second = false, es = lastEntries) {
+                if (!st) return -1;
+                return second ? tlPartEntry(es, st.source2, st.part2)
+                              : tlPartEntry(es, st.source, st.part);
             }
-            // Does the clip carry THIS role? Asked per side, because a
-            // clip bridged onto itself (the take that loops a lone clip)
-            // carries both, and pinRoleFor can only answer one.
-            function pinHasRole(clip, st, role) {
-                if (!st) return false;
-                if (st.role === "bridge") {
-                    return role === "extend" ? st.source === clip
-                                             : st.source2 === clip;
+            // The pin fields naming entry i, to spread into a new state.
+            // Pinning a line whose FILE is in the cut more than once
+            // gives the line a part id if it has none, so the pin keeps
+            // meaning THIS line whatever happens to the cut around it.
+            // A file that is there once needs no id (the pin names the
+            // file, and a later split gives both halves ids and moves the
+            // pin -- see splitEntry), so a plain cut stays plain text.
+            // The id is written into the sequence text here without a
+            // refresh: every caller hands the result straight to
+            // setPinState, whose refresh and undo step cover both.
+            function pinAt(i, second = false, es = lastEntries) {
+                const e = es?.[i];
+                if (e && e.gap == null && !e.part
+                        && es.filter((x) => x.clip === e.clip).length > 1) {
+                    givePart(i, es);
                 }
-                return st.source === clip && st.role === role;
+                const clip = e?.clip;
+                const part = e?.part ?? null;
+                const out = second ? { source2: clip } : { source: clip };
+                if (part) out[second ? "part2" : "part"] = part;
+                return out;
+            }
+            function givePart(i, es) {
+                const lines = currentLines();
+                const map = entryLines();
+                const parsed = tlParseSequence(seqWidget.value);
+                if (map[i] == null || parsed[i]?.clip !== es[i].clip) return;
+                const id = tlNewPart(new Set(parsed.map((p) => p.part)
+                                               .filter(Boolean)));
+                parsed[i].part = id;
+                lines[map[i]] = tlFormatLine(parsed[i]);
+                writeSequence(lines.join("\n"));
+                es[i].part = id;
+                if (lastEntries !== es && lastEntries[i]?.clip === es[i].clip) {
+                    lastEntries[i].part = id;
+                }
+            }
+            // which pin role entry i carries under the current state (a
+            // bridge gives its extend side to `source` and its prepend
+            // side to `source2`)
+            function pinRoleAt(i, st, es = lastEntries) {
+                if (!st || i < 0) return null;
+                if (st.role === "bridge") {
+                    return pinIdx(st, false, es) === i ? "extend"
+                        : pinIdx(st, true, es) === i ? "prepend" : null;
+                }
+                return pinIdx(st, false, es) === i ? st.role : null;
+            }
+            // Does entry i carry THIS role? Asked per side, because a
+            // clip bridged onto itself (the take that loops a lone clip)
+            // carries both, and pinRoleAt can only answer one.
+            function pinHasRoleAt(i, st, role, es = lastEntries) {
+                if (!st || i < 0) return false;
+                if (st.role === "bridge") {
+                    return pinIdx(st, role !== "extend", es) === i;
+                }
+                return st.role === role && pinIdx(st, false, es) === i;
             }
             // A bridge from the LAST entry into the FIRST is the take
             // that closes a loop -- the same clip on both sides when the
             // strip holds only one.
-            function impliesLoop(st) {
-                if (!st || st.role !== "bridge" || !lastEntries?.length) {
+            function impliesLoop(st, es = lastEntries) {
+                if (!st || st.role !== "bridge" || !es?.length) {
                     return false;
                 }
-                return st.source === lastEntries[lastEntries.length - 1].clip
-                    && st.source2 === lastEntries[0].clip;
+                return pinIdx(st, false, es) === es.length - 1
+                    && pinIdx(st, true, es) === 0;
+            }
+            // The pinned clip's name for a label, with which part it is
+            // when the file stands in the sequence more than once.
+            function pinName(st, second = false) {
+                const clip = second ? st?.source2 : st?.source;
+                if (!clip) return "";
+                const base = clip.split("/").pop();
+                const es = lastEntries ?? [];
+                const count = es.filter((e) => e.clip === clip).length;
+                if (count < 2) return base;
+                return `${base} (part ${tlOccOf(es, pinIdx(st, second)) + 1}`
+                    + `/${count})`;
             }
             // Arming that bridge is deciding the cut loops: a take with
             // both feet on the strip's ends has nowhere else to land.
@@ -3807,8 +4094,8 @@ app.registerExtension({
                 // clips): cycling the window or the mask of an armed pin
                 // must not keep overwriting a length that was typed.
                 if (st && st.role && (!prev || prev.role !== st.role
-                        || prev.source !== st.source
-                        || (prev.source2 ?? null) !== (st.source2 ?? null))) {
+                        || pinIdx(prev) !== pinIdx(st)
+                        || pinIdx(prev, true) !== pinIdx(st, true))) {
                     fitDurationToGap(st);
                 }
                 tlNoteEdit();
@@ -4235,7 +4522,7 @@ app.registerExtension({
             function pinLanding(st = shownPin()) {
                 const es = lastEntries;
                 if (!st || !es?.length || !cumStarts.length) return null;
-                const k = es.findIndex((e) => e.clip === st.source);
+                const k = pinIdx(st, false, es);
                 if (k < 0) return null;
                 const secs = durSeconds();
                 const plan = secs == null ? null
@@ -4244,7 +4531,7 @@ app.registerExtension({
                 const isGap = (i) => es[i] != null && es[i].gap != null;
                 const endOf = (i) => cumStarts[i] + playedArr[i];
                 if (st.role === "prepend") {
-                    const occ = tlOccupant(es, st.source, "before", linkedMeta);
+                    const occ = tlOccupant(es, k, "before", linkedMeta);
                     if (occ) {
                         return { start: cumStarts[occ.idx], gapIdx: -1,
                                  frames: kept ?? playedArr[occ.idx] };
@@ -4261,7 +4548,7 @@ app.registerExtension({
                 if (st.role === "bridge" && impliesLoop(st)) {
                     return { start: totalFrames, frames: kept, gapIdx: -1 };
                 }
-                const occ = tlOccupant(es, st.source, "after", linkedMeta);
+                const occ = tlOccupant(es, k, "after", linkedMeta);
                 if (occ) {
                     return { start: endOf(k), gapIdx: -1,
                              frames: kept ?? playedArr[occ.idx] };
@@ -4323,6 +4610,8 @@ app.registerExtension({
             }
 
             let lastEntries = [];
+            // why the pin row shows no pin, when a pin was just cleared
+            let pinGoneNote = "", pinGoneTip = "";
             // the clips on the strip at the previous render; null until
             // the first one, so a loaded graph is not read as "added"
             let seenClips = null;
@@ -4422,16 +4711,24 @@ app.registerExtension({
                 display: "flex", gap: "6px", alignItems: "center",
                 height: "22px", boxSizing: "border-box",
             });
-            const cutBtn = (label, side, title) => {
+            // ONE box for every button on the row. The cut labels carry
+            // ⟨ ⟩, which come from a fallback font; a fallback glyph can
+            // grow a line box past its line-height, so the row's height
+            // is pinned here rather than left to whatever text it holds.
+            const CUT_ROW_BTN = {
+                height: "20px", boxSizing: "border-box",
+                borderRadius: "4px", padding: "1px 9px",
+                font: "11px/16px sans-serif", whiteSpace: "nowrap",
+                flexShrink: "0",
+            };
+            // The row's action buttons (cut left / split / cut right):
+            // one look, painted by paintRowBtn as usable or not.
+            const rowBtn = (label, title, onClick) => {
                 const b = document.createElement("button");
                 b.textContent = label;
                 b.title = title;
-                Object.assign(b.style, {
-                    borderRadius: "4px", padding: "1px 9px",
-                    font: "11px/16px sans-serif", whiteSpace: "nowrap",
-                    flexShrink: "0",
-                });
-                b.addEventListener("click", () => applyPlayheadCut(side));
+                Object.assign(b.style, CUT_ROW_BTN);
+                b.addEventListener("click", onClick);
                 b.addEventListener("mouseenter", () => {
                     if (b.dataset.on === "1") {
                         b.style.background = TL_ROLE.extend.hover;
@@ -4444,6 +4741,16 @@ app.registerExtension({
                 });
                 return b;
             };
+            function paintRowBtn(b, ok, P) {
+                b.dataset.on = ok ? "1" : "0";
+                b.style.background = ok ? TL_ROLE.extend.bg : "none";
+                b.style.border = "1px solid " + (ok ? "transparent" : P.edge);
+                b.style.color = ok ? "#fff" : P.text;
+                b.style.opacity = ok ? "1" : "0.5";
+                b.style.cursor = ok ? "pointer" : "not-allowed";
+            }
+            const cutBtn = (label, side, title) =>
+                rowBtn(label, title, () => applyPlayheadCut(side));
             const cutLeftBtn = cutBtn("⟨ cut left", "left",
                 "Cut the clip under the playhead from its LEFT edge to "
                 + "here. If nothing leads into that clip, the time it "
@@ -4455,33 +4762,38 @@ app.registerExtension({
             uncutBtn.textContent = "uncut";
             uncutBtn.title = "Remove the manual cut from the selected clip "
                 + "and let its seam be derived from the sidecars again";
-            Object.assign(uncutBtn.style, {
+            Object.assign(uncutBtn.style, CUT_ROW_BTN, {
                 background: "#2a2e36", color: "#e8eaee",
-                border: "1px solid #3a3f48", borderRadius: "4px",
-                padding: "1px 9px", cursor: "pointer",
-                font: "11px/16px sans-serif", whiteSpace: "nowrap",
+                border: "1px solid #3a3f48", cursor: "pointer",
             });
             uncutBtn.addEventListener("click", () => {
                 if (lastHighlight < 0) return;
                 setCut(lastHighlight, { enter: null, exit: null });
             });
+            // Split sits beside uncut: it acts on the clip under the
+            // playhead, not on either end, so it belongs in the middle.
+            const splitBtn = rowBtn("split", "", () => applyPlayheadSplit());
             function updateCutRow() {
                 const has = selectedHasCut();
                 uncutBtn.style.display = has ? "block" : "none";
                 // themePalette() rather than PAL: this can run before
                 // PAL's declaration is reached (temporal dead zone)
                 const P = themePalette();
+                // shown while the playhead is on a clip; dimmed, with the
+                // reason as its tooltip, while it sits on an edge
+                const sp = playheadSplit();
+                splitBtn.style.display = sp ? "block" : "none";
+                const spOK = !!sp && !sp.blocked;
+                paintRowBtn(splitBtn, spOK, P);
+                splitBtn.title = spOK
+                    ? `Split ${sp.name} in two at frame ${sp.at}. Both `
+                      + "halves play the same file -- nothing is "
+                      + "re-encoded -- and join back-to-back."
+                    : sp?.why ?? "";
                 for (const [b, side] of [[cutLeftBtn, "left"],
                                          [cutRightBtn, "right"]]) {
                     const t = playheadCut(side);
-                    const ok = !!t && !t.blocked;
-                    b.dataset.on = ok ? "1" : "0";
-                    b.style.background = ok ? TL_ROLE.extend.bg : "none";
-                    b.style.border = "1px solid "
-                        + (ok ? "transparent" : P.edge);
-                    b.style.color = ok ? "#fff" : P.text;
-                    b.style.opacity = ok ? "1" : "0.5";
-                    b.style.cursor = ok ? "pointer" : "not-allowed";
+                    paintRowBtn(b, !!t && !t.blocked, P);
                 }
             }
             // Two spacers rather than auto margins on `uncut`: hiding
@@ -4493,8 +4805,8 @@ app.registerExtension({
                 d.style.flex = "1";
                 return d;
             };
-            cutRow.append(cutLeftBtn, cutSpacer(), uncutBtn, cutSpacer(),
-                          cutRightBtn);
+            cutRow.append(cutLeftBtn, cutSpacer(), uncutBtn, splitBtn,
+                          cutSpacer(), cutRightBtn);
             const progress = tlProgressBar();
             const dropProgress = tlOnProgress(
                 () => String(widgetValue("preview_filename", "")
@@ -4525,12 +4837,17 @@ app.registerExtension({
                 return String(seqWidget.value || "").split("\n");
             }
             function setSequence(text) {
+                writeSequence(text);
+                tlNoteEdit();      // one undo step per edit
+                void refresh();
+            }
+            // The text alone, for an edit whose refresh and undo step
+            // come from the write that follows it (see pinAt).
+            function writeSequence(text) {
                 seqWidget.value = text;
                 const seqEl2 = seqWidget.element ?? seqWidget.inputEl;
                 if (seqEl2) seqEl2.value = text;
                 seqWidget.callback?.(text);
-                tlNoteEdit();      // one undo step per edit
-                void refresh();
             }
             function entryLines() {
                 // indices of entry lines (not comments, not the loop
@@ -4641,6 +4958,51 @@ app.registerExtension({
             function removeEntry(i) {
                 const lines = currentLines();
                 lines.splice(entryLines()[i], 1);
+                setSequence(lines.join("\n"));
+            }
+            // The clip's ✕: take it out and leave its time as empty space,
+            // so nothing after it moves. Exactly its PLAYED length, merged
+            // with any empty space already beside it, and the neighbours
+            // keep playing the frames they played: a join the removed clip
+            // derived (a parent cut where the clip continued it, a child
+            // entered where it led in) is written down as a cut, because
+            // empty space breaks lineage and would otherwise hand those
+            // frames back and shift everything after.
+            // Plainly removed instead where a hole would be wrong: with no
+            // clip after it (nothing would move), or at either end of a
+            // looping cut (a ring cannot start or end on empty space).
+            function deleteClip(i) {
+                const es = tlParseSequence(seqWidget.value);
+                const e = es[i], r = lastEntries[i];
+                if (!e || e.gap != null) return;
+                const clipBefore = es.slice(0, i).some((x) => x.gap == null);
+                const clipAfter = es.slice(i + 1).some((x) => x.gap == null);
+                if (!clipAfter || (loopOn() && !clipBefore)
+                        || !r || r.clip !== e.clip) {
+                    removeEntry(i);
+                    return;
+                }
+                const played = Math.max(1, Math.round(
+                    (r.exit ?? r.frames) - (r.enter ?? 0)));
+                const lines = currentLines();
+                const map = entryLines();
+                const L = es[i - 1], R = es[i + 1];
+                const rl = lastEntries[i - 1], rr = lastEntries[i + 1];
+                if (L && L.gap == null && L.exitOverride == null
+                        && rl?.exit != null) {
+                    L.exitOverride = rl.exit;
+                    lines[map[i - 1]] = tlFormatLine(L);
+                }
+                if (R && R.gap == null && R.enterOverride == null && rr?.enter) {
+                    R.enterOverride = rr.enter;
+                    lines[map[i + 1]] = tlFormatLine(R);
+                }
+                let gap = played;
+                const drop = [];
+                if (L?.gap != null) { gap += L.gap; drop.push(map[i - 1]); }
+                if (R?.gap != null) { gap += R.gap; drop.push(map[i + 1]); }
+                lines[map[i]] = `~ ${gap}`;
+                for (const k of drop.sort((a, b) => b - a)) lines.splice(k, 1);
                 setSequence(lines.join("\n"));
             }
             function reorderEntry(from, to) {
@@ -5772,15 +6134,13 @@ app.registerExtension({
                 const pstD = shownPin();
                 const pinGaps = new Set();
                 if (pstD) {
-                    const k = entries.findIndex(
-                        (en) => en.clip === pstD.source);
+                    const k = pinIdx(pstD, false, entries);
                     if (k >= 0) {
                         pinGaps.add(pstD.role === "prepend"
                             ? k : k + 1);
                     }
                     if (pstD.role === "bridge") {
-                        const k2 = entries.findIndex(
-                            (en) => en.clip === pstD.source2);
+                        const k2 = pinIdx(pstD, true, entries);
                         if (k2 >= 0) pinGaps.add(k2);
                     }
                 }
@@ -6071,7 +6431,8 @@ app.registerExtension({
                         // ink on a light page, light on a dark one --
                         // so it reads on both.
                         background: atPin ? TL_ROLE.extend.bg
-                            : hasLink ? TL_COLORS[seam.kind] : PAL.sub,
+                            : hasLink && !seam.jump ? TL_COLORS[seam.kind]
+                            : PAL.sub,
                         boxShadow: "0 0 0 2px rgba(0,0,0,0.35)",
                         transition: "height 0.1s",
                         pointerEvents: "none",
@@ -6228,9 +6589,10 @@ app.registerExtension({
                 const n = entries.length;
                 const wrap = loopOn() && n > 0 && (i === 0 || i === n)
                     && entries[0].gap == null && entries[n - 1].gap == null;
-                const L = i > 0 ? entries[i - 1]
-                    : wrap ? entries[n - 1] : null;
-                const R = i < n ? entries[i] : wrap ? entries[0] : null;
+                const Li = i > 0 ? i - 1 : wrap ? n - 1 : -1;
+                const Ri = i < n ? i : wrap ? 0 : -1;
+                const L = Li >= 0 ? entries[Li] : null;
+                const R = Ri >= 0 ? entries[Ri] : null;
                 const pop = document.createElement("div");
                 seamPopup = pop;
                 const stripTop = timelineWrap.offsetTop +
@@ -6311,8 +6673,8 @@ app.registerExtension({
                         // ALREADY active the item wears the pin purple
                         // and clicking it again clears the pin
                         const cur = pinState();
-                        const genActive = pinHasRole(
-                            side.gen.clip, cur, side.gen.role);
+                        const genActive = pinHasRoleAt(
+                            side.gen.idx, cur, side.gen.role, entries);
                         const g = item(parent,
                             side.gen.role === "extend"
                                 ? "+ extend new" : "+ prepend new",
@@ -6326,7 +6688,7 @@ app.registerExtension({
                             + (side.gen.pixel
                                 ? " (no mctx sidecar: VAE-encoded from "
                                   + "pixels, soft continuity)" : ""),
-                            () => togglePinFor(side.gen.clip,
+                            () => togglePinAt(side.gen.idx,
                                               side.gen.role));
                         g.style.color = genActive
                             ? (PAL.light ? "#5e3a9e"
@@ -6343,7 +6705,7 @@ app.registerExtension({
                     }
                     // ... and a section left empty by that must say so,
                     // or it renders as a bare heading
-                    if (!side.items.length
+                    if (!side.items.length && !side.elsewhere?.length
                             && !(side.gen && !upscaleMode())) {
                         const n = document.createElement("div");
                         n.textContent = "none found";
@@ -6355,6 +6717,57 @@ app.registerExtension({
                         item(parent, c.clip, c.clip,
                              () => side.act(c.clip));
                     }
+                    // Takes of the same file that join somewhere ELSE in
+                    // it -- another part's edge, or a point this part's
+                    // cut no longer reaches. Still offered (the choice is
+                    // yours), but apart and dimmed, saying where they
+                    // join: put here, the join jumps and plays as a cut.
+                    if (side.elsewhere?.length) {
+                        const h2 = document.createElement("div");
+                        h2.textContent = "joins elsewhere";
+                        Object.assign(h2.style, {
+                            color: PAL.sub, margin: "4px 0 2px",
+                            fontSize: "10px", letterSpacing: "0.05em",
+                        });
+                        parent.appendChild(h2);
+                        for (const c of side.elsewhere) {
+                            const it = item(parent,
+                                `${c.clip.split("/").pop()} (at ${c.at})`,
+                                `${c.clip}\ncontinues from frame ${c.at} of `
+                                + `${side.edgeName}, which ${side.edgeWord} `
+                                + `at ${side.edgeAt} here -- put here, `
+                                + "the join plays as a cut",
+                                () => side.act(c.clip));
+                            it.style.opacity = "0.55";
+                        }
+                    }
+                };
+                // Split a side's lineage candidates into the ones that
+                // join on the seam's own edge and the ones that join
+                // elsewhere in the same file. `e` is the seam's clip on
+                // that side, `side` "after" when the candidates follow
+                // it (they extend it), "before" when they lead into it.
+                // Only that relation has a frame to check: the other
+                // (e extends / prepends into the candidate) puts the
+                // candidate on the far side of e's own recorded join.
+                const splitFits = (list, e, side) => {
+                    const fit = [], elsewhere = [];
+                    for (const c of list) {
+                        const link = side === "after"
+                            ? tlExtendParent(c.meta) : tlPrependChild(c.meta);
+                        if (!e?.meta || link?.id !== e.meta.self_id
+                                || tlJoinFits(e, c.meta, side)) {
+                            fit.push(c);
+                            continue;
+                        }
+                        elsewhere.push({ ...c, at: link.join
+                            - (Number(e.meta.pinned_head_frames) || 0) });
+                    }
+                    return { items: fit, elsewhere,
+                             edgeName: e ? partLabel(entries.indexOf(e)) : "",
+                             edgeWord: side === "after" ? "ends" : "starts",
+                             edgeAt: side === "after"
+                                 ? (e?.exit ?? e?.frames) : (e?.enter ?? 0) };
                 };
 
                 pop.textContent = "";
@@ -6370,7 +6783,7 @@ app.registerExtension({
                 if (atEnd && !upscaleMode() && tlPinGrade(endL)
                         && tlPinGrade(endR)) {
                     const cur = pinState();
-                    const active = impliesLoop(cur);
+                    const active = impliesLoop(cur, entries);
                     const same = endL.clip === endR.clip;
                     const g = item(pop,
                         active ? "✓ loop take armed" : "+ loop new",
@@ -6384,8 +6797,9 @@ app.registerExtension({
                                  : " and makes the sequence loop"),
                         () => {
                             if (active) { setPinState(null); return; }
-                            setBridge({ role: "bridge", source: endL.clip,
-                                        source2: endR.clip,
+                            setBridge({ role: "bridge",
+                                        ...pinAt(n - 1, false, entries),
+                                        ...pinAt(0, true, entries),
                                         window: cur?.window ?? "22" });
                         });
                     g.style.fontWeight = "600";
@@ -6422,20 +6836,20 @@ app.registerExtension({
                 if (hasLink) {
                     sides.push({
                         title: "replace left side",
-                        items: cand.filter((c) => c.clip !== L.clip &&
-                            linkedMeta(c.meta, R.meta)),
+                        ...splitFits(cand.filter((c) => c.clip !== L.clip &&
+                            linkedMeta(c.meta, R.meta)), R, "before"),
                         act: (clip) => replaceAt(wrap ? n - 1 : i - 1, clip),
                         gen: tlPinGrade(R)
-                            ? { clip: R.clip, role: "prepend",
+                            ? { clip: R.clip, idx: Ri, role: "prepend",
                                 pixel: tlPinGrade(R) === "pixel" } : null,
                     });
                     sides.push({
                         title: "replace right side",
-                        items: cand.filter((c) => c.clip !== R.clip &&
-                            linkedMeta(L.meta, c.meta)),
+                        ...splitFits(cand.filter((c) => c.clip !== R.clip &&
+                            linkedMeta(L.meta, c.meta)), L, "after"),
                         act: (clip) => replaceAt(wrap ? 0 : i, clip),
                         gen: tlPinGrade(L)
-                            ? { clip: L.clip, role: "extend",
+                            ? { clip: L.clip, idx: Li, role: "extend",
                                 pixel: tlPinGrade(L) === "pixel" } : null,
                     });
                 } else {
@@ -6450,20 +6864,20 @@ app.registerExtension({
                     if (tlPinGrade(R)) {
                         sides.push({
                             title: "insert before",
-                            items: R.meta ? cand.filter((c) =>
-                                linkedMeta(c.meta, R.meta)) : [],
+                            ...splitFits(R.meta ? cand.filter((c) =>
+                                linkedMeta(c.meta, R.meta)) : [], R, "before"),
                             act: (clip) => insertAtGap(clip, wrap ? 0 : i),
-                            gen: { clip: R.clip, role: "prepend",
+                            gen: { clip: R.clip, idx: Ri, role: "prepend",
                                    pixel: tlPinGrade(R) === "pixel" },
                         });
                     }
                     if (tlPinGrade(L)) {
                         sides.push({
                             title: "insert after",
-                            items: L.meta ? cand.filter((c) =>
-                                linkedMeta(L.meta, c.meta)) : [],
+                            ...splitFits(L.meta ? cand.filter((c) =>
+                                linkedMeta(L.meta, c.meta)) : [], L, "after"),
                             act: (clip) => insertAtGap(clip, wrap ? n : i),
-                            gen: { clip: L.clip, role: "extend",
+                            gen: { clip: L.clip, idx: Li, role: "extend",
                                    pixel: tlPinGrade(L) === "pixel" },
                         });
                     }
@@ -6651,6 +7065,103 @@ app.registerExtension({
                               : Math.max(lo, Math.min(e.frames, snapped)));
             }
 
+            // ---- split at the playhead --------------------------------
+            // One line becomes two lines of the SAME file, the left one
+            // exiting and the right one entering at the playhead's frame.
+            // Nothing is re-encoded, so a split costs nothing and the
+            // halves can then be moved, cut or deleted on their own. The
+            // join between them is back-to-back (a file never extends
+            // itself), which plays straight on because the frames are
+            // consecutive.
+            // null when the playhead is not on a clip; {blocked, why}
+            // when it is but no split point lies strictly inside it.
+            function playheadSplit() {
+                const f = displayFrame();
+                if (f == null || !cumStarts.length) return null;
+                const g = Math.max(0, Math.round(f));
+                const i = clipAt(g);
+                const e = lastEntries?.[i];
+                if (!e || e.gap != null) return null;
+                const name = e.clip.split("/").pop();
+                const lo = e.enter, hi = e.exit ?? e.frames;
+                const within = g - cumStarts[i] + lo;
+                if (within <= lo || within >= hi) {
+                    return { idx: i, blocked: true, name,
+                             why: "Move the playhead off the clip's edge "
+                                  + "to split it" };
+                }
+                // With snap cuts on, on the grid a TAIL cut uses: the
+                // left half's end is the one a pin continues from
+                // ("extend clip" on it regenerates what follows).
+                const at = splitPoint(within, e, lo, hi);
+                if (at == null) {
+                    return { idx: i, blocked: true, name,
+                             why: "No snap point inside this clip -- turn "
+                                  + "snap cuts off to split it here" };
+                }
+                return { idx: i, blocked: false, at, name };
+            }
+            function splitPoint(within, e, lo, hi) {
+                if (!snapOn()) return within;
+                let best = null;
+                for (const s of tlCutStops(e.meta, e.frames, true, "exit")) {
+                    if (s <= lo || s >= hi) continue;
+                    if (best == null
+                            || Math.abs(s - within) < Math.abs(best - within)) {
+                        best = s;
+                    }
+                }
+                return best;
+            }
+            function applyPlayheadSplit() {
+                const t = playheadSplit();
+                if (!t || t.blocked) return;
+                splitEntry(t.idx, t.at);
+            }
+            // The left half keeps the join in front of the clip (its
+            // enter, and the per-seam settings, which live on the clip
+            // to the right of a join); the right half keeps the clip's
+            // exit. Either may be a derived one: an override that was
+            // not there is not invented.
+            // Both halves get part ids -- the left keeps the line's own
+            // -- so pins and takes can tell them apart. A pin on the
+            // split clip follows the EDGE it continues from: an extend
+            // leaves from the clip's end, which is now the right half's;
+            // a prepend arrives at its start, which stays the left's.
+            function splitEntry(i, at) {
+                const es = tlParseSequence(seqWidget.value);
+                const e = es[i];
+                if (!e || e.gap != null) return;
+                const lines = currentLines();
+                const map = entryLines();
+                if (map[i] == null) return;
+                const taken = new Set(es.map((p) => p.part).filter(Boolean));
+                const leftId = e.part ?? tlNewPart(taken);
+                taken.add(leftId);
+                const rightId = tlNewPart(taken);
+                const left = { ...e, exitOverride: at, part: leftId };
+                const right = { ...e, enterOverride: at, seamOpts: {},
+                                part: rightId };
+                const cur = pinState();
+                if (cur) {
+                    const next = { ...cur };
+                    // `second` = the bridge's arriving side (source2)
+                    for (const second of [false, true]) {
+                        if (pinIdx(cur, second, es) !== i) continue;
+                        const leaves = second ? false
+                            : cur.role === "extend" || cur.role === "bridge";
+                        next[second ? "part2" : "part"] =
+                            leaves ? rightId : leftId;
+                    }
+                    // written directly: the sequence write below
+                    // refreshes, and the two are one edit
+                    if (psWidget) psWidget.value = JSON.stringify(next);
+                }
+                lines.splice(map[i], 1, tlFormatLine(left),
+                             tlFormatLine(right));
+                setSequence(lines.join("\n"));
+            }
+
             // The pin continues from the CUT, not from the clip's own
             // edge -- so pin_state has to carry it. Derived from the
             // sequence on every refresh rather than written once at
@@ -6660,9 +7171,10 @@ app.registerExtension({
             function syncPinCut(entries) {
                 const st = pinState();
                 if (!st || !psWidget) return;
-                const cutOf = (clip, side) => {
-                    const e = entries.find(
-                        (x) => x.gap == null && x.clip === clip);
+                // the pinned OCCURRENCE's cut: each half of a split clip
+                // has its own
+                const cutOf = (second, side) => {
+                    const e = entries[pinIdx(st, second, entries)];
                     if (!e) return null;
                     const v = side === "exit" ? e.exitOverride
                                               : e.enterOverride;
@@ -6674,12 +7186,12 @@ app.registerExtension({
                 if (st.role === "bridge") {
                     // the extend side leaves `source`, the prepend side
                     // arrives at `source2`
-                    const a = cutOf(st.source, "exit");
-                    const b = cutOf(st.source2, "enter");
+                    const a = cutOf(false, "exit");
+                    const b = cutOf(true, "enter");
                     if (a != null) next.cut = a;
                     if (b != null) next.cut2 = b;
                 } else {
-                    const a = cutOf(st.source,
+                    const a = cutOf(false,
                                     st.role === "prepend" ? "enter" : "exit");
                     if (a != null) next.cut = a;
                 }
@@ -7003,8 +7515,8 @@ app.registerExtension({
                     && !upscaleMode();
                 const cur0 = shownPin();
                 const isThis = canBridge && cur0?.role === "bridge"
-                    && cur0.source === left.clip
-                    && cur0.source2 === right.clip;
+                    && pinIdx(cur0, false, entries) === i - 1
+                    && pinIdx(cur0, true, entries) === i + 1;
                 const bridge = gapBtn("+", canBridge
                     ? TL_ROLE.extend.bg : "rgba(127,127,127,0.35)", "13px");
                 // a little air between the two, or they read as one
@@ -7046,8 +7558,9 @@ app.registerExtension({
                         ev.stopPropagation();
                         const cur = pinState();
                         setPinState(isThis ? null : {
-                            role: "bridge", source: left.clip,
-                            source2: right.clip,
+                            role: "bridge",
+                            ...pinAt(i - 1, false, entries),
+                            ...pinAt(i + 1, true, entries),
                             window: cur?.window ?? "22",
                         });
                     });
@@ -7131,6 +7644,41 @@ app.registerExtension({
                 for (const e of entries) {
                     if (e.enterOverride !== null) e.enter = e.enterOverride;
                     if (e.exitOverride !== null) e.exit = e.exitOverride;
+                }
+                // ...and a manual cut that disagrees with a lineage link
+                // makes the join JUMP: the left side stops somewhere
+                // other than where the right side continues from. The
+                // pill says so, exactly as the upscale decides it
+                // (nodes_joint.segment_breaks): a hand cut on either side
+                // that is not the natural join frame.
+                const jumpNote = (L, R, s) => {
+                    if (!s || s.kind !== "seamless" || !L?.meta) return s;
+                    const natural = s.exitL
+                        ?? (Number(L.meta.delivered_frames) || 0);
+                    const exitJump = L.exitOverride !== null
+                        && L.exitOverride !== natural;
+                    const enterJump = R.enterOverride !== null
+                        && R.enterOverride !== (s.enterR || 0);
+                    if (!exitJump && !enterJump) return s;
+                    return { ...s, jump: true,
+                             note: (exitJump
+                                 ? `cut at ${L.exitOverride}, but the next `
+                                   + `clip continues from ${natural}`
+                                 : `cut to start at ${R.enterOverride}, but `
+                                   + `it continues from ${s.enterR || 0}`)
+                                 + ": plays (and upscales) as a cut" };
+                };
+                for (let i = 1; i < entries.length; i++) {
+                    if (entries[i].seam) {
+                        entries[i].seam = jumpNote(entries[i - 1],
+                                                   entries[i],
+                                                   entries[i].seam);
+                    }
+                }
+                if (entries[0]?.wrapSeam) {
+                    entries[0].wrapSeam = jumpNote(
+                        entries[entries.length - 1], entries[0],
+                        entries[0].wrapSeam);
                 }
                 syncPinCut(entries);
 
@@ -7310,22 +7858,21 @@ app.registerExtension({
                     // pin itself is toggled from the selected-clip bar
                     // or the seam popups.
                     const pst = shownPin();
-                    const pinnedRole = pinRoleFor(e.clip, pst);
+                    // by ENTRY: of a clip split in two, only the half the
+                    // pin names wears the badge
+                    const pinnedRole = pinRoleAt(i, pst, entries);
                     // the clip occupying the GAP(s) the pin regenerates
                     // gets replaced on add -- fade it as a preview.
                     // Gap-based, either lineage direction: prepending
                     // into S also displaces S's extend-PARENT (both are
                     // lead-ins for the same boundary). A bridge checks
                     // both of its sides.
-                    const exClip = pst && pst.role !== "prepend"
-                        ? pst.source : null;
-                    const prClip = !pst ? null
-                        : pst.role === "bridge" ? pst.source2
-                        : pst.role === "prepend" ? pst.source : null;
-                    const exMeta = exClip ? entries.find((en) =>
-                        en.clip === exClip)?.meta : null;
-                    const prMeta = prClip ? entries.find((en) =>
-                        en.clip === prClip)?.meta : null;
+                    const exIdx = pst && pst.role !== "prepend"
+                        ? pinIdx(pst, false, entries) : -1;
+                    const prIdx = !pst ? -1
+                        : pst.role === "bridge" ? pinIdx(pst, true, entries)
+                        : pst.role === "prepend" ? pinIdx(pst, false, entries)
+                        : -1;
                     // Lineage alone is NOT enough: a clip keeps its
                     // lineage wherever you drag it, so a bare
                     // linkedMeta() check left it faded after it had been
@@ -7334,9 +7881,9 @@ app.registerExtension({
                     // -- i.e. it is the immediate neighbour on that side
                     // right now, with the link live.
                     const willReplace =
-                        tlOccupant(entries, exClip, "after",
+                        tlOccupant(entries, exIdx, "after",
                                    linkedMeta)?.entry === e ||
-                        tlOccupant(entries, prClip, "before",
+                        tlOccupant(entries, prIdx, "before",
                                    linkedMeta)?.entry === e;
                     if (willReplace) {
                         block.style.opacity = "0.45";
@@ -7371,15 +7918,15 @@ app.registerExtension({
                         // per SIDE, not per role: a clip bridged onto
                         // itself carries both
                         mkBar("left",
-                            pinHasRole(e.clip, pst, "prepend")
+                            pinHasRoleAt(i, pst, "prepend", entries)
                                 ? TL_ROLE.prepend.bg
-                                : seamL?.kind === "seamless"
+                                : seamL?.kind === "seamless" && !seamL.jump
                                     ? TL_COLORS.seamless
                                     : TL_COLORS.butt),
                         mkBar("right",
-                            pinHasRole(e.clip, pst, "extend")
+                            pinHasRoleAt(i, pst, "extend", entries)
                                 ? TL_ROLE.extend.bg
-                                : seamR?.kind === "seamless"
+                                : seamR?.kind === "seamless" && !seamR.jump
                                     ? TL_COLORS.seamless
                                     : TL_COLORS.butt));
                     const pinSlot = document.createElement("span");
@@ -7400,8 +7947,7 @@ app.registerExtension({
                         });
                         // the take that closes a loop wears its own
                         // word on both clips it touches (or the one)
-                        const looping = impliesLoop(pst) &&
-                            (pst.source === e.clip || pst.source2 === e.clip);
+                        const looping = impliesLoop(pst, entries);
                         pb.textContent = looping ? "looping"
                             : pinnedRole === "extend"
                                 ? "extending" : "prepending";
@@ -7424,8 +7970,9 @@ app.registerExtension({
                     });
                     name.style.flex = "1";
                     const closeBtn = mini("✕",
-                        "Remove from the sequence",
-                        () => removeEntry(i));
+                        "Remove from the sequence, leaving its time as "
+                        + "empty space (nothing after it moves)",
+                        () => deleteClip(i));
                     closeBtn.style.font = "9px/13px sans-serif";
                     closeBtn.style.marginRight = "2px";
                     closeBtn.style.marginTop = "-1px";
@@ -7655,13 +8202,30 @@ app.registerExtension({
                 // a pin whose clip left the sequence is stale: clear it
                 // directly (setPinState would recurse into refresh)
                 const pst2 = pinState();
-                const inSeq = (c) =>
-                    entries.some((en) => en.clip === c);
-                if (pst2 && (!inSeq(pst2.source) ||
+                if (pst2 && (pinIdx(pst2, false, entries) < 0 ||
                         (pst2.role === "bridge" &&
-                         !inSeq(pst2.source2)))) {
+                         pinIdx(pst2, true, entries) < 0))) {
                     if (psWidget) psWidget.value = "";
+                    // said in the pin row until the next pin, because a
+                    // pin that vanishes is otherwise easy to miss
+                    // name the side that is gone (a bridge has two)
+                    const second = pinIdx(pst2, false, entries) >= 0;
+                    const part = second ? pst2.part2 : pst2.part;
+                    const file = String(second ? pst2.source2 : pst2.source)
+                        .split("/").pop();
+                    pinGoneNote = `the pinned ${part ? "part of " : ""}`
+                        + `${file} left the cut`;
+                    pinGoneTip = part
+                        ? "The pin named a part of this clip that is no "
+                          + "longer in the cut, so it was cleared rather "
+                          + "than moved onto another part. Pin the part "
+                          + "you want again."
+                        : "The pinned clip is no longer in the cut, so the "
+                          + "pin was cleared. Pin a clip again to extend or "
+                          + "prepend from it.";
                     tldbg("pin cleared: its clip left the sequence");
+                } else if (pst2) {
+                    pinGoneNote = "";
                 }
                 // repainted on every strip render, not only on a click:
                 // "load settings" writes widget values straight in, and
@@ -7735,78 +8299,82 @@ app.registerExtension({
             // Shared pin toggle: the ONLY writers of pin_state are this
             // (via the info-bar toggles and the seam popups' "generate
             // new" items) -- the strip blocks just wear a status badge.
-            function togglePinFor(clip, role) {
+            // Everything here is by ENTRY index into the rendered list:
+            // the pin records which part of its file it means.
+            function togglePinAt(i, role) {
+                const es = lastEntries;
+                const e = es?.[i];
+                if (!e || e.gap != null) return;
+                const clip = e.clip;
                 const cur = pinState();
                 const w = cur?.window ?? "22";
-                if (pinHasRole(clip, cur, role)) {
+                // one of the current pin's sides, re-keyed for the slot
+                // it takes in the new state (`second` = source2/part2)
+                const side = (src, part, second) => ({
+                    [second ? "source2" : "source"]: src,
+                    ...(part ? { [second ? "part2" : "part"]: part } : {}),
+                });
+                const curSrc = cur ? side(cur.source, cur.part, false) : {};
+                if (pinHasRoleAt(i, cur, role)) {
                     // toggling an ACTIVE side off: a bridge keeps its
                     // other side as a single pin, a single pin clears
                     if (cur.role === "bridge") {
                         setPinState(role === "extend"
-                            ? { source: cur.source2, role: "prepend",
-                                window: w }
-                            : { source: cur.source, role: "extend",
-                                window: w });
+                            ? { ...side(cur.source2, cur.part2, false),
+                                role: "prepend", window: w }
+                            : { ...curSrc, role: "extend", window: w });
                     } else {
                         setPinState(null);
                     }
                     return;
                 }
-                // opposite-side single pin already set on another clip
+                // opposite-side single pin already set on another entry
                 // -> combine into a bridge (extend side = source,
                 // prepend side = source2)
-                // ...or on the SAME clip when it is the only one on the
+                // ...or on the SAME entry when it is the only one on the
                 // strip: extending its tail and prepending its head in
                 // one run is the take that loops it onto itself
-                const alone = lastEntries?.length === 1 &&
-                    lastEntries[0].clip === clip;
+                const alone = es.length === 1;
                 if (cur && cur.role !== "bridge" &&
-                        (clip !== cur.source || alone) && cur.role ===
+                        (i !== pinIdx(cur) || alone) && cur.role ===
                         (role === "extend" ? "prepend" : "extend")) {
                     setBridge(role === "extend"
-                        ? { role: "bridge", source: clip,
-                            source2: cur.source, window: w }
-                        : { role: "bridge", source: cur.source,
-                            source2: clip, window: w });
+                        ? { role: "bridge", ...pinAt(i),
+                            ...side(cur.source, cur.part, true), window: w }
+                        : { role: "bridge", ...curSrc, ...pinAt(i, true),
+                            window: w });
                     return;
                 }
                 // fresh pin. If it would REPLACE a clip that is linked
                 // on BOTH sides (regenerating the middle of a chain),
                 // auto-upgrade to a bridge so the new take binds to
-                // both neighbors.
-                const meta = lastEntries?.find(
-                    (en) => en.clip === clip)?.meta;
-                if (meta && lastEntries) {
-                    if (role === "extend") {
-                        const occ = lastEntries.find((en) =>
-                            en.clip !== clip && en.meta &&
-                            linkedMeta(meta, en.meta));
-                        const far = occ && lastEntries.find((en) =>
-                            en !== occ && en.clip !== clip &&
-                            en.meta && linkedMeta(occ.meta, en.meta));
-                        if (far) {
-                            setPinState({ role: "bridge",
-                                          source: clip,
-                                          source2: far.clip,
-                                          window: w });
-                            return;
-                        }
-                    } else {
-                        const occ = lastEntries.find((en) =>
-                            en.clip !== clip && en.meta &&
-                            linkedMeta(en.meta, meta));
-                        const far = occ && lastEntries.find((en) =>
-                            en !== occ && en.clip !== clip &&
-                            en.meta && linkedMeta(en.meta, occ.meta));
-                        if (far) {
-                            setPinState({ role: "bridge",
-                                          source: far.clip,
-                                          source2: clip, window: w });
-                            return;
-                        }
+                // both neighbors. Positional, like the faded preview of
+                // what the run replaces: the clip it would replace is
+                // the live neighbour on that side, and the far clip is
+                // the one that neighbour leads into right there. (Read
+                // by lineage anywhere in the cut, the first part of a
+                // split clip heading a chain bridged into the chain's
+                // far end, although its neighbour is its own other part.)
+                const o = tlOccupant(es, i,
+                    role === "extend" ? "after" : "before", linkedMeta);
+                if (o) {
+                    const f = role === "extend" ? o.idx + 1 : o.idx - 1;
+                    const far = es[f];
+                    const binds = far && far.gap == null && far.meta
+                        && far.clip !== clip
+                        && (role === "extend"
+                            ? linkedMeta(o.entry.meta, far.meta)
+                            : linkedMeta(far.meta, o.entry.meta));
+                    if (binds) {
+                        setPinState(role === "extend"
+                            ? { role: "bridge", ...pinAt(i),
+                                ...pinAt(f, true), window: w }
+                            : { role: "bridge", ...pinAt(f),
+                                ...pinAt(i, true), window: w });
+                        return;
                     }
                 }
-                setPinState({ source: clip, role, window: w });
+                setPinState({ ...pinAt(i), role, window: w });
             }
 
             const smallBtn = (label, title) => {
@@ -7939,7 +8507,9 @@ app.registerExtension({
                     // no pin: the same surface as the clip-info box, so
                     // "nothing special is happening" looks like the
                     // resting chrome rather than an announcement
-                    value.textContent = "root generation (no pin)";
+                    value.textContent = "root generation (no pin)"
+                        + (pinGoneNote ? ` -- ${pinGoneNote}` : "");
+                    value.title = pinGoneNote ? pinGoneTip : "";
                     value.style.color = PAL.sub;
                     value.style.background = PAL.rest;
                     value.style.borderColor = PAL.edge;
@@ -7949,15 +8519,16 @@ app.registerExtension({
                     frame.append(value, durWrap);
                     return;
                 }
-                const shortName = st.source.split("/").pop();
+                // names say WHICH part when the file is in the cut more
+                // than once (a split clip)
+                const shortName = pinName(st);
                 value.textContent = st.role === "bridge"
                     ? (impliesLoop(st)
-                        ? (st.source === st.source2
+                        ? (lastEntries?.length === 1
                             ? `loops ${shortName} onto itself`
                             : `loops: bridges ${shortName} → `
-                              + st.source2.split("/").pop())
-                        : `bridges ${shortName} → `
-                          + st.source2.split("/").pop())
+                              + pinName(st, true))
+                        : `bridges ${shortName} → ` + pinName(st, true))
                     : st.role === "extend"
                         ? `extends ${shortName}`
                         : `prepends into ${shortName}`;
@@ -8087,7 +8658,8 @@ app.registerExtension({
             // last click sits on) -- no separate selection state.
             function renderClipInfo() {
                 infoIdx = lastHighlight;
-                const e = lastEntries?.[lastHighlight];
+                const idx = lastHighlight;
+                const e = lastEntries?.[idx];
                 infoRow.replaceChildren();
                 // the clip-surfaced box holds the text; the toggles sit
                 // OUTSIDE it, to its right
@@ -8146,7 +8718,7 @@ app.registerExtension({
                 // active, not framed buttons -- they read as part of
                 // the bar itself
                 const mkToggle = (role, label, title) => {
-                    const active = pinHasRole(e.clip, pst, role);
+                    const active = pinHasRoleAt(idx, pst, role);
                     const b = document.createElement("button");
                     b.textContent = label;
                     b.title = pixel
@@ -8185,7 +8757,7 @@ app.registerExtension({
                     });
                     b.addEventListener("click", (ev) => {
                         ev.stopPropagation();
-                        togglePinFor(e.clip, role);
+                        togglePinAt(idx, role);
                     });
                     return b;
                 };
@@ -8475,21 +9047,23 @@ app.registerExtension({
                 // multi-pin aware: a bridge take aims after its
                 // extend-parent (its prepend-side neighbor is then the
                 // gap occupant placeClip resolves against)
+                // Of a parent split into parts, the part the take was
+                // pinned to (or whose cut the take joins at).
                 const m = p.meta;
-                const ex = tlExtendParent(m);
-                const pr = tlPrependChild(m);
-                let k = ex ? lastEntries.findIndex((e) =>
-                    e.meta && e.meta.self_id === ex.id) : -1;
+                const st = pinState();
+                let k = tlParentIdx(lastEntries, m, "after",
+                    st && st.role !== "prepend" ? pinIdx(st) : -1);
                 if (k >= 0) {
                     return { at: k + 1, parentIdx: k, side: "after",
-                             label: "after " + clipBase(lastEntries[k].clip),
+                             label: "after " + partLabel(k),
                              tail: k === lastEntries.length - 1 };
                 }
-                k = pr ? lastEntries.findIndex((e) =>
-                    e.meta && e.meta.self_id === pr.id) : -1;
+                k = tlParentIdx(lastEntries, m, "before",
+                    !st ? -1 : st.role === "prepend" ? pinIdx(st)
+                        : st.role === "bridge" ? pinIdx(st, true) : -1);
                 if (k >= 0) {
                     return { at: k, parentIdx: k, side: "before",
-                             label: "before " + clipBase(lastEntries[k].clip),
+                             label: "before " + partLabel(k),
                              tail: false };
                 }
                 return { at: lastEntries.length, parentIdx: -1,
@@ -8523,24 +9097,75 @@ app.registerExtension({
             // Only the PIN's own cut is rewritten. An unrelated manual
             // cut on the same clip is a decision about something else
             // and has to survive being extended from.
-            function reconcileParentCut(meta) {
+            //
+            // A take made from a part-id'd line knows its part and the
+            // cut it was QUEUED at (tlTakePart), so "is this the pin's
+            // cut?" is answered exactly:
+            //   - its part is gone: no cut is touched, and the note says
+            //     where the take went instead;
+            //   - the part's cut is still the queued one: only the grid
+            //     moved it (or nothing did) -- the old rewrite, quietly;
+            //   - the cut was changed while the take generated: that was
+            //     a decision, so it is ASKED about, never overwritten.
+            // An older take has none of this and keeps the old proof.
+            async function reconcileParentCut(meta) {
                 const ex = tlExtendParent(meta);
                 if (!ex) return null;
-                const i = lastEntries.findIndex(
-                    (e) => e.meta && e.meta.self_id === ex.id);
+                const st = pinState();
+                const rec = tlTakePart(meta, "after");
+                const i = tlParentIdx(lastEntries, meta, "after",
+                    st && st.role !== "prepend" ? pinIdx(st) : -1);
                 const e = i >= 0 ? lastEntries[i] : null;
-                if (!e || e.exitOverride == null) return null;
+                if (!e) return null;
                 // delivered coordinates, exactly as tlDeriveSeam maps
                 // them: the parent's own pinned head offsets the join
                 const exitF = ex.join
                     - (Number(e.meta.pinned_head_frames) || 0);
                 const delivered = Number(e.meta.delivered_frames) || 0;
                 const was = e.exitOverride;
-                if (was === exitF) return null;
+                // a join at the clip's own end needs no cut at all
+                const wanted = exitF === delivered ? null : exitF;
+                if (rec && e.part !== rec.part) {
+                    if (tlJoinFits(e, meta, "after")) return null;
+                    return `the part of ${clipBase(e.clip)} this take `
+                        + "continued is no longer in the cut; it goes after "
+                        + `${partLabel(i)}, which ends elsewhere, so that `
+                        + "join plays as a cut";
+                }
+                if (rec) {
+                    if ((was ?? null) === (rec.cut ?? null)) {
+                        if (was == null || was === exitF) return null;
+                        setCut(i, { exit: wanted });
+                        return `${partLabel(i)} now ends at ${exitF}`
+                            + ` instead of ${was}: the 17-frame grid moved`
+                            + " the take's start";
+                    }
+                    if ((was ?? null) === wanted) return null;
+                    const from = rec.cut == null ? "its end" : `frame ${rec.cut}`;
+                    const now = was == null ? "its end" : `frame ${was}`;
+                    const back = wanted == null ? "its end" : `frame ${exitF}`;
+                    if (await tlAskChoice({
+                            title: `${partLabel(i)} was cut again`,
+                            message: `It was cut at ${from} when this take `
+                                + `was queued, and is cut at ${now} now. The `
+                                + `take continues from ${back}.\n\n`
+                                + `Cut it at ${back} again and the join is `
+                                + "seamless. Keep your cut and the join plays "
+                                + "as a cut.",
+                            yes: `Cut at ${back} again`,
+                            no: "Keep my cut",
+                        })) {
+                        setCut(i, { exit: wanted });
+                        return `${partLabel(i)} cut at ${back} again, where `
+                            + "this take continues from";
+                    }
+                    return `kept your cut on ${partLabel(i)}; this take `
+                        + `continues from ${back}, so that join plays as a cut`;
+                }
+                if (was == null || was === exitF) return null;
                 // Two ways to be sure this cut is the one the take was
                 // asked to continue from -- it only takes one.
-                const st = pinState();
-                const thePinsCut = !!st && st.source === e.clip
+                const thePinsCut = !!st && pinIdx(st) === i
                     && Number(st.cut) === was;
                 // The pin is gone after a reload, but the arithmetic
                 // still proves it: the take's join is exactly where the
@@ -8555,15 +9180,22 @@ app.registerExtension({
                 if (!thePinsCut && !gridMoved) {
                     return null;               // somebody else's cut
                 }
-                // a join at the clip's own end needs no cut at all
-                setCut(i, { exit: exitF === delivered ? null : exitF });
-                return `${clipBase(e.clip)} now ends at ${exitF}`
-                    + ` instead of ${was}: the 17-frame grid moved the`
-                    + " take's start";
+                setCut(i, { exit: wanted });
+                return `${partLabel(i)} now ends at ${exitF}`
+                    + ` instead of ${was}, where this take continues from`;
+            }
+            // A clip's name for a message, saying which part it is when
+            // the file stands in the cut more than once.
+            function partLabel(i) {
+                const e = lastEntries[i];
+                if (!e?.clip) return "";
+                const n = lastEntries.filter((x) => x.clip === e.clip).length;
+                return clipBase(e.clip) + (n < 2 ? ""
+                    : ` (part ${tlOccOf(lastEntries, i) + 1}/${n})`);
             }
 
-            function placeClip(clip, meta) {
-                const moved = reconcileParentCut(meta);
+            async function placeClip(clip, meta) {
+                const moved = await reconcileParentCut(meta);
                 const note = (msg) => (moved ? msg + " -- " + moved : msg);
                 const aim = aimFor({ clip, meta });
                 if (aim.parentIdx >= 0) {
@@ -8574,7 +9206,7 @@ app.registerExtension({
                     // elsewhere is a different position in the cut now,
                     // and must not be silently removed.
                     const held = tlOccupant(
-                        lastEntries, lastEntries[aim.parentIdx]?.clip,
+                        lastEntries, aim.parentIdx,
                         aim.side === "after" ? "after" : "before",
                         linkedMeta);
                     if (held && held.entry.clip !== clip) {
@@ -8666,7 +9298,7 @@ app.registerExtension({
                         return "already in the timeline";
                     }
                     const meta = await tlClipMeta(clip);
-                    const msg = placeClip(clip, meta);
+                    const msg = await placeClip(clip, meta);
                     const n = applySeamOptsMap(seamOpts);
                     return n
                         ? `${msg}, with ${n === 1 ? "its own seam settings"
@@ -8698,6 +9330,68 @@ app.registerExtension({
 // workflow save/reload.
 const RP_NODE = "H3ResultPreview";
 const RP_PREVIEW_NAME = "obvpm_h3_result";
+
+// ---- out of undo/redo -------------------------------------------------
+// What a Result Preview shows (the last result, whether it was added or
+// dismissed, its seam tuning, the live-preview toggle) is not an edit to
+// the workflow, so it must not be undone. The frontend's undo history is
+// whole-graph snapshots (ChangeTracker: activeState + undoQueue +
+// redoQueue, each a rootGraph.serialize()), and a node's properties ride
+// in them -- so a finished run became an undo step, and Ctrl+Z on an
+// unrelated edit brought back an older result. Leaving the properties out
+// of the snapshots is not an option: saving writes the same activeState.
+// So every snapshot is brought into line with the node instead: after
+// each change, the node's h3_* properties are copied into all of them.
+// A preview change then differs from no step (no undo entry of its own),
+// and restoring any step restores the preview as it is NOW. Node position
+// and size stay ordinary, undoable layout. Silently a no-op on a frontend
+// without these fields.
+function rpOutOfHistory(node) {
+    const tracker = app.extensionManager?.workflow?.activeWorkflow?.changeTracker;
+    const graph = node?.graph;
+    if (!tracker || !graph) return;
+    const root = app.rootGraph ?? app.graph;
+    const inRoot = graph === root;
+    // a node inside a subgraph lives in that subgraph's definition
+    if (!inRoot && graph.rootGraph !== root) return;   // another workflow
+    // Mid-load the active tracker may still be the PREVIOUS workflow's
+    // (the new graph is configured before the pointer moves), and two
+    // workflows share node ids -- so only a tracker whose snapshots are
+    // of THIS graph is touched. The load itself then snapshots the node
+    // as it is.
+    if (tracker.constructor?.isLoadingGraph) return;
+    if (tracker.activeState?.id && root?.id
+            && tracker.activeState.id !== root.id) {
+        return;
+    }
+    const props = {};
+    for (const [k, v] of Object.entries(node.properties ?? {})) {
+        if (k.startsWith("h3_")) props[k] = v == null ? v : JSON.parse(JSON.stringify(v));
+    }
+    const id = String(node.id);
+    const patch = (state) => {
+        const nodes = inRoot ? state?.nodes
+            : (state?.definitions?.subgraphs ?? [])
+                .find((s) => s.id === graph.id)?.nodes;
+        const n = (nodes ?? []).find((x) => String(x.id) === id);
+        if (!n) return;
+        n.properties = { ...(n.properties ?? {}) };
+        for (const [k, v] of Object.entries(props)) {
+            if (v === undefined) delete n.properties[k];
+            else n.properties[k] = v == null ? v : JSON.parse(JSON.stringify(v));
+        }
+    };
+    try {
+        patch(tracker.activeState);
+        for (const s of tracker.undoQueue ?? []) patch(s);
+        for (const s of tracker.redoQueue ?? []) patch(s);
+        // the unsaved-changes dot still follows it: a new result is
+        // worth saving, it just is not worth undoing
+        tracker.updateModified?.();
+    } catch (err) {
+        tldbg("result preview: could not keep it out of undo:", err);
+    }
+}
 
 // ---- whose run was that? -------------------------------------------
 // ComfyUI delivers `executed` by NODE ID into whichever workflow is open
@@ -9386,6 +10080,7 @@ function buildResultPreview(node) {
         if (own && Object.keys(own).length) all[clip] = own;
         else delete all[clip];
         node.properties.h3_seam_opts = all;
+        rpOutOfHistory(node);
     }
     function rpSetSeamOpt(clip, key, value) {
         const own = { ...rpSeamOptsFor(clip) };
@@ -9406,6 +10101,7 @@ function buildResultPreview(node) {
         }
         if (Object.keys(next).length !== Object.keys(all).length) {
             node.properties.h3_seam_opts = next;
+            rpOutOfHistory(node);
         }
     }
     // Once a join exists in a Timeline too, THAT is where its settings
@@ -9943,6 +10639,7 @@ function buildResultPreview(node) {
     function decide() {
         node.properties = node.properties || {};
         node.properties.h3_decided = current?.clip ?? null;
+        rpOutOfHistory(node);
     }
     function updateActionBtns() {
         if (decided()) {
@@ -10016,6 +10713,7 @@ function buildResultPreview(node) {
             for (const t of TL_REGISTRY.values()) t.forget(gone);
             current = null;
             node.properties.h3_result = null;
+            rpOutOfHistory(node);
             video.pause();
             video.removeAttribute("src");
             video.load();
@@ -10047,6 +10745,7 @@ function buildResultPreview(node) {
         lastShownAt = now;
         node.properties = node.properties || {};
         node.properties.h3_result = d;
+        rpOutOfHistory(node);
         void render(d);
     };
 
@@ -10074,6 +10773,7 @@ function buildResultPreview(node) {
             // the take itself is gone: nothing left to show, and keeping
             // the payload would resurrect this every time it loads
             node.properties.h3_result = null;
+            rpOutOfHistory(node);
             status.style.color = PAL.sub;
             status.textContent =
                 d.clip.split("/").pop() + " was deleted";
@@ -10106,6 +10806,7 @@ function buildResultPreview(node) {
             callback: () => {
                 this.properties ??= {};
                 this.properties.h3_live_preview = !liveWanted();
+                rpOutOfHistory(this);
                 if (!liveWanted()) {
                     liveClear();
                     if (video.getAttribute("src")) video.style.display = "block";
@@ -10142,6 +10843,7 @@ function buildResultPreview(node) {
                 tldbg("result preview: dropping saved result", saved.clip,
                       "— this node watches", rpScopeFolder(this));
                 this.properties.h3_result = null;
+                rpOutOfHistory(this);
             } else if (saved) {
                 void restoreResult(saved);
             }

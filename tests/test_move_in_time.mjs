@@ -34,7 +34,8 @@ const liftConst = (name) => {
 const seqWidget = { value: "" };
 const body = [
     ...["TL_LINE_RE", "TL_GAP_RE", "TL_LOOP_RE", "TL_OPTS_RE", "TL_SEAM_KEYS",
-        "TL_SEAM_ORDER", "TL_TRUE", "TL_FALSE"].map(liftConst),
+        "TL_SEAM_ORDER", "TL_TRUE", "TL_FALSE", "TL_PART_KEY",
+        "TL_PART_RE"].map(liftConst),
     ...["tlIsEntryLine", "tlSplitSeamOpts", "tlFormatSeamOpts", "tlParseSequence",
         "tlFormatLine", "tlPins", "tlExtendParent", "tlPrependChild", "tlDeriveSeam",
         "linkedMeta", "currentLines", "entryLines", "gapBefore", "canMoveInTime",

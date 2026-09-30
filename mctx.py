@@ -269,6 +269,14 @@ def serialize_pins(pin_specs):
                           ("mask_hold", 0.0)):
             if spec.get(key) and spec[key] != zero:
                 e[key] = spec[key]
+        # The timeline part the pin was taken from, and the cut it was
+        # queued at (null = the clip's own edge). Written only when the
+        # pin named a part, so every other recipe is unchanged. See
+        # nodes_assemble._stamp_part.
+        if spec.get("tl_part"):
+            e["tl_part"] = str(spec["tl_part"])
+            e["tl_cut"] = (None if spec.get("tl_cut") is None
+                           else int(spec["tl_cut"]))
         entries.append(e)
     return json.dumps(entries, separators=(",", ":"))
 
