@@ -37,7 +37,7 @@ Full history in [workflows/README.md](workflows/README.md)
 
 ### comfyui-obvpm-timeline Custom Node Pack Updates
 
-#### Latest HEAD
+#### 0.1.4-preview.1 (2026-09-30)
 
 - Timeline: clips joined by a green seam can now be separated. Ctrl+drag the right-hand clip to open empty space between them; both keep playing the frames they played while joined. Dragging it back flush rejoins them.
 - Timeline: new **split** button in the middle of the cut row. It splits the clip under the playhead into two clips at that frame (on the snap grid while **snap cuts** is on), which can then be moved, cut or deleted separately. Both halves play the same file; nothing is re-encoded. The button is dimmed while the playhead sits on the clip's edge. The two halves join back-to-back, so an upscale treats the split as a cut.
@@ -67,14 +67,6 @@ Full history in [workflows/README.md](workflows/README.md)
 - Takes extended or prepended from a clip in another folder now record where that clip was, so Result Preview can show them together instead of the take alone.
 - A `base_folder` typed with backslashes (`projects\my_project`) now works like `projects/my_project`. The Timeline's clip menu used to find nothing in it.
 - The Timeline's upscale toggle can now be read before a run. With [comfyui-obvpm](https://github.com/chanon/comfyui-obvpm) 0.2.10-preview.1 or newer, the workflow shows which engine settings the next run will use: Override Bundle Values shows their values, and the Value Presets the run will not use are faded.
-
-#### 0.1.2-preview.1 (2026-09-26)
-
-- Upscaling: a timeline with hard cuts (unrelated clips, gray seams) or empty space can now be upscaled. It is split into segments that are upscaled, refined and rendered separately (`upscale_00001_s01.mp4`, `_s02`, ...) and joined into one finished `upscale_00001.mp4`, black for empty space, the sound de-clicked at the cuts. Before, such a timeline failed with "not on the latent grid", or its second shot started mid-cycle.
-- Upscaling: only what the cut shows is upscaled and refined. A take trimmed to a few seconds is no longer processed whole, and the rendered file now ends where the last clip's cut says (it used to run to the end of the last take).
-- Upscaling: a cut made by hand on a seamless (green) seam is now honoured as a cut. Before, the upscale silently played the natural join instead.
-- The "not on the latent grid" error now names the clip and the nearest frames that would work.
-- Fixed: colours of saved takes and upscales looked shifted in browsers (including the timeline preview), video players and editors -- greens duller, skin and warm tones redder. Videos are now encoded with the BT.709 colour matrix and tagged as such, like ComfyUI's own Save Video. Takes saved before this update keep playing as before, and a timeline mixing old and new takes still previews and exports correctly, only slower: such a preview or export is re-encoded as a whole instead of copied.
 
 Full change history in [CHANGELOG.md](CHANGELOG.md)
 

@@ -4,7 +4,7 @@ Changes to the nodes themselves. The workflows have their own changelog: [workfl
 
 Changes not yet in a release are listed under **Latest HEAD**; they become a numbered version when the pack is released.
 
-## Latest HEAD
+## 0.1.4-preview.1 (2026-09-30)
 
 - Timeline: clips joined by a green seam can now be separated. Ctrl+drag the right-hand clip to open empty space between them; both keep playing the frames they played while joined. Dragging it back flush rejoins them.
 - Timeline: new **split** button in the middle of the cut row. It splits the clip under the playhead into two clips at that frame (on the snap grid while **snap cuts** is on), which can then be moved, cut or deleted separately. Both halves play the same file; nothing is re-encoded. The button is dimmed while the playhead sits on the clip's edge. The two halves join back-to-back, so an upscale treats the split as a cut.
