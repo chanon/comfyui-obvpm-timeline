@@ -6761,12 +6761,50 @@ app.registerExtension({
             // one edit: the size of the hole in front of it. Setting it to
             // zero removes the hole rather than leaving a `~ 0` line the
             // parser would have to tolerate.
-            function setGapBefore(i, frames) {
+            //
+            // `entries` is the rendered list (seams derived) and is only
+            // needed when the move separates or rejoins a linked pair.
+            // A gap breaks the chain, so both clips would fall back to
+            // their own ends: at a trim-point join the parent would play
+            // past the frames its child replaces and the child would
+            // replay them, and the clip would jump on drop. Separating
+            // therefore writes the derived play range down as manual
+            // cuts, in the same edit; rejoining clears the ones that
+            // equal what the seam derives again, so the round trip
+            // leaves the text as it was.
+            function setGapBefore(i, frames, entries) {
                 const es = tlParseSequence(seqWidget.value);
                 const lines = currentLines();
                 const map = entryLines();
                 const n = Math.max(0, Math.round(Number(frames) || 0));
-                if (i > 0 && es[i - 1]?.gap != null) {
+                const hadGap = i > 0 && es[i - 1]?.gap != null;
+                const li = hadGap ? i - 2 : i - 1;   // the clip on the left
+                const L = entries?.[li], R = entries?.[i];
+                const separating = !hadGap && n > 0;
+                const rejoining = hadGap && n <= 0;
+                if ((separating || rejoining) && L && R && L.gap == null
+                        && linkedMeta(L.meta, R.meta)) {
+                    if (separating) {
+                        if (es[li].exitOverride === null && L.exit !== null) {
+                            es[li].exitOverride = L.exit;
+                        }
+                        if (es[i].enterOverride === null && R.enter) {
+                            es[i].enterOverride = R.enter;
+                        }
+                    } else {
+                        const s = tlDeriveSeam(L.meta, R.meta);
+                        if (s.exitL !== null
+                                && es[li].exitOverride === s.exitL) {
+                            es[li].exitOverride = null;
+                        }
+                        if (s.enterR && es[i].enterOverride === s.enterR) {
+                            es[i].enterOverride = null;
+                        }
+                    }
+                    lines[map[li]] = tlFormatLine(es[li]);
+                    lines[map[i]] = tlFormatLine(es[i]);
+                }
+                if (hadGap) {
                     if (n <= 0) lines.splice(map[i - 1], 1);
                     else lines[map[i - 1]] = `~ ${n}`;
                 } else {
@@ -6844,13 +6882,14 @@ app.registerExtension({
                 }
                 return { move, hide };
             }
-            // A clip that something leads INTO cannot be slid away from
-            // it: the hole would break the seam. Same rule that stops you
-            // cutting an interior head, for the same reason.
+            // Any clip can slide, including one its left neighbour leads
+            // INTO: pulling it away is how you separate a linked pair.
+            // The hole breaks the chain the same way resolve_sequence
+            // treats every gap -- both clips keep their own ends -- and
+            // dragging it back flush rejoins them.
             function canMoveInTime(entries, i) {
                 const e = entries[i];
-                if (!e || e.gap != null) return false;
-                return !linkedMeta(entries[i - 1]?.meta, e.meta);
+                return !!e && e.gap == null;
             }
 
             // "uncut" is offered only when the selected clip actually
@@ -7599,7 +7638,9 @@ app.registerExtension({
                             // the pending click is swallowed by the guard
                             // in the click handler; clear it if none comes
                             setTimeout(() => { dragMoved = false; }, 0);
-                            if (frames !== base) setGapBefore(i, frames);
+                            if (frames !== base) {
+                                setGapBefore(i, frames, entries);
+                            }
                         };
                         document.addEventListener(
                             "pointermove", onMove, true);
