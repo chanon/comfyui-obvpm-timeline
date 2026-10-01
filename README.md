@@ -37,7 +37,7 @@ Full history in [workflows/README.md](workflows/README.md)
 
 ### comfyui-obvpm-timeline Custom Node Pack Updates
 
-#### Latest HEAD
+#### 0.1.4-preview.2 (2026-10-01)
 
 - Extends, prepends and bridges: a new take takes over one latent step earlier at its join (4 frames before the end of the clip it extends). The decoder draws a file's last frames with nothing after them, so the older clip's last frames never quite matched the new take, which decoded the same latents mid-file. The join's fine-detail change drops by about a third (measured at 1376x768), in the quick preview too, with nothing re-encoded. Takes made before keep their join; the upscale is unchanged.
 
@@ -64,13 +64,6 @@ Full history in [workflows/README.md](workflows/README.md)
 #### 0.1.2-preview.3 (2026-09-28)
 
 - Load settings: a Value Presets node ([comfyui-obvpm](https://github.com/chanon/comfyui-obvpm), 0.2.10-preview.2 or newer) is listed setting by setting instead of as raw widget text. Each changed value is its own row. A changed schema, and each workflow preset that differs, is one row, unticked by default, with what changed inside it (per field: type, default, `when`, tooltip; per preset: its values) behind a collapsed toggle. Loading the preset label no longer puts that preset's stored values over the take's own.
-
-#### 0.1.2-preview.2 (2026-09-28)
-
-- Fixed ([#15](https://github.com/chanon/comfyui-obvpm-timeline/issues/15)): clips could show **no mctx** (and extends fell back to the pixel route, with no loop option) although their `.mctx.safetensors` was right beside them, when the browser could not read the sidecar itself. The server now answers for it, and a clip without a usable sidecar says why in its tooltip: no sidecar, a sidecar that no longer matches the video, or one that could not be read.
-- Takes extended or prepended from a clip in another folder now record where that clip was, so Result Preview can show them together instead of the take alone.
-- A `base_folder` typed with backslashes (`projects\my_project`) now works like `projects/my_project`. The Timeline's clip menu used to find nothing in it.
-- The Timeline's upscale toggle can now be read before a run. With [comfyui-obvpm](https://github.com/chanon/comfyui-obvpm) 0.2.10-preview.1 or newer, the workflow shows which engine settings the next run will use: Override Bundle Values shows their values, and the Value Presets the run will not use are faded.
 
 Full change history in [CHANGELOG.md](CHANGELOG.md)
 

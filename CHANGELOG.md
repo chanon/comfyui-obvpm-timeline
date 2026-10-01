@@ -4,7 +4,7 @@ Changes to the nodes themselves. The workflows have their own changelog: [workfl
 
 Changes not yet in a release are listed under **Latest HEAD**; they become a numbered version when the pack is released.
 
-## Latest HEAD
+## 0.1.4-preview.2 (2026-10-01)
 
 - Extends, prepends and bridges: a new take now takes over one latent step earlier at its join -- 4 frames before the end of the clip it extends, or 5 frames into the clip it arrives at with a hard hold (mask ramp 0; the default soft hold already hands over later). The video decoder draws the last frames of a file with nothing after them, and the first frames with nothing before them, so the older clip's frames there never quite matched the new take, which decoded the very same latents in the middle of its own file. That was part of the fine-detail change visible at a join: measured on a 1376x768 extend, the join's detail change drops by about a third, and the rest is the model redrawing the texture, which only the upscale removes. It is just where the two clips are cut, so the quick preview, the full preview, the export and the Result Preview all show it, and nothing is re-encoded. The take records it in its recipe (`handover_edge`), so takes made before keep the join they were cut at. The upscale is unchanged: it renders the same latents either way.
 
