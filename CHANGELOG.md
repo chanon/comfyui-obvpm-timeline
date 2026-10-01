@@ -4,6 +4,10 @@ Changes to the nodes themselves. The workflows have their own changelog: [workfl
 
 Changes not yet in a release are listed under **Latest HEAD**; they become a numbered version when the pack is released.
 
+## Latest HEAD
+
+- Timeline preview and export: at an extend, the last 4 frames of the clip being continued are now replaced by the new take's own copy of them. The video decoder draws the last frames of a file with nothing after them, so they never quite matched the frames the extend continues from, and that added to the fine-detail change visible at the join. Measured on a 1376x768 extend, the join's detail change drops by about a third; the rest is the model redrawing the texture, which only the upscale removes. The same is done for the first 5 frames of a clip that a prepend arrives at with a hard hold (mask ramp 0; the default soft hold already avoids them). It applies to takes saved from this version on, which keep those few frames in their `.mctx` sidecar; older takes join as before. The upscale is unchanged: it never has these frames.
+
 ## 0.1.4-preview.1 (2026-09-30)
 
 - Timeline: clips joined by a green seam can now be separated. Ctrl+drag the right-hand clip to open empty space between them; both keep playing the frames they played while joined. Dragging it back flush rejoins them.

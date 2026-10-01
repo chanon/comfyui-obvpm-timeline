@@ -37,6 +37,10 @@ Full history in [workflows/README.md](workflows/README.md)
 
 ### comfyui-obvpm-timeline Custom Node Pack Updates
 
+#### Latest HEAD
+
+- Timeline preview and export: at an extend, the last 4 frames of the clip being continued are now replaced by the new take's own copy of them. The video decoder draws the last frames of a file with nothing after them, so they never quite matched the frames the extend continues from, and that added to the fine-detail change visible at the join (about a third of it, measured at 1376x768). It applies to takes saved from this version on; older takes join as before. The upscale is unchanged: it never has these frames.
+
 #### 0.1.4-preview.1 (2026-09-30)
 
 - Timeline: clips joined by a green seam can now be separated. Ctrl+drag the right-hand clip to open empty space between them; both keep playing the frames they played while joined. Dragging it back flush rejoins them.

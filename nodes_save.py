@@ -23,6 +23,7 @@ import tempfile
 import folder_paths
 
 from . import condstore
+from . import decodeseam
 from . import frames as fr
 from . import wiretypes as wt
 from . import mctx
@@ -654,6 +655,26 @@ def _overlap_bytes(untrimmed_images, untrimmed_audio, n, crf, tail=False):
             return None
 
 
+def _seam_bytes(images, crf):
+    """A few held-window frames as a small MP4 (see decodeseam), or None.
+
+    Picture only, through THE encode site, so what assembly swaps in was
+    encoded exactly like the frames around it.
+    """
+    if images is None or int(images.shape[0]) == 0:
+        return None
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "seam.mp4")
+        try:
+            H3SaveVideoWithMCtx._encode_mp4(p, images, None, int(crf))
+            with open(p, "rb") as f:
+                return f.read()
+        except Exception:
+            _LOG.exception("obvpm.h3: could not encode the decode seam "
+                           "frames; saving without them")
+            return None
+
+
 def read_overlap(clip_path, tail=False):
     """The overlap MP4 bytes stored beside a take, or None.
 
@@ -866,6 +887,19 @@ class H3SaveVideoWithMCtx:
             sidecar_blobs[OVERLAP_BLOB] = overlap
         if overlap_tail:
             sidecar_blobs[OVERLAP_TAIL_BLOB] = overlap_tail
+        # A held window's frames next to the older clip's decode EDGE,
+        # decoded here from the middle of this take's own file -- the
+        # older clip decoded its copy with nothing beyond it. Assembly
+        # swaps them in at the join (see decodeseam).
+        seam_sides = decodeseam.capture_sides(pins)
+        seam_head = (_seam_bytes(decodeseam.head_frames(untrimmed_images, head), crf)
+                     if "before" in seam_sides else None)
+        seam_tail = (_seam_bytes(decodeseam.tail_frames(untrimmed_images, tail), crf)
+                     if "after" in seam_sides else None)
+        if seam_head:
+            sidecar_blobs[decodeseam.HEAD_BLOB] = seam_head
+        if seam_tail:
+            sidecar_blobs[decodeseam.TAIL_BLOB] = seam_tail
 
         meta = {
             "format": mctx.FORMAT,
@@ -885,6 +919,10 @@ class H3SaveVideoWithMCtx:
             "user_meta": user_meta,
             "overlap_frames": str(head if overlap else 0),
             "overlap_tail_frames": str(tail if overlap_tail else 0),
+            decodeseam.HEAD_KEY: str(decodeseam.END_SWAP + decodeseam.VERIFY
+                                     if seam_head else 0),
+            decodeseam.TAIL_KEY: str(decodeseam.START_SWAP + decodeseam.VERIFY
+                                     if seam_tail else 0),
         }
         sidecar = mctx.write_sidecar(
             mctx.sidecar_path(video_path), video_lat, audio_lat, meta,
