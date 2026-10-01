@@ -39,7 +39,7 @@ Full history in [workflows/README.md](workflows/README.md)
 
 #### Latest HEAD
 
-- Timeline preview and export: at an extend, the last 4 frames of the clip being continued are now replaced by the new take's own copy of them. The video decoder draws the last frames of a file with nothing after them, so they never quite matched the frames the extend continues from, and that added to the fine-detail change visible at the join (about a third of it, measured at 1376x768). It applies to takes saved from this version on; older takes join as before. The upscale is unchanged: it never has these frames.
+- Extends, prepends and bridges: a new take takes over one latent step earlier at its join (4 frames before the end of the clip it extends). The decoder draws a file's last frames with nothing after them, so the older clip's last frames never quite matched the new take, which decoded the same latents mid-file. The join's fine-detail change drops by about a third (measured at 1376x768), in the quick preview too, with nothing re-encoded. Takes made before keep their join; the upscale is unchanged.
 
 #### 0.1.4-preview.1 (2026-09-30)
 

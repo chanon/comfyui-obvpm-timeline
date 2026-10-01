@@ -67,8 +67,10 @@ export function maskProfile(covered, steps, place, rampFrames = 0, edge = 0, dee
 // nodes_masked.handover_frames: offset INSIDE the window where the two
 // sides change hands. after-pin: the take delivers [0, n), the target
 // enters at n. before-pin: the parent plays to n, the take delivers
-// [n, covered). A hard hold gives 0 / covered.
-export function handoverFrames(covered, place, rampFrames = 0, edge = 0, deep = 0) {
+// [n, covered). A hard hold gives 0 / covered -- or, with decodeEdge (a
+// recipe's handover_edge), one latent step inside that edge: 5 / covered-4.
+export function handoverFrames(covered, place, rampFrames = 0, edge = 0, deep = 0,
+                               decodeEdge = false) {
     covered = Math.trunc(Number(covered) || 0);
     rampFrames = Math.trunc(Number(rampFrames) || 0);
     deep = Number(deep) || 0;
@@ -80,8 +82,14 @@ export function handoverFrames(covered, place, rampFrames = 0, edge = 0, deep = 
     prof.forEach((v, k) => { if (v === 0) held.push(k); });
     if (!held.length) return place === "after" ? 0 : covered;
     const starts = stepOffsets(steps);
-    if (place === "after") return starts[held[0]];
+    if (place === "after") {
+        if (decodeEdge && held[0] === 0 && held[1] === 1 && steps > 2) return starts[2];
+        return starts[held[0]];
+    }
     const ends = starts.slice(1).concat([covered]);
+    if (decodeEdge && held[held.length - 1] === steps - 1 && steps > 1) {
+        return starts[steps - 1];
+    }
     return ends[held[held.length - 1]];
 }
 
@@ -92,5 +100,6 @@ export function specHandover(spec, place) {
         Number(spec?.source_frames) || 0, place,
         Number(spec?.mask_ramp_frames) || 0,
         Number(spec?.mask_ramp_edge) || 0,
-        Number(spec?.mask_hold) || 0);
+        Number(spec?.mask_hold) || 0,
+        Boolean(spec?.handover_edge));
 }

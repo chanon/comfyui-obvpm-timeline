@@ -44,7 +44,6 @@ import folder_paths
 
 from . import condstore
 from . import crossfade as xf
-from . import decodeseam as ds
 from . import frames as fr
 from . import levellock
 from . import mctx
@@ -63,7 +62,7 @@ DEFAULT_PREVIEW_NAME = "obvpm_h3_preview"
 # an older version is served as current -- and a fix looks like it did
 # nothing. Raise it with any change to how frames are decoded, corrected
 # or encoded.
-BUILD_VERSION = 11   # 11: decode seams swapped at masked joins
+BUILD_VERSION = 10
 
 
 def _decode_audio(path):
@@ -643,40 +642,6 @@ def _patch_clip_planes(entries, i, enter, hi, locks, fades,
     return (y, u, v), _merge(ranges)
 
 
-def _apply_seams(e, swaps, enter, hi, planes, patched, changed):
-    """Swap a clip's decode-edge frames for the newer take's (decodeseam).
-
-    Runs after the seam repairs and works on whatever they left: their
-    planes when they ran in YUV, their frames when they fell back to RGB,
-    or -- the usual case, since the repairs default off at masked joins
-    -- a fresh decode of just this clip. Returns (planes, patched,
-    changed) in the same shapes the build reads them in.
-    """
-    label = _short(e)
-    changed = list(changed or [])
-    if planes is not None:
-        got = ds.apply_planes(planes, swaps, enter, hi, label=label)
-        return planes, patched, _merge(changed + got)
-    if patched is None and yuv.usable(e["path"]):
-        fresh = yuv.decode(e["path"], upto=hi)
-        if fresh is not None and fresh[0].shape[0] >= hi:
-            fresh = tuple(p.copy() for p in fresh)
-            got = ds.apply_planes(fresh, swaps, enter, hi, label=label)
-            if got:
-                return fresh, None, _merge(changed + got)
-            return None, None, changed
-    if patched is None:
-        patched = _decode_images(e["path"])
-        if patched is None:
-            return None, None, changed
-        patched = patched.clone()
-    got = ds.apply_images(patched, swaps, enter, hi, _decode_images,
-                          label=label)
-    if not got and not changed:
-        return None, None, changed
-    return None, patched, _merge(changed + got)
-
-
 def _patch_clip(entries, i, enter, hi, locks, fades, images=None,
                 ramps=(), tail_locks=None, tfades=None):
     """(patched images or None, changed ranges) for one entry.
@@ -795,14 +760,13 @@ class _Progress:
         self.total = 0.0
         self.done = 0.0
 
-    def plan(self, entries, locks, fades, tail_locks=(), tfades=(),
-             seams=()):
+    def plan(self, entries, locks, fades, tail_locks=(), tfades=()):
         for i, e in enumerate(entries):
             if e.get("gap"):
                 self.total += self.WORK
                 continue
             heavy = (i in locks or i in tail_locks or (i + 1) in fades
-                     or i in tfades or i in seams
+                     or i in tfades
                      or e.get("enter") or e.get("exit") is not None)
             self.total += self.WORK if heavy else self.COPY
         self.total += self.MUX
@@ -938,10 +902,6 @@ def _build_preview(sequence, crf, probe=False, base_folder="",
 
     (locks, fades, ramps, tail_locks,
      tfades) = _join_fixes(entries, seam_plan, loop)
-    # not a seam SETTING: a decode edge is never what a clip looks like
-    # anywhere else, so where the newer take kept the right frames they
-    # always go in (see decodeseam)
-    seams = ds.plan(entries, loop)
     # the joins whose child asked for the carried spatial field (entry
     # 0 is a child too when the cut loops)
     locals_ = {i for i in range(0 if loop else 1, len(entries))
@@ -954,7 +914,7 @@ def _build_preview(sequence, crf, probe=False, base_folder="",
                   if overrides else "")
     prog = _Progress(on_progress).plan(entries, locks, fades,
                                        tail_locks=tail_locks,
-                                       tfades=tfades, seams=seams)
+                                       tfades=tfades)
     prog.emit("reading audio")
 
     audio_parts, have_audio, sample_rate = [], True, None
@@ -1095,7 +1055,7 @@ def _build_preview(sequence, crf, probe=False, base_folder="",
                 enter = e["enter"]
                 hi = e["frames"] if e["exit"] is None else e["exit"]
                 heavy = (i in locks or i in tail_locks
-                         or (i + 1) in fades or i in tfades or i in seams)
+                         or (i + 1) in fades or i in tfades)
                 # A clip only leaves the copy path for one of two
                 # reasons, and the label should say which. A repair
                 # rewrites its pixels, so those frames no longer match
@@ -1125,9 +1085,6 @@ def _build_preview(sequence, crf, probe=False, base_folder="",
                     patched, changed = _patch_clip(
                         entries, i, enter, hi, locks, fades, ramps=ramps,
                         tail_locks=tail_locks, tfades=tfades)
-                if i in seams:
-                    planes, patched, changed = _apply_seams(
-                        e, seams[i], enter, hi, planes, patched, changed)
                 if not changed and enter == 0 and e["exit"] is None:
                     pieces.append({"path": e["path"], "from": 0,
                                    "to": e["frames"]})
@@ -1223,10 +1180,6 @@ def _build_preview(sequence, crf, probe=False, base_folder="",
                                            ramps=ramps)
             if changed:
                 imgs = patched
-            if i in seams:
-                imgs = imgs.clone()
-                ds.apply_images(imgs, seams[i], e["enter"], hi,
-                                _decode_images, label=_short(e))
             frames.append(imgs[e["enter"]:hi])
             prog.step(1.0, "re-encoding %s" % _short(e))
         prog.emit("assembling")

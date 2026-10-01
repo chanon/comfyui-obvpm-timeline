@@ -273,19 +273,18 @@ export). The node itself:
 
 Outputs: `pin_specs`, `length`, `sequence`, `upscaling`.
 
-**Decode seams** (not a setting; always on). H3's video decoder draws
-the first 5 and last 4 frames of a file with nothing before or after
-them, so they come out slightly different from the same moment decoded
-mid-file. At a masked extend the parent's last 4 frames are exactly
-that, and they meet the child's continuation. The child decoded the same
-latents mid-file, so its Save keeps those few frames in its sidecar, and
-the preview and export swap them in at the join -- after checking that
-the frames next to them match the parent's own, so frames out of step
-with the parent, or a re-rendered parent, are left alone. The mirror case
-(a prepend arriving with a hard hold, at a clip's first 5 frames) is
-handled the same way. Only takes saved since this was added carry the
-frames; the upscale never has these edges (its windows decode with
-run-in and lookahead).
+**Decode edges.** H3's video decoder draws the first 5 and last 4 frames
+of a file with nothing before or after them, so they come out slightly
+different from the same moment decoded mid-file. A masked window holds
+the older clip's latents verbatim, so the newer take decoded exactly those
+moments in the middle of its own file. Its pins therefore record
+`handover_edge`: a window held hard up to the join hands over one latent
+step inside it -- the extend delivers the last 4 frames of its window and
+the parent exits 4 frames short of its end; a hard-held arrival delivers
+the first 5 and the target enters at frame 5. Held frames decode
+identically everywhere else, so this changes nothing but those edge frames.
+Older takes (no flag) keep their join, and the joint render lays out the
+same latent line either way.
 
 **Switching branches.** A workflow that can both generate a take and
 refine the timeline holds two branches that must never run together.

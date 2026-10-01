@@ -138,11 +138,16 @@ def pins_trim_totals(pins):
         # the ramped frames are this take's own work, matched to what it
         # generated, so they ship and the source enters past them
         # (nodes_masked.handover_frames).
+        # ...and a hard-held one hands over a step inside its edge when
+        # the recipe says so (handover_edge): the older clip's frames
+        # there are its decode edge, this take's are mid-file.
+        edge = bool(spec.get("handover_edge"))
         if p.get("place") == "before":
-            head += nodes_masked.handover_frames(covered, "before", *shape)
+            head += nodes_masked.handover_frames(covered, "before", *shape,
+                                                 decode_edge=edge)
         elif p.get("place") == "after":
             tail += covered - nodes_masked.handover_frames(
-                covered, "after", *shape)
+                covered, "after", *shape, decode_edge=edge)
     return head, tail
 
 
@@ -311,6 +316,11 @@ class H3MCtxPinSpec:
             "mask_ramp_frames": int(mask_ramp_frames),
             "mask_ramp_edge": float(mask_ramp_edge),
             "mask_hold": float(mask_hold),
+            # A hard-held window hands over a step inside the older
+            # clip's decode edge (nodes_masked.handover_frames). Latent
+            # grade only: these held frames decode from the very latents
+            # the older clip decoded, so only its edge frames differ.
+            "handover_edge": mode in ("masked", "both"),
         }
         # Where the parent was when it was pinned, as pixel pins record
         # it. The hash (source_id) still decides what the parent IS; this

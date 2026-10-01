@@ -2840,9 +2840,18 @@ function tlDeriveSeam(lh, rh) {
         const exitF = ex.join - num(lh, "pinned_head_frames");
         const delivered = num(lh, "delivered_frames");
         const clean = exitF === delivered;
+        // a window that ends at the parent's end but hands over a latent
+        // step inside it (handover_edge, nodes_masked.handover_frames):
+        // the parent stops short of its decode edge -- the join, not a cut
+        const pin = tlPins(rh).find((s) => s.place === "before" &&
+            s.source_id === lh.self_id && s.handover_edge);
+        const edge = !!pin && (Number(pin.source_start) || 0)
+            + (Number(pin.source_frames) || 0)
+            - num(lh, "pinned_head_frames") === delivered;
         return { exitL: clean ? null : exitF, enterR: 0,
                  kind: "seamless",
                  note: clean ? "extends: seamless"
+                     : edge ? `extends: seamless, hands over at frame ${exitF}`
                      : `extends at a cut: exits at frame ${exitF}` };
     }
     const pr = tlPrependChild(lh);

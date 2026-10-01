@@ -308,7 +308,8 @@ def _handover(spec, place):
         int(spec.get("source_frames", 0) or 0), place,
         int(spec.get("mask_ramp_frames", 0) or 0),
         float(spec.get("mask_ramp_edge", 0.0) or 0.0),
-        float(spec.get("mask_hold", 0.0) or 0.0))
+        float(spec.get("mask_hold", 0.0) or 0.0),
+        decode_edge=bool(spec.get("handover_edge")))
 
 
 def _extend_parent(header):
@@ -348,6 +349,20 @@ def _prepend_child(header):
     return None
 
 
+def _edge_handover_at_end(child_header, parent_id, parent_header, delivered):
+    """Did the child's window end at the parent's delivered end, with the
+    join moved a step inside it (handover_edge)? Then the parent's exit
+    short of its end is the join, not a cut -- for the notes only."""
+    ph = int(parent_header.get("pinned_head_frames", 0) or 0)
+    for s in mctx.parse_pins(child_header):
+        if (s.get("place") == "before" and s.get("source_id") == parent_id
+                and s.get("handover_edge")):
+            end = (int(s.get("source_start", 0) or 0)
+                   + int(s.get("source_frames", 0) or 0) - ph)
+            return end == int(delivered)
+    return False
+
+
 def _derive_seam(left, right):
     """(left_exit_delivered_frame_or_None, right_enter_frame, note).
 
@@ -370,6 +385,10 @@ def _derive_seam(left, right):
                 "disagree with themselves; re-check the takes."
                 % (right["clip"], left["clip"], join, delivered))
         note = ("extends: seamless" if exit_f == delivered else
+                "extends: seamless, %s hands over at frame %d (its last "
+                "%d frames are its decode edge)"
+                % (left["clip"], exit_f, delivered - exit_f)
+                if _edge_handover_at_end(rh, l_id, lh, delivered) else
                 "extends at a cut: %s exits at frame %d (%d frames held "
                 "back)" % (left["clip"], exit_f, delivered - exit_f))
         return (None if exit_f == delivered else exit_f), 0, note

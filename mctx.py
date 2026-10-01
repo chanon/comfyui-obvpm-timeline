@@ -269,6 +269,11 @@ def serialize_pins(pin_specs):
                           ("mask_hold", 0.0)):
             if spec.get(key) and spec[key] != zero:
                 e[key] = spec[key]
+        # Moves the join (see nodes_masked.handover_frames), so it is
+        # part of the recipe; written only when set, so takes made
+        # before it keep both their recipe and the cut it implies.
+        if spec.get("handover_edge"):
+            e["handover_edge"] = True
         # The timeline part the pin was taken from, and the cut it was
         # queued at (null = the clip's own edge). Written only when the
         # pin named a part, so every other recipe is unchanged. See
@@ -314,14 +319,17 @@ def summarize_pins(pin_specs):
     shape = (int(s.get("mask_ramp_frames", 0) or 0),
              float(s.get("mask_ramp_edge", 0.0) or 0.0),
              float(s.get("mask_hold", 0.0) or 0.0))
+    edge = bool(s.get("handover_edge"))
     if place == "before":
         return ("extends", s["source_id"],
                 int(s.get("source_start", 0))
-                + handover_frames(covered, "before", *shape))
+                + handover_frames(covered, "before", *shape,
+                                  decode_edge=edge))
     if place == "after":
         return ("prepends", s["source_id"],
                 int(s.get("source_start", 0))
-                + handover_frames(covered, "after", *shape))
+                + handover_frames(covered, "after", *shape,
+                                  decode_edge=edge))
     return "", "", 0
 
 
