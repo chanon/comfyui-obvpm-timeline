@@ -5259,34 +5259,67 @@ app.registerExtension({
             };
             let persistTimer = null;
             let skipTimelinePersist = false;
-            function persistBody() {
+            // Saves only go to the folder Open or New last bound. A
+            // typed or wired base_folder change must not follow the
+            // current cut into some other project's file.
+            let boundFolder = null;
+            let persistSkipTold = false;
+            function toastTimeline(severity, detail, life) {
+                app.extensionManager?.toast?.add?.({
+                    severity, summary: "H3 Timeline",
+                    detail, life: life ?? 6000,
+                });
+            }
+            function persistBody(folder) {
                 return {
                     action: "save",
-                    base_folder: folderValue(),
+                    base_folder: folder,
                     sequence: seqWidget.value ?? "",
                 };
             }
-            async function persistTimelineNow() {
-                if (skipTimelinePersist || openFolderBlocked()) return;
+            async function postTimelineSave(folder) {
+                const resp = await api.fetchApi("/obvpm/h3/timeline_state", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(persistBody(folder)),
+                });
+                if (!resp.ok) throw new Error(await resp.text());
+            }
+            async function persistBoundNow() {
+                if (skipTimelinePersist || boundFolder == null) return true;
                 clearTimeout(persistTimer);
                 try {
-                    await api.fetchApi("/obvpm/h3/timeline_state", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify(persistBody()),
-                    });
-                } catch { /* offline */ }
+                    await postTimelineSave(boundFolder);
+                    return true;
+                } catch (err) {
+                    toastTimeline("error",
+                        "Could not save the current cut: "
+                        + String(err?.message ?? err).slice(0, 160));
+                    return false;
+                }
             }
             queueTimelinePersist = () => {
-                if (skipTimelinePersist || openFolderBlocked()) return;
+                if (skipTimelinePersist || boundFolder == null) return;
+                const folder = boundFolder;
                 clearTimeout(persistTimer);
                 persistTimer = setTimeout(() => {
-                    if (skipTimelinePersist || openFolderBlocked()) return;
-                    void api.fetchApi("/obvpm/h3/timeline_state", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify(persistBody()),
-                    }).catch(() => {});
+                    if (skipTimelinePersist) return;
+                    if (boundFolder !== folder
+                            || folderValue() !== folder) {
+                        if (!persistSkipTold) {
+                            persistSkipTold = true;
+                            toastTimeline("warn",
+                                "Timeline not saved: base_folder no "
+                                + "longer matches the project that "
+                                + "was opened.");
+                        }
+                        return;
+                    }
+                    void postTimelineSave(folder).catch((err) => {
+                        toastTimeline("error",
+                            "Could not save the current cut: "
+                            + String(err?.message ?? err).slice(0, 160));
+                    });
                 }, 1000);
             };
             let openMenu = null;
@@ -5323,63 +5356,53 @@ app.registerExtension({
                 setTimeout(() => paint(true), 60);
             }
             async function applyOpenFolder(folder) {
+                folder = normalizeFolderInput(folder);
+                let data;
+                try {
+                    data = await loadTimelineFolder(folder);
+                } catch (err) {
+                    toastTimeline("error",
+                        String(err?.message ?? err).slice(0, 160));
+                    return;
+                }
                 const cur = String(seqWidget.value || "").trim();
-                if (cur && tlParseSequence(cur).length) {
+                const incoming = data.found ? String(data.sequence ?? "") : "";
+                const sameText = incoming.replace(/\r\n/g, "\n").trim()
+                    === cur.replace(/\r\n/g, "\n");
+                // Bound work is written back first. Opening the folder
+                // the node already names just loads that file. Ask only
+                // when an unbound strip would be thrown away for a
+                // different folder's cut.
+                if (data.found && boundFolder == null
+                        && folderValue() !== folder
+                        && cur && !sameText
+                        && tlParseSequence(cur).length) {
                     const label = folder || "(output root)";
                     if (!confirm(
-                        "Replace the current timeline with the cut saved "
-                        + "in " + label + "?")) return;
+                        "Close the current timeline and open the one "
+                        + "saved in " + label + "?")) return;
+                }
+                if (boundFolder != null && boundFolder !== folder) {
+                    if (!await persistBoundNow()) return;
                 }
                 clearTimeout(persistTimer);
                 skipTimelinePersist = true;
                 try {
-                    const prevFolder = folderValue();
-                    if (prevFolder !== folder) {
-                        try {
-                            await api.fetchApi("/obvpm/h3/timeline_state", {
-                                method: "POST",
-                                headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({
-                                    action: "save",
-                                    base_folder: prevFolder,
-                                    sequence: seqWidget.value ?? "",
-                                }),
-                            });
-                        } catch { /* offline */ }
-                    }
-                    let data;
-                    try {
-                        data = await loadTimelineFolder(folder);
-                    } catch (err) {
-                        app.extensionManager?.toast?.add?.({
-                            severity: "error",
-                            summary: "H3 Timeline",
-                            detail: String(err?.message ?? err).slice(0, 160),
-                            life: 6000,
-                        });
-                        return;
-                    }
-                    const text = data.found ? String(data.sequence ?? "") : "";
                     if (!rpSetWidgetValue(node, "base_folder", folder)) {
-                        app.extensionManager?.toast?.add?.({
-                            severity: "warn",
-                            summary: "H3 Timeline",
-                            detail: "Could not write this folder along the "
-                                + "base_folder wire. Change it on the "
-                                + "source node.",
-                            life: 6000,
-                        });
+                        toastTimeline("warn",
+                            "Could not write this folder along the "
+                            + "base_folder wire. Change it on the "
+                            + "source node.");
                         return;
                     }
-                    holdSequence(text);
-                    if (!data.found) {
-                        app.extensionManager?.toast?.add?.({
-                            severity: "info",
-                            summary: "H3 Timeline",
-                            detail: "No saved timeline in this folder yet "
-                                + "(obvpm_h3_timeline.sequence).",
-                            life: 5000,
-                        });
+                    boundFolder = folder;
+                    persistSkipTold = false;
+                    if (data.found) {
+                        holdSequence(String(data.sequence ?? ""));
+                    } else {
+                        toastTimeline("info",
+                            "No saved timeline in this folder yet "
+                            + "(obvpm_h3_timeline.sequence).", 5000);
                     }
                     single = null;
                     usingSingle = false;
@@ -5400,6 +5423,21 @@ app.registerExtension({
                 return j.folder ?? folder;
             }
             async function applyStartNew(folder) {
+                folder = normalizeFolderInput(folder);
+                let existing;
+                try {
+                    existing = await loadTimelineFolder(folder);
+                } catch (err) {
+                    toastTimeline("error",
+                        String(err?.message ?? err).slice(0, 160));
+                    return;
+                }
+                if (existing.found) {
+                    toastTimeline("warn",
+                        "This folder already contains a timeline. "
+                        + "Select a folder that does not have one.");
+                    return;
+                }
                 const cur = String(seqWidget.value || "").trim();
                 if (cur && tlParseSequence(cur).length) {
                     if (!confirm(
@@ -5408,31 +5446,36 @@ app.registerExtension({
                         return;
                     }
                 }
-                await persistTimelineNow();
+                if (boundFolder != null && boundFolder !== folder) {
+                    if (!await persistBoundNow()) return;
+                }
                 clearTimeout(persistTimer);
                 skipTimelinePersist = true;
                 try {
-                    folder = await ensureFolder(folder);
+                    folder = normalizeFolderInput(await ensureFolder(folder));
                     if (!rpSetWidgetValue(node, "base_folder", folder)) {
-                        app.extensionManager?.toast?.add?.({
-                            severity: "warn",
-                            summary: "H3 Timeline",
-                            detail: "Could not write this folder along the "
-                                + "base_folder wire. Change it on the "
-                                + "source node. The strip is still cleared.",
-                            life: 6000,
-                        });
+                        toastTimeline("warn",
+                            "Could not write this folder along the "
+                            + "base_folder wire. Change it on the "
+                            + "source node.");
+                        return;
                     }
+                    boundFolder = folder;
+                    persistSkipTold = false;
                     setPinState(null);
                     holdSequence("");
                     single = null;
                     usingSingle = false;
                     await rescanPickerClips().catch(() => populatePicker());
                     node.setDirtyCanvas?.(true, true);
+                } catch (err) {
+                    toastTimeline("error",
+                        String(err?.message ?? err).slice(0, 160));
+                    return;
                 } finally {
                     skipTimelinePersist = false;
-                    queueTimelinePersist();
                 }
+                if (boundFolder === folder) queueTimelinePersist();
             }
             function normalizeFolderInput(raw) {
                 return String(raw ?? "").trim().replace(/\\/g, "/")
@@ -5465,12 +5508,18 @@ app.registerExtension({
                 }
                 const pop = document.createElement("div");
                 openMenu = pop;
+                // Stay inside the widget. overflow:hidden on the panel
+                // would clip a 380px menu, and those last rows are then
+                // below the list's own scrollport -- unreachable.
+                const menuTop = header.offsetTop + header.offsetHeight + 4;
+                const menuH = Math.min(380, Math.max(80,
+                    (container.clientHeight || 320) - menuTop - 6));
                 Object.assign(pop.style, {
                     position: "absolute", zIndex: "11",
                     left: "8px", minWidth: "280px", maxWidth: "85%",
-                    top: (header.offsetTop + header.offsetHeight + 4)
-                        + "px",
-                    maxHeight: "min(380px, 55vh)",
+                    top: menuTop + "px",
+                    height: menuH + "px",
+                    overflow: "hidden",
                     display: "flex", flexDirection: "column", gap: "4px",
                     background: PAL.rest, color: PAL.text,
                     border: "1px solid " + PAL.edge,
@@ -5479,6 +5528,7 @@ app.registerExtension({
                     boxShadow: "0 4px 14px rgba(0,0,0,0.45)",
                 });
                 pop.addEventListener("click", (ev) => ev.stopPropagation());
+                pop.addEventListener("wheel", (ev) => ev.stopPropagation());
                 const searchIn = document.createElement("input");
                 searchIn.type = "search";
                 searchIn.placeholder = purpose === "new"
@@ -5510,7 +5560,7 @@ app.registerExtension({
                 });
                 const listEl = document.createElement("div");
                 Object.assign(listEl.style, {
-                    overflowY: "auto", flex: "1", minHeight: "80px",
+                    overflowY: "auto", flex: "1", minHeight: "0",
                 });
                 const createWrap = document.createElement("div");
                 Object.assign(createWrap.style, {
@@ -9367,8 +9417,10 @@ function rpSetOutput(node, slotIndex, value, hops, ctx) {
         return rpSetInput(node, node.inputs[0], value, hops - 1, ctx);
     }
 
-    const w = node.widgets?.find((x) => x.name === "value")
-        ?? (node.widgets?.length === 1 ? node.widgets[0] : null);
+    // Writes only a `value` widget. The read-side single-widget
+    // fallback is harmless; writing it can overwrite an unrelated
+    // control on a one-widget node that is not a primitive.
+    const w = node.widgets?.find((x) => x.name === "value");
     if (!w) return false;
     const wired = (node.inputs ?? []).find(
         (s) => (s.widget?.name === w.name || s.name === w.name)

@@ -34,6 +34,25 @@ class TimelineStoreTests(unittest.TestCase):
         ts.save_state("project1", seq)
         self.assertEqual(ts.load_state("project1"), seq)
 
+    def test_second_save_replaces(self):
+        ts.save_state("project1", "first")
+        ts.save_state("project1", "second")
+        self.assertEqual(ts.load_state("project1"), "second")
+        parent = os.path.dirname(ts.state_path("project1"))
+        leftovers = [n for n in os.listdir(parent) if n != ts.STATE_NAME]
+        self.assertEqual(leftovers, [])
+
+    def test_failed_save_does_not_use_fixed_tmp(self):
+        def boom(_src, _dst):
+            raise OSError("nope")
+        with patch.object(os, "replace", boom):
+            with self.assertRaises(OSError):
+                ts.save_state("project1", "x")
+        parent = os.path.join(self.tmp.name, "project1")
+        names = os.listdir(parent) if os.path.isdir(parent) else []
+        self.assertNotIn(ts.STATE_NAME, names)
+        self.assertNotIn(ts.STATE_NAME + ".tmp", names)
+
     def test_missing_returns_none(self):
         self.assertIsNone(ts.load_state("nothing_here"))
 

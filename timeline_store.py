@@ -6,6 +6,7 @@ project folder can restore the last cut without rereading the workflow.
 """
 
 import os
+import tempfile
 
 import folder_paths
 
@@ -47,10 +48,19 @@ def save_state(base_folder, sequence):
     if parent:
         os.makedirs(parent, exist_ok=True)
     text = "" if sequence is None else str(sequence)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(
+        prefix=STATE_NAME + ".", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 _SEARCH_LIMIT = 250
