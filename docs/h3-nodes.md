@@ -435,8 +435,10 @@ this panel too, in the box the result takes over when the take lands,
 with the step count on the status line. That node can then be
 collapsed: it stays the place where the preview's frame count and
 resolution are set, but nothing needs to be looked at there. Only the
-run this preview owns is shown, and without the KJ node the panel
-behaves exactly as before.
+sampler of this preview's own branch is shown -- an upscale branch in
+the same workflow is not its run. To go without the live picture, take
+the KJ node off the model; without it the panel behaves exactly as
+before.
 
 ## H3 MCtx Assemble
 

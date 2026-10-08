@@ -334,6 +334,7 @@ app.registerExtension({
             widget.serialize = false;
             widget.options.serialize = false;
             tlPanWithMiddleButton(container);
+            tlNoSelect(container);
             widget.computeLayoutSize = () => ({ minHeight, minWidth });
             // THE frozen-width culprit (diagnosed via the sampler): once
             // something stores widget.width (the Vue legacy-widget mirror
@@ -804,6 +805,34 @@ const TL_PROGRESS_EVENT = "obvpm.h3.build_progress";
 // canvas element as a copy of itself and the pan just works; the copy
 // carries the same clientX/Y and pointerId, which is all the canvas
 // reads. Left and right buttons are untouched: those are the panel's.
+// A panel holding video: never text-selectable. A double click or a drag
+// across the canvas otherwise selects the panel, and the browser paints
+// its blue selection over the whole picture. Text fields inside stay
+// selectable, and so are the status lines marked with tlSelectable --
+// a file name or a "next run" line is worth copying. Any other <video>
+// on the page (ComfyUI's own video previews, other packs') is kept out
+// of the selection the same way.
+const TL_NOSELECT = "obvpm-h3-noselect";
+const TL_SELECTABLE = "obvpm-h3-selectable";
+if (!document.getElementById(TL_NOSELECT)) {
+    const style = document.createElement("style");
+    style.id = TL_NOSELECT;
+    style.textContent = `.${TL_NOSELECT}, .${TL_NOSELECT} *, video {`
+        + " -webkit-user-select: none; user-select: none; }"
+        + ` .${TL_NOSELECT} input, .${TL_NOSELECT} textarea,`
+        + ` .${TL_NOSELECT} [contenteditable="true"],`
+        + ` .${TL_NOSELECT} .${TL_SELECTABLE},`
+        + ` .${TL_NOSELECT} .${TL_SELECTABLE} * {`
+        + " -webkit-user-select: text; user-select: text; }";
+    document.head.appendChild(style);
+}
+function tlNoSelect(el) {
+    el.classList.add(TL_NOSELECT);
+}
+function tlSelectable(el) {
+    el.classList.add(TL_SELECTABLE);
+}
+
 function tlPanWithMiddleButton(el) {
     el.addEventListener("pointerdown", (e) => {
         if (e.button !== 1) return;
@@ -879,6 +908,7 @@ function tlProgressBar() {
         font: "10px sans-serif",
     });
     const label = document.createElement("div");
+    tlSelectable(label);
     Object.assign(label.style, {
         whiteSpace: "nowrap", overflow: "hidden",
         textOverflow: "ellipsis",
@@ -3851,6 +3881,7 @@ app.registerExtension({
             // the pin options (window cycle, clear). Framed as a
             // CONTROL panel; colors re-applied per render (theme-live).
             const nextRunRow = document.createElement("div");
+            tlSelectable(nextRunRow);
             Object.assign(nextRunRow.style, {
                 // HARD-FIXED height: content changes (buttons
                 // appearing, longer text) must NEVER reflow the
@@ -3865,6 +3896,7 @@ app.registerExtension({
             // frames) with the prepend/extend toggles OUTSIDE it, to
             // the right; fixed height like the next-run row
             const infoRow = document.createElement("div");
+            tlSelectable(infoRow);
             Object.assign(infoRow.style, {
                 display: "flex", flexWrap: "nowrap", gap: "6px",
                 alignItems: "stretch", height: "24px",
@@ -4971,6 +5003,7 @@ app.registerExtension({
             widget.serialize = false;
             widget.options.serialize = false;
             tlPanWithMiddleButton(container);
+            tlNoSelect(container);
             const minHeight = 320;
             widget.computeLayoutSize = () => ({ minHeight, minWidth: 340 });
             Object.defineProperty(widget, "width", {
@@ -9622,16 +9655,16 @@ const rpPlaysAsIs = (d) => d?.render === "joint" && !String(d.sequence ?? "").in
 
 // ---- nothing in the workflow ----------------------------------------------
 // A Result Preview keeps NOTHING in the workflow. It used to keep its
-// last result, the add/dismiss decision, its seam tuning and the live-
-// preview toggle on node.properties -- which made every finished run an
+// last result, the add/dismiss decision and its seam tuning on
+// node.properties -- which made every finished run an
 // undo step (and an undo on an unrelated edit brought an older result
 // back), changed the workflow file on every run, and shipped the author's
 // last result inside every workflow they shared.
 //   - the result: this session's own (RP_RESULTS), or else the newest take
 //     its Save node writes, asked of the server when the workflow opens
 //     (/obvpm/h3/latest_result);
-//   - the decision, the seam tuning, the toggle: this browser's storage,
-//     keyed by the take (or by the preview's scope for the toggle).
+//   - the decision, the seam tuning: this browser's storage, keyed by
+//     the take.
 // Workflows saved before this still carry those properties; they are read
 // once into storage and otherwise ignored -- never deleted from the node,
 // because deleting them would itself be an edit (an undo step, and the
@@ -9646,10 +9679,12 @@ function rpStore() {
     try {
         const s = JSON.parse(localStorage.getItem(RP_STORE_KEY) || "{}");
         const map = (k) => (s && typeof s[k] === "object" && s[k]) || {};
+        // (a "live" map -- a per-folder switch for the live picture -- is
+        // no longer read, and is dropped at the next write)
         return { decided: map("decided"), seam: map("seam"),
-                 live: map("live"), cleared: map("cleared") };
+                 cleared: map("cleared") };
     } catch (err) {
-        return { decided: {}, seam: {}, live: {}, cleared: {} };
+        return { decided: {}, seam: {}, cleared: {} };
     }
 }
 function rpStoreWrite(s) {
@@ -9663,7 +9698,7 @@ function rpStoreWrite(s) {
     };
     try {
         localStorage.setItem(RP_STORE_KEY, JSON.stringify({
-            decided: trim(s.decided), seam: trim(s.seam), live: s.live,
+            decided: trim(s.decided), seam: trim(s.seam),
             cleared: trim(s.cleared ?? {}),
         }));
     } catch (err) { /* private mode, quota: forget quietly */ }
@@ -9982,24 +10017,108 @@ function rpPromptValue(prompt, v, hops) {
         ? rpPromptValue(prompt, inputs[keys[0]], hops - 1) : null;
 }
 
+function rpNodeWrites(prompt, n, scope) {
+    if (n?.inputs?.filename_prefix === undefined) return false;
+    const p = rpPromptValue(prompt, n.inputs.filename_prefix, RP_HOPS);
+    if (p == null) return false;
+    // ABSENT and UNREADABLE are different: a save node with no
+    // base_folder really does write at the root, but one whose folder
+    // can't be resolved must not be judged as if it were empty -- that
+    // makes "folder/clip" look like a match for scope "clip".
+    let f = "";
+    if (n.inputs.base_folder !== undefined) {
+        f = rpPromptValue(prompt, n.inputs.base_folder, RP_HOPS);
+        if (f == null) return false;
+    }
+    return rpJoinPrefix(f, p) === scope;
+}
+
 function rpPromptWrites(prompt, scope) {
     if (!prompt || typeof prompt !== "object") return false;
-    for (const n of Object.values(prompt)) {
-        if (n?.inputs?.filename_prefix === undefined) continue;
-        const p = rpPromptValue(prompt, n.inputs.filename_prefix, RP_HOPS);
-        if (p == null) continue;
-        // ABSENT and UNREADABLE are different: a save node with no
-        // base_folder really does write at the root, but one whose folder
-        // can't be resolved must not be judged as if it were empty -- that
-        // makes "folder/clip" look like a match for scope "clip".
-        let f = "";
-        if (n.inputs.base_folder !== undefined) {
-            f = rpPromptValue(prompt, n.inputs.base_folder, RP_HOPS);
-            if (f == null) continue;
+    return Object.values(prompt).some((n) => rpNodeWrites(prompt, n, scope));
+}
+
+// The API prompt of each queued job this page has looked at, so a live
+// frame can be judged without asking the server again (frames arrive
+// every step). Kept small: only the last few jobs matter.
+const RP_RUN_PROMPTS = new Map();
+function rpRememberPrompts(jobs) {
+    for (const j of jobs) {
+        if (j?.[1] && j?.[2] && typeof j[2] === "object") {
+            RP_RUN_PROMPTS.set(j[1], j[2]);
         }
-        if (rpJoinPrefix(f, p) === scope) return true;
     }
-    return false;
+    while (RP_RUN_PROMPTS.size > 16) {
+        RP_RUN_PROMPTS.delete(RP_RUN_PROMPTS.keys().next().value);
+    }
+}
+
+// What the server is executing right now: `executing` names the node (its
+// flat API id -- subgraphs are already expanded) as it starts, and a
+// sampler's live frames arrive while it runs.
+const RP_EXEC = { promptId: null, node: null };
+if (!globalThis.__obvpmRpExec) {
+    globalThis.__obvpmRpExec = true;
+    api.addEventListener("execution_start", (e) => {
+        RP_EXEC.promptId = e?.detail?.prompt_id ?? null;
+        RP_EXEC.node = null;
+    });
+    api.addEventListener("executing", (e) => {
+        const d = e?.detail;
+        RP_EXEC.node = d && typeof d === "object"
+            ? (d.display_node ?? d.node ?? null) : (d ?? null);
+    });
+}
+
+// Does node `from` feed a save that writes to `scope`? "yes" | "no" |
+// "unknown". A whole prompt is the wrong question for a LIVE frame: the
+// generation and the upscale branch sit in one prompt, and the branch
+// that is not running is switched off by a gate at run time (Mute If),
+// not left out of the prompt -- so by the prompt alone the upscale
+// preview owned every generation run and showed its sampler's frames.
+// The node actually sampling only reaches the save of its own branch.
+const RP_USERS = new WeakMap();
+function rpFeedsScope(prompt, from, scope) {
+    if (scope === null) return "unknown";
+    const saves = rpSavesFed(prompt, from);
+    if (!saves?.length) return "unknown";
+    return saves.some((n) => rpNodeWrites(prompt, n, scope)) ? "yes" : "no";
+}
+// The save nodes (a `filename_prefix` input) downstream of `from`,
+// itself included; null when the prompt or the node is unknown.
+function rpSavesFed(prompt, from) {
+    if (!prompt || typeof prompt !== "object" || from == null) return null;
+    let users = RP_USERS.get(prompt);
+    if (!users) {
+        users = new Map();
+        for (const [id, n] of Object.entries(prompt)) {
+            for (const v of Object.values(n?.inputs ?? {})) {
+                if (!Array.isArray(v) || v.length !== 2) continue;
+                const src = String(v[0]);
+                if (!prompt[src]) continue;
+                if (!users.has(src)) users.set(src, []);
+                users.get(src).push(id);
+            }
+        }
+        RP_USERS.set(prompt, users);
+    }
+    const start = String(from);
+    if (!prompt[start]) return null;
+    const seen = new Set([start]);
+    const todo = [start];
+    const saves = [];
+    while (todo.length) {
+        const id = todo.pop();
+        const n = prompt[id];
+        if (n?.inputs?.filename_prefix !== undefined) saves.push(n);
+        for (const u of users.get(id) ?? []) {
+            if (!seen.has(u)) {
+                seen.add(u);
+                todo.push(u);
+            }
+        }
+    }
+    return saves;
 }
 
 // "yes" | "no" | "unknown" — unknown whenever the answer can't be
@@ -10015,6 +10134,7 @@ async function rpQueueOwns(scope, promptId) {
     }
     if (!q) return "unknown";
     const jobs = [...(q.queue_running ?? []), ...(q.queue_pending ?? [])];
+    rpRememberPrompts(jobs);
     if (promptId == null) {
         return jobs.some((j) => rpPromptWrites(j?.[2], scope)) ? "yes" : "no";
     }
@@ -10230,6 +10350,7 @@ function buildResultPreview(node) {
     });
 
     const status = document.createElement("div");
+    tlSelectable(status);
     Object.assign(status.style, {
         font: "11px sans-serif", color: PAL.sub,
         whiteSpace: "nowrap", overflow: "hidden",
@@ -10283,6 +10404,7 @@ function buildResultPreview(node) {
     widget.serialize = false;
     widget.options.serialize = false;
     tlPanWithMiddleButton(container);
+    tlNoSelect(container);
     tlWheelToCanvas(container);
     widget.computeLayoutSize = () => ({ minHeight: 220, minWidth: 240 });
     Object.defineProperty(widget, "width", {
@@ -10831,15 +10953,17 @@ function buildResultPreview(node) {
     }
     // a live frame is shown only for the run being timed: the event is
     // global, and another workflow's sampling must not paint here
-    // Per preview, kept by the Save prefix it watches in this browser's
-    // storage (see RP_STORE_KEY): a preview on the refine branch shares
-    // the one event stream with the generation branch's, and its owner
-    // may not want the sampler's frames there at all.
-    const liveKey = () => rpScopeFolder(node) ?? "#" + node.id;
-    const liveWanted = () => rpStore().live[liveKey()] !== false;
     const onLivePreview = (e) => {
         const data = e?.detail;
-        if (!data || runStartedAt === null || !liveWanted()) return;
+        if (!data || runStartedAt === null) return;
+        // only frames from the sampler of THIS preview's branch: a preview
+        // on the refine branch shares the one event stream with the
+        // generation branch's
+        const prompt = RP_RUN_PROMPTS.get(runPromptId ?? RP_EXEC.promptId);
+        if (rpFeedsScope(prompt, RP_EXEC.node,
+                         rpScopeFolder(node)) === "no") {
+            return;
+        }
         if (typeof data.step === "number" && typeof data.total === "number") {
             liveStep = { step: data.step, total: data.total };
             runTick();
@@ -11172,9 +11296,10 @@ function buildResultPreview(node) {
         node._h3ShowResult(d);
     }
     // Workflows saved before the preview stopped keeping anything in them
-    // carry the decision, the seam tuning and the live toggle as node
-    // properties: carried into storage once, never removed from the node
-    // (see RP_STORE_KEY). What storage already has wins.
+    // carry the decision and the seam tuning as node properties: carried
+    // into storage once, never removed from the node (see RP_STORE_KEY).
+    // What storage already has wins. (Their old `h3_live_preview` is
+    // ignored: the live picture has no switch.)
     function adoptOldProperties(p) {
         if (!p) return;
         const s = rpStore();
@@ -11192,32 +11317,8 @@ function buildResultPreview(node) {
                 }
             }
         }
-        if (p.h3_live_preview === false && s.live[liveKey()] === undefined) {
-            s.live[liveKey()] = false;
-            changed = true;
-        }
         if (changed) rpStoreWrite(s);
     }
-    const prevMenu = node.getExtraMenuOptions;
-    node.getExtraMenuOptions = function (canvas, options) {
-        const r = prevMenu?.apply(this, arguments);
-        options.push({
-            content: (liveWanted() ? "✓ " : "") + "Live preview while sampling",
-            callback: () => {
-                const s = rpStore();
-                s.live[liveKey()] = !liveWanted();
-                rpStoreWrite(s);
-                if (!liveWanted()) {
-                    liveClear();
-                    if (video.getAttribute("src")) video.style.display = "block";
-                    if (current) strip.style.display = "flex";
-                    updateActionBtns();
-                }
-                this.setDirtyCanvas?.(true, true);
-            },
-        });
-        return r;
-    };
 
     const live = {
         alive: () => !!node.graph,
