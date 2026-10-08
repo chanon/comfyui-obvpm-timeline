@@ -234,6 +234,23 @@ Pins are **appended** to any keyframe anchors already on the
 conditioning, so combinations like extend-toward-image (a before-pin
 plus a stock last-frame keyframe) are legal.
 
+**Very short takes.** A window is taken from the source's whole stored
+latent, not only from what it delivered. A take made by extending
+another clip keeps the frames it held from that clip ahead of its own
+(its pinned head: 35 + 33 = 68 raw frames for a 33-frame take), so a
+39-frame window ending at its end reaches 18 frames back into them and
+still fits; a take made by prepending likewise keeps the frames it led
+into (its pinned tail), which a prepend's window may run on into. They
+are the take's own latents, identical to the clip it continues there,
+so nothing about the join changes: the new take still starts at the
+cut. A root (no held frames) shorter than the window is refused as
+before. A pin from the take's pixels (`clip_pixels`, VAE-encoded from
+its file) has only the take's file, which holds just the delivered
+frames; there the frames before them are read from the file of the
+clip it continues, and a prepend's frames after them from the file of
+the clip it leads into (each found as the Result Preview finds it),
+and the window is refused if that file is gone.
+
 **Pins from clips with no sidecar.** When a spec names a file instead of
 carrying latents (`source_kind: clip_pixels` — what the Timeline emits
 for imported footage), Apply decodes just the pinned window out of that

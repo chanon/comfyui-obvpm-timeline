@@ -153,6 +153,7 @@ def _create_pins(bundle, clip, create_pins, pin_window, at_frame=None,
             "(encoded, so pixel-grade rather than exact)."
             % (create_pins, clip))
     take_from, place = mode
+    prepend = take_from == "head"
 
     # Continuation clips have off-grid edges: a pinned head pushes the
     # delivered content 5 past a group boundary (prepend case), a pinned
@@ -164,6 +165,7 @@ def _create_pins(bundle, clip, create_pins, pin_window, at_frame=None,
     # extra bookkeeping.
     meta = bundle["meta"]
     ph = int(meta.get("pinned_head_frames", 0) or 0)
+    pt = int(meta.get("pinned_tail_frames", 0) or 0)
     delivered = int(meta.get("delivered_frames", 0) or 0)
     w = int(pin_window)
     if at_frame is None:
@@ -173,14 +175,25 @@ def _create_pins(bundle, clip, create_pins, pin_window, at_frame=None,
         end = cut + w if take_from == "head" else cut
     off = (ph + end - w) % fr.FRAMES_PER_GROUP
     take_from_frame = 0
+    # The room is the take's whole stored latent, not only what it
+    # delivered: a take made by extending another one keeps the frames it
+    # held from that clip (its pinned head), a take made by prepending
+    # keeps the ones it led into (its pinned tail). A window may reach
+    # into them -- a very short take, or a cut close to its start, can
+    # still be continued -- and the join does not move: the new take
+    # still starts at the cut. (A window that needs no shifting is left
+    # to Apply Pins, which may snap it down to what there is.)
     if off:
         if take_from == "head":
             end += fr.FRAMES_PER_GROUP - off
-            if end > delivered:
+            if end > delivered + pt:
                 raise ValueError(
                     "create_pins: %s is too short to prepend to -- the "
                     "first latent-grade window ends at frame %d but only "
-                    "%d frames were delivered." % (clip, end, delivered))
+                    "%d frames were delivered%s." % (
+                        clip, end, delivered,
+                        " (+%d held from the clip it leads into)" % pt
+                        if pt else ""))
             skip = end - w
             _LOG.info(
                 "obvpm.h3: %s: head sits off the latent grid (continuation "
@@ -189,11 +202,13 @@ def _create_pins(bundle, clip, create_pins, pin_window, at_frame=None,
                 "new + this[%d:].", clip, end, skip, skip)
         else:
             end -= off
-            if end < w:
+            if ph + end < w:
                 raise ValueError(
                     "create_pins: %s is too short to extend -- no "
-                    "latent-grade %d-frame window fits before frame %d."
-                    % (clip, w, delivered))
+                    "latent-grade %d-frame window fits before frame %d%s."
+                    % (clip, w, delivered,
+                       " (even reaching %d frames back into the clip it "
+                       "continues)" % ph if ph else ""))
             _LOG.info(
                 "obvpm.h3: %s: tail sits off the latent grid (pinned-tail "
                 "clip); extend window shifted to end at frame %d, skipping "
@@ -201,6 +216,17 @@ def _create_pins(bundle, clip, create_pins, pin_window, at_frame=None,
                 "frame %d -- assemble as this[:%d] + new.",
                 clip, end, off, end, end)
         take_from, take_from_frame = "at_frame", end
+    if prepend and end > delivered:
+        _LOG.info(
+            "obvpm.h3: %s: the %d-frame prepend window reaches %d frames "
+            "into the clip this one leads into (its held tail).",
+            clip, w, end - delivered)
+    if not prepend and 0 <= end < w <= ph + end:
+        _LOG.info(
+            "obvpm.h3: %s: the %d-frame extend window reaches %d frames "
+            "back into the clip this one continues (its held head); the "
+            "new take still continues from frame %d.",
+            clip, w, w - end, end)
 
     # An explicit cut must be honoured whether or not it needed shifting.
     # This used to sit inside the `if off:` branch, so a cut that was

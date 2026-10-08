@@ -367,6 +367,192 @@ def _prepare_pins(pin_specs, snap_window_down_to_available, ctx=None):
     return pins
 
 
+def _lineage_pin(header, place):
+    """The take's one pin from a clip on that side ("before": the clip it
+    continues, "after": the clip it leads into), or None."""
+    pins = [s for s in mctx.parse_pins(header)
+            if s.get("place") == place and s.get("source_id")
+            and s.get("source_kind") in mctx.LINEAGE_KINDS]
+    return pins[0] if len(pins) == 1 else None
+
+
+def _lineage_file(path, p):
+    """The file of the clip pin `p` of the take at `path` names, found as
+    the Result Preview finds it: by sidecar id in the take's folder, then
+    the path the recipe recorded -- and the hash still decides what that
+    clip is. None when it is gone."""
+    import os
+
+    from . import nodes_load
+
+    pid = p["source_id"]
+    ap = os.path.abspath(path)
+    side = mctx.scan_for_parent(os.path.dirname(ap), pid)
+    if side:
+        cand = side[:-len(mctx.SIDECAR_SUFFIX)] + ".mp4"
+        if os.path.isfile(cand):
+            return cand
+    if p.get("source_path"):
+        try:
+            cand = nodes_load.resolve_clip_path(p["source_path"])
+        except Exception:
+            cand = None
+        if cand and os.path.isfile(cand) \
+                and nodes_load._cached_hash(cand) == pid:
+            return cand
+    return None
+
+
+def _file_frame(p, raw, fpath):
+    """The frame of the clip pin `p` names, in its FILE, under its frame
+    `raw` in the recipe's coordinates: a latent recipe counts the clip's
+    raw frames (its own held head first), a pixel recipe its file's."""
+    if p.get("source_kind") != "clip":
+        return raw
+    try:
+        h = mctx.read_header(mctx.sidecar_path(fpath))
+    except (OSError, ValueError):
+        return None
+    return raw - int(h.get("pinned_head_frames", 0) or 0)
+
+
+def _file_frames(fpath):
+    """How many frames the file holds: its sidecar's delivered count, or
+    the file itself when it has none."""
+    try:
+        h = mctx.read_header(mctx.sidecar_path(fpath))
+        return int(h.get("delivered_frames", 0) or 0)
+    except (OSError, ValueError):
+        from . import nodes_encode as ne
+        return int(ne.probe_clip(fpath)["frames"])
+
+
+def _parent_frames(path, header, k):
+    """Where the take at `path` continues from, as (parent file, the
+    parent's frame under the take's delivered frame 0), when the parent's
+    file holds the `k` frames before that; else None.
+
+    A take's held head IS the frames of the clip it continues: its raw
+    frame r is that clip's raw frame `source_start + r` (a latent recipe;
+    a pixel recipe counts the parent file's own frames). Its delivered
+    frame 0 is raw frame `pinned_head`.
+    """
+    ph = int(header.get("pinned_head_frames", 0) or 0)
+    p = _lineage_pin(header, "before")
+    if ph < k or p is None:
+        return None
+    ppath = _lineage_file(path, p)
+    if ppath is None:
+        _LOG.warning("obvpm.h3: %s is too short for its window, and the "
+                     "clip it continues (%s) was not found to read the "
+                     "frames before it from", path, p["source_id"][:12])
+        return None
+    p0 = _file_frame(p, int(p.get("source_start", 0) or 0) + ph, ppath)
+    if p0 is None:
+        return None
+    if p0 < k:
+        _LOG.warning("obvpm.h3: %s's window would reach %d frames back, "
+                     "past the start of the clip it continues (%s)",
+                     path, k, ppath)
+        return None
+    return ppath, p0
+
+
+def _child_frames(path, header, k):
+    """The other way round, for a take made by prepending: (the file of
+    the clip it leads into, that file's frame right after the take's
+    last), when that file holds the `k` frames from there; else None.
+
+    A prepend-made take's held tail IS the frames of the clip it leads
+    into: the last `source_frames` of its raw frames are that clip's raw
+    `source_start` on. The frames a soft or edge hold handed over sit
+    before the tail, delivered, so the take's file ends at that clip's
+    raw `source_start + source_frames - pinned_tail` -- where the
+    recipe's join is.
+    """
+    pt = int(header.get("pinned_tail_frames", 0) or 0)
+    p = _lineage_pin(header, "after")
+    if pt < k or p is None:
+        return None
+    cpath = _lineage_file(path, p)
+    if cpath is None:
+        _LOG.warning("obvpm.h3: %s is too short for its window, and the "
+                     "clip it leads into (%s) was not found to read the "
+                     "frames after it from", path, p["source_id"][:12])
+        return None
+    q0 = _file_frame(p, int(p.get("source_start", 0) or 0)
+                     + int(p.get("source_frames", 0) or 0) - pt, cpath)
+    if q0 is None:
+        return None
+    if q0 < 0 or q0 + k > _file_frames(cpath):
+        _LOG.warning("obvpm.h3: %s's window would run %d frames on, past "
+                     "the end of the clip it leads into (%s)",
+                     path, k, cpath)
+        return None
+    return cpath, q0
+
+
+def _decode_span(path, info, start, n, read_at):
+    """`n` frames of the file from `start`, its sound read `read_at`
+    audio steps off its frames (see _audio_at_phase)."""
+    from . import nodes_encode as ne
+
+    images, audio = ne.decode_window(path, start, n, info=info)
+    if abs(read_at) > 1e-6:
+        audio = _audio_at_phase(path, start, n, read_at,
+                                int(info["frames"]))
+    return images, audio
+
+
+def _join_frames(parts, own):
+    """Frames of several files one after the other, each brought to the
+    size of parts[own] -- the take's (a parent or child made at another
+    size)."""
+    import torch
+
+    size = tuple(parts[own].shape[1:3])
+    out = []
+    for x in parts:
+        if tuple(x.shape[1:3]) != size:
+            x = torch.nn.functional.interpolate(
+                x.movedim(-1, 1), size=size,
+                mode="bilinear", align_corners=False).movedim(1, -1)
+        out.append(x)
+    return torch.cat(out, dim=0)
+
+
+def _join_audio(parts, own):
+    """Several files' sound one after the other, each part an (audio,
+    frames) pair, at the rate and channels of parts[own] -- the take's.
+    A silent other file is silence for its frames, so every part's sound
+    stays under its own frames; a silent take is no sound at all."""
+    import torch
+
+    base = parts[own][0]
+    if base is None:
+        return None
+    b = base["waveform"]
+    rb = int(base["sample_rate"])
+    out = []
+    for i, (aud, frames) in enumerate(parts):
+        if i == own:
+            out.append(b)
+            continue
+        if aud is None:
+            k = int(round(frames / float(fr.FPS) * rb))
+            out.append(b.new_zeros(b.shape[:-1] + (k,)))
+            continue
+        a = aud["waveform"]
+        ra = int(aud["sample_rate"])
+        if ra != rb:
+            import torchaudio
+            a = torchaudio.functional.resample(a, ra, rb)
+        if a.shape[1] != b.shape[1]:
+            a = a.mean(dim=1, keepdim=True).expand(-1, b.shape[1], -1)
+        out.append(a.to(b))
+    return {"waveform": torch.cat(out, dim=-1), "sample_rate": rb}
+
+
 def _prepare_pixel_pin(i, spec, snap_down, ctx):
     """A pin from a clip with no usable sidecar: decode, encode, slice.
 
@@ -399,32 +585,56 @@ def _prepare_pixel_pin(i, spec, snap_down, ctx):
 
     path = nodes_load.resolve_clip_path(clip)
     info = ne.probe_clip(path)
-    available = int(info["frames"])
+    frames = int(info["frames"])
     take_from = spec.get("take_from", "tail")
     cut = int(spec.get("take_from_frame", 0) or 0)
-    if take_from == "at_frame":
-        if cut < 1 or cut > available:
-            raise ValueError(
-                "H3MCtxApplyPins: spec %d's cut frame %d is outside %s "
-                "(1..%d frames at 24 fps)." % (i, cut, clip, available))
-        available = cut
-    elif take_from not in ("tail", "head"):
+    if take_from not in ("tail", "head", "at_frame"):
         raise ValueError(
             "H3MCtxApplyPins: spec %d has unknown take_from %r."
             % (i, take_from))
 
+    try:
+        header = mctx.read_header(mctx.sidecar_path(path))
+    except (OSError, ValueError):
+        header = None
+
     n = int(spec.get("requested_window", 22))
-    if n > available:
-        snapped = fr.snap_window(available)
+    # The window may run past either end of the file, as the latent route
+    # reaches into the take's held frames: a window ending at a cut back
+    # into the clip this take continues (_parent_frames), a prepend's on
+    # into the clip it leads into (_child_frames). Those frames are read
+    # from that clip's file, and only looked for when the file alone is
+    # too short.
+    reach = ahead = None
+    if take_from == "head":
+        available = frames
+        if n > available and header:
+            ahead = _child_frames(path, header, n - available)
+        room = available + (n - available if ahead else 0)
+    else:
+        available = frames
+        if take_from == "at_frame":
+            if cut > frames and header and spec.get("place") == "after":
+                ahead = _child_frames(path, header, cut - frames)
+            if cut < 1 or (cut > frames and not ahead):
+                raise ValueError(
+                    "H3MCtxApplyPins: spec %d's cut frame %d is outside %s "
+                    "(1..%d frames at 24 fps)." % (i, cut, clip, frames))
+            available = cut
+        if n > available and header:
+            reach = _parent_frames(path, header, n - available)
+        room = available + (n - available if reach else 0)
+    if n > room:
+        snapped = fr.snap_window(room)
         if not snap_down or snapped is None or snapped == 1:
             raise ValueError(
                 "H3MCtxApplyPins: spec %d wants a %d frame window but %s "
                 "only offers %d frames (%s). Enable "
                 "snap_window_down_to_available to use %s instead."
-                % (i, n, clip, available, take_from,
+                % (i, n, clip, room, take_from,
                    snapped if snapped and snapped > 1 else "nothing"))
         _LOG.warning("obvpm.h3: spec %d window %d -> %d (only %d frames "
-                     "available in %s)", i, n, snapped, available, clip)
+                     "available in %s)", i, n, snapped, room, clip)
         n = snapped
     if n == 1:
         raise ValueError(
@@ -436,22 +646,17 @@ def _prepare_pixel_pin(i, spec, snap_down, ctx):
         start = 0
     else:                       # tail, and at_frame (which ENDS at `cut`)
         start = available - n
-    if start < 0:
+    if start < 0 and not reach:
         raise ValueError(
             "H3MCtxApplyPins: spec %d's %d frame window does not fit "
             "before frame %d of %s." % (i, n, available, clip))
 
-    images, audio = ne.decode_window(path, start, n, info=info)
     # A clip WITH a sidecar pinned from its pixels: the same window pinned
     # from the sidecar's latents is sliced from the nearest audio step and
     # carries the clip's own phase. Read the sound off the file at that
     # same phase, so both routes hold the same timing. A file with no
     # sidecar has no audio grid: read on frame.
-    phase = 0.0
-    try:
-        header = mctx.read_header(mctx.sidecar_path(path))
-    except (OSError, ValueError):
-        header = None
+    phase, read_at = 0.0, 0.0
     if header:
         raw_lo = int(header.get("pinned_head_frames", 0) or 0) + start
         src_phase = header_audio_phase(header)
@@ -460,9 +665,42 @@ def _prepare_pixel_pin(i, spec, snap_down, ctx):
         # an older file's sound already carries the clip's own phase
         read_at = phase if header_audio_synced(header) else (
             phase - header_audio_phase(header))
-        if abs(read_at) > 1e-6:
-            audio = _audio_at_phase(path, start, n, read_at,
-                                    int(info["frames"]))
+    own = max(0, start)
+    past = max(0, start + n - frames)       # frames after the file's last
+    if own >= frames or n - (own - start) - past < 1:
+        raise ValueError(
+            "H3MCtxApplyPins: spec %d's %d frame window (frames %d..%d) "
+            "holds none of %s's own %d frames."
+            % (i, n, start, start + n - 1, clip, frames))
+    images, audio = _decode_span(path, info, own, n - (own - start) - past,
+                                 read_at)
+    # The same moments in both files: the held head IS the parent's
+    # frames and the held tail the child's, so their sound is read at the
+    # take's phase too
+    img_parts, aud_parts, mine = [images], [(audio, 0)], 0
+    if start < 0:
+        ppath, p0 = reach
+        pinfo = ne.probe_clip(ppath)
+        head_img, head_aud = _decode_span(ppath, pinfo, p0 + start, -start,
+                                          read_at)
+        img_parts.insert(0, head_img)
+        aud_parts.insert(0, (head_aud, -start))
+        mine = 1
+        _LOG.info("obvpm.h3: pixel pin from %s reaches %d frames back into "
+                  "%s (its frames %d..%d)", clip, -start, ppath,
+                  p0 + start, p0 - 1)
+    if past:
+        cpath, q0 = ahead
+        cinfo = ne.probe_clip(cpath)
+        tail_img, tail_aud = _decode_span(cpath, cinfo, q0, past, read_at)
+        img_parts.append(tail_img)
+        aud_parts.append((tail_aud, past))
+        _LOG.info("obvpm.h3: pixel pin from %s runs %d frames on into %s "
+                  "(its frames %d..%d)", clip, past, cpath, q0,
+                  q0 + past - 1)
+    if len(img_parts) > 1:
+        images = _join_frames(img_parts, mine)
+        audio = _join_audio(aud_parts, mine)
     a_window = int(spec.get("audio_window", 0) or 0)
     if a_window > n:
         _LOG.warning("obvpm.h3: audio_window %d exceeds the %d frame "
@@ -674,19 +912,31 @@ def _prepare_clip_pin(i, spec, snap_down):
                 "refusing." % (meta_raw, raw_frames))
         delivered = int(meta.get("delivered_frames", raw_frames))
         pinned_head = int(meta.get("pinned_head_frames", 0))
+        pinned_tail = int(meta.get("pinned_tail_frames", 0) or 0)
         take_from = spec.get("take_from", "tail")
         cut_frame = int(spec.get("take_from_frame", 0))
 
-        # window availability depends on where it's taken from
+        # Window availability depends on where it's taken from -- and the
+        # room is the source's whole stored latent: a window ending at a
+        # cut may reach back into the frames the source held from the
+        # clip it continues (its pinned head), and a prepend's window may
+        # reach on into the ones it led into (its pinned tail). They are
+        # the source's own latents, continuous with what it delivered, so
+        # a very short take can still be continued; the window's END,
+        # where the new take joins, stays where it was asked to be.
         if take_from == "at_frame":
-            if cut_frame < 1 or cut_frame > delivered:
+            hi = delivered + (pinned_tail
+                              if spec.get("place") == "after" else 0)
+            if cut_frame < 1 or cut_frame > hi:
                 raise ValueError(
                     "H3MCtxApplyPins: spec %d's cut frame %d is outside the "
                     "source's delivered range (1..%d)."
-                    % (i, cut_frame, delivered))
-            available = cut_frame
-        elif take_from in ("tail", "head"):
-            available = delivered
+                    % (i, cut_frame, hi))
+            available = pinned_head + cut_frame
+        elif take_from == "tail":
+            available = pinned_head + delivered
+        elif take_from == "head":
+            available = delivered + pinned_tail
         else:
             raise ValueError(
                 "H3MCtxApplyPins: spec %d has unknown take_from %r."
@@ -727,6 +977,10 @@ def _prepare_clip_pin(i, spec, snap_down):
         else:
             d_start = cut_frame - n
         raw_start = pinned_head + d_start
+        if d_start < 0:
+            _LOG.info("obvpm.h3: spec %d's %d frame window reaches %d frames "
+                      "back into the clip its source continues (the "
+                      "source's held head)", i, n, -d_start)
 
         # Latent-grade cut rule: phase-0 slice starts occur only at
         # 17-frame group boundaries. This one check covers everything the
@@ -737,7 +991,7 @@ def _prepare_clip_pin(i, spec, snap_down):
             hi = lo + fr.FRAMES_PER_GROUP
             suggest = sorted(set(
                 b - pinned_head + n for b in (lo, hi)
-                if 0 <= b - pinned_head and b - pinned_head + n <= delivered))
+                if 0 <= b and 1 <= b - pinned_head + n <= delivered))
             raise ValueError(
                 "H3MCtxApplyPins: spec %d's window would start at raw frame "
                 "%d, which is not on the 17-frame latent grid -- the slice "
