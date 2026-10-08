@@ -176,7 +176,10 @@ class H3ResultPreview:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {
+            # optional: the Save node feeding it may be muted for this Run
+            # (the timeline mutes the half a Run does not use); with
+            # nothing in, the preview keeps showing what it showed
+            "optional": {
                 "path": ("STRING", {
                     "forceInput": True,
                     "tooltip": "The saved clip's path -- wire the path "
@@ -185,7 +188,7 @@ class H3ResultPreview:
         }
 
     @classmethod
-    def IS_CHANGED(cls, path):
+    def IS_CHANGED(cls, path=None):
         # The measurement version rides along so that changing how seams
         # are judged re-runs every preview once. Without it a clip whose
         # file has not moved keeps showing a verdict from the old metric
@@ -206,7 +209,9 @@ class H3ResultPreview:
             p = os.path.join(folder_paths.get_output_directory(), p)
         return os.path.abspath(p)
 
-    def show(self, path):
+    def show(self, path=None):
+        if not path:
+            return {"ui": {}}
         root = os.path.abspath(folder_paths.get_output_directory())
         ap = self._abs(path)
         if os.path.commonpath([root, ap]) != root:

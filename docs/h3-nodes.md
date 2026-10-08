@@ -288,7 +288,17 @@ same latent line either way.
 
 **Switching branches.** A workflow that can both generate a take and
 refine the timeline holds two branches that must never run together.
-Put a **Mute If** gate (comfyui-obvpm) on the last wire before each
+Put each branch in its own group with a **Mute Group If** node
+(comfyui-obvpm) inside it, its `mute` wired from `upscaling`: `invert`
+off in the generation groups (muted while upscaling), on in the refine
+group (muted while generating). The muted half is left out of the Run
+entirely -- its loaders, image composes and samplers never start -- and
+shows greyed; shared work (model loading, settings, the inputs, the
+previews) belongs outside those groups. The `upscaling` output is known
+before a Run, which is what Mute Group If needs.
+
+The gates below still work, alone or as a safety net beside the
+groups. Put a **Mute If** gate (comfyui-obvpm) on the last wire before each
 branch's own work begins and drive both from `upscaling`: the
 generation branch's gate on `length` → MiniMax H3 Reference to Video,
 muted when `upscaling` is true; the refine branch's gate on `sequence`
@@ -376,7 +386,9 @@ Load.
 ## H3 MCtx Result Preview
 
 Mini timeline of a just-saved take in its lineage context. Wire a Save
-node's `path` output to the `path` input; after each run the widget
+node's `path` output to the `path` input (optional: while the Save node
+is muted for a Run, nothing arrives and the preview keeps what it
+shows); after each run the widget
 shows the take beside its parent (extend), its target (prepend), or
 between both (bridge), playable as one seamless preview.
 

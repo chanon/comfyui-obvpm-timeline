@@ -201,6 +201,13 @@ class ResultPreviewFindsAParentElsewhere(OutputFolder):
         self.assertEqual(got["sequence"],
                          "elsewhere/clip_00001.mp4\nV_Project/clip_00002.mp4")
 
+    def test_nothing_wired_shows_nothing_new(self):
+        # the Save node feeding it is muted for this Run: no path arrives,
+        # and an empty ui sends no `executed`, so the preview keeps its take
+        self.assertIn("path", nodes_result.H3ResultPreview.INPUT_TYPES()["optional"])
+        self.assertEqual(nodes_result.H3ResultPreview().show(), {"ui": {}})
+        self.assertTrue(nodes_result.H3ResultPreview.IS_CHANGED())
+
     def test_without_a_recorded_path_it_is_not(self):
         # an older take (saved before the path was recorded)
         got = self.take("elsewhere/clip_00001.mp4", recorded=False)
