@@ -197,14 +197,17 @@ def audio_span(frame_a, frame_b):
 def audio_overhang(total_audio_t, frame_count):
     """Fraction of a step the audio grid extends past the last frame.
 
-    H3 rounds the audio grid UP (124 frames want 206.67 steps, the layout
-    allocates 207), so a clip's final audio step reaches ~overhang/40 s
-    beyond its last pixel frame. Callers compensate window placement with
-    it. Returns 0.0 (with no complaint) when the grid looks unexpected --
-    the caller logs, this module stays torch- and logging-free.
+    Core sizes a clip's audio to the NEAREST step (round(seconds * 40)),
+    so its last step can end after the last pixel frame or before it: 124
+    frames want 206.67 steps and get 207 (+1/3, ~8.3 ms past the end), 362
+    frames want 603.33 and get 603 (-1/3, ~8.3 ms short of it). One frame
+    in three on the 17k+5 grid is the second kind. A grid rounded UP
+    (0 <= overhang < 1) is taken as well. Callers compensate window
+    placement with it. Returns None when the grid fits neither -- the
+    caller logs, this module stays torch- and logging-free.
     """
     overhang = total_audio_t - FRAME_RESCALE * frame_count
-    if not (0.0 <= overhang < 1.0):
+    if not (-0.5 < overhang < 1.0):
         return None
     return float(overhang)
 
@@ -322,10 +325,13 @@ def _self_test():
         prev = boundary
     assert acc == audio_total(430)
 
-    # overhang
+    # overhang: core's nearest-step grid ends after the last frame or
+    # before it
     assert audio_overhang(207, 124) is not None
     assert abs(audio_overhang(207, 124) - (207 - FRAME_RESCALE * 124)) < 1e-9
+    assert abs(audio_overhang(603, 362) + 1.0 / 3.0) < 1e-9
     assert audio_overhang(999, 124) is None  # unexpected grid -> None
+    assert audio_overhang(602, 362) is None
 
     # tail_slice_start refusal
     try:

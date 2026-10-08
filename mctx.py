@@ -274,6 +274,13 @@ def serialize_pins(pin_specs):
         # before it keep both their recipe and the cut it implies.
         if spec.get("handover_edge"):
             e["handover_edge"] = True
+        # The source's audio steps the held sound came from: the upscale
+        # lays this take's sound by them (nodes_joint.lineage_ticks).
+        # Written whenever the slice recorded them; older recipes are
+        # placed by the rule they were sliced with.
+        if spec.get("audio_start_step") is not None:
+            e["audio_start_step"] = int(spec["audio_start_step"])
+            e["audio_steps"] = int(spec.get("audio_steps", 0) or 0)
         # The timeline part the pin was taken from, and the cut it was
         # queued at (null = the clip's own edge). Written only when the
         # pin named a part, so every other recipe is unchanged. See

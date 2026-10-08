@@ -489,12 +489,9 @@ def apply_masked_pins(latent, masked_pins, audio_feather_ticks=8,
                     "/".join(str(SHARED_AV_GRID_BASE + SHARED_AV_GRID_STEP * k)
                              for k in range(5)))
 
-        if float(pin.get("overhang", 0.0)) and place == "before":
-            _LOG.warning(
-                "obvpm.h3: masked prefix audio carries the source's "
-                "clip-end overhang (~%.1f ms); for a bit-exact prefix use "
-                "a parent whose delivered length is on the 39/90/141 grid",
-                float(pin["overhang"]) * 1000.0 / fr.AUDIO_LATENT_FPS)
+        # (a held window whose sound starts between audio steps keeps it
+        # there; the take's file is cut on its frames instead -- see
+        # nodes_pins: audio phase)
         _LOG.info(
             "obvpm.h3: masked %s-pin preserved %d frames = %d video steps "
             "/ %d audio ticks of a %d frame target (%s-grade)",

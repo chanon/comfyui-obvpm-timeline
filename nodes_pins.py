@@ -14,6 +14,7 @@ capability without changing these interfaces.
 """
 
 import logging
+import math
 
 import node_helpers
 
@@ -441,6 +442,27 @@ def _prepare_pixel_pin(i, spec, snap_down, ctx):
             "before frame %d of %s." % (i, n, available, clip))
 
     images, audio = ne.decode_window(path, start, n, info=info)
+    # A clip WITH a sidecar pinned from its pixels: the same window pinned
+    # from the sidecar's latents is sliced from the nearest audio step and
+    # carries the clip's own phase. Read the sound off the file at that
+    # same phase, so both routes hold the same timing. A file with no
+    # sidecar has no audio grid: read on frame.
+    phase = 0.0
+    try:
+        header = mctx.read_header(mctx.sidecar_path(path))
+    except (OSError, ValueError):
+        header = None
+    if header:
+        raw_lo = int(header.get("pinned_head_frames", 0) or 0) + start
+        src_phase = header_audio_phase(header)
+        phase = (src_phase + slice_step(raw_lo, src_phase)
+                 - raw_lo * fr.FRAME_RESCALE)
+        # an older file's sound already carries the clip's own phase
+        read_at = phase if header_audio_synced(header) else (
+            phase - header_audio_phase(header))
+        if abs(read_at) > 1e-6:
+            audio = _audio_at_phase(path, start, n, read_at,
+                                    int(info["frames"]))
     a_window = int(spec.get("audio_window", 0) or 0)
     if a_window > n:
         _LOG.warning("obvpm.h3: audio_window %d exceeds the %d frame "
@@ -451,7 +473,7 @@ def _prepare_pixel_pin(i, spec, snap_down, ctx):
         width=ctx["width"], height=ctx["height"],
         fps=fr.FPS,                 # decode_window already resampled
         keep="head", max_frames=0, fit=ctx.get("fit", "cover"),
-        audio=audio)
+        audio=audio, audio_phase=phase)
     _LOG.info("obvpm.h3: pixel pin from %s: frames %d..%d of %d (%s), "
               "encoded at %dx%d -- pixel-grade, unverified",
               clip, start, start + n - 1, int(info["frames"]), take_from,
@@ -482,6 +504,155 @@ def _prepare_pixel_pin(i, spec, snap_down, ctx):
         source_start=start, source_frames=n)
     pin["source_id"] = source_id
     return pin
+
+
+# ---------------------------------------------------------------------------
+# audio phase: where a clip's stored sound sits against its own frames
+# ---------------------------------------------------------------------------
+#
+# Audio steps (40 Hz) and frames (24 fps) meet only every third frame. A
+# pin window starting between two steps is sliced from the nearest one,
+# so the take's sound -- held and generated alike -- runs a third of a
+# step early or late against its own picture. That is NOT corrected in
+# the latents: a take's sound stays on its parent's audio grid, which is
+# exactly what the joint upscale lays every clip on (one grid per
+# stretch), and what makes a chain of extends line up there. It is
+# corrected where sound meets frames: the delivered MP4's sound is cut
+# that much earlier or later (H3TrimPinned), so the file, and every
+# preview and export built from files, plays in sync.
+#
+# The phase is in audio steps: + means the sound at a given moment of
+# the file is from slightly LATER than the picture (cut it earlier).
+
+
+def shifted_samples(wave, lo, hi):
+    """wave[..., lo:hi], mirroring the sound past either end instead of
+    leaving silence (a shift of a few ms can reach just past the decoded
+    sound, at the very place a join is made)."""
+    import torch
+
+    n = int(wave.shape[-1])
+    a, b = max(0, lo), min(n, hi)
+    if a >= b:
+        return wave[..., :0].new_zeros(wave.shape[:-1] + (max(0, hi - lo),))
+    out = wave[..., a:b]
+    if lo < a:
+        k = a - lo
+        head = wave[..., a + 1:a + 1 + k].flip(-1)
+        if int(head.shape[-1]) < k:
+            head = torch.cat([head.new_zeros(head.shape[:-1] + (
+                k - int(head.shape[-1]),)), head], dim=-1)
+        out = torch.cat([head, out], dim=-1)
+    if hi > b:
+        k = hi - b
+        tail = wave[..., max(0, b - 1 - k):b - 1].flip(-1)
+        if int(tail.shape[-1]) < k:
+            tail = torch.cat([tail, tail.new_zeros(tail.shape[:-1] + (
+                k - int(tail.shape[-1]),))], dim=-1)
+        out = torch.cat([out, tail], dim=-1)
+    return out
+
+
+def slice_step(frame, phase):
+    """The audio step a window starting at `frame` is sliced from: the one
+    nearest that frame's moment in TRUE time, for a source whose sound
+    sits `phase` steps off its frames. Choosing it this way (not merely
+    the step nearest the frame on the source's own grid) keeps every
+    take within half a step of its frames: phases never add up along a
+    chain."""
+    return int(math.floor(frame * fr.FRAME_RESCALE - float(phase) + 0.5))
+
+
+def phase_samples(phase, rate):
+    """A phase in audio steps as whole samples at `rate`."""
+    return int(round(float(phase) * rate / float(fr.AUDIO_LATENT_FPS)))
+
+
+def pins_audio_phase(pins, raw_frames):
+    """The take's audio phase, from the pins that made it (resolved pins,
+    as Apply returns them). The extend side decides on a bridge: its held
+    window is where the take's sound starts from."""
+    pins = list(pins or [])
+    for p in pins:
+        if p.get("place") == "before":
+            return float(p.get("audio_phase", 0.0) or 0.0)
+    for p in pins:
+        if p.get("place") == "after" and p.get("audio_steps"):
+            # held at the take's END: its first step sits where the
+            # masked placement puts it, which may itself be between steps
+            covered = int(p.get("covered", 0) or 0)
+            a_lo = fr.audio_total(int(raw_frames)) - int(p["audio_steps"])
+            gap = a_lo - (int(raw_frames) - covered) * fr.FRAME_RESCALE
+            return float(p.get("audio_phase", 0.0) or 0.0) - gap
+    return 0.0
+
+
+def header_audio_phase(header):
+    """A saved clip's audio phase. Recorded by takes saved since it was
+    (`audio_phase`); for older ones, worked out from the recipe the way
+    their slice was made, taking the clip they continue as on its own
+    grid (a root, or a take whose length is on the shared AV grid)."""
+    if not header:
+        return 0.0
+    v = header.get("audio_phase")
+    if v not in (None, ""):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            pass
+    pins = mctx.parse_pins(header)
+    raw = int(header.get("raw_frames", 0) or 0)
+
+    def sliced(p):
+        if p.get("source_kind") != "clip":
+            return None              # encoded from pixels: on its frame
+        start = int(p.get("source_start", 0) or 0)
+        n = int(p.get("source_frames", 0) or 0)
+        a_lo = start + n - (int(p.get("audio_window", 0) or 0) or n)
+        return fr.audio_total(a_lo) - a_lo * fr.FRAME_RESCALE, n, start, a_lo
+    for p in pins:
+        if p.get("place") == "before":
+            got = sliced(p)
+            return float(got[0]) if got else 0.0
+    for p in pins:
+        if p.get("place") == "after":
+            got = sliced(p)
+            if not got:
+                return 0.0
+            off, n, start, a_lo = got
+            steps = fr.audio_total(start + n) - fr.audio_total(a_lo)
+            gap = (fr.audio_total(raw) - steps) - (raw - n) * fr.FRAME_RESCALE
+            return float(off - gap)
+    return 0.0
+
+
+def _audio_at_phase(path, start, n, phase, frames):
+    """The file's sound under frames start..start+n, read `phase` audio
+    steps later (earlier when negative). Past either end of the file's
+    sound (`frames` long: our files are cut to their frames) it is
+    mirrored rather than silent -- an extend's window ends at the clip's
+    last frame, which is exactly where the take continues from."""
+    from . import nodes_encode as ne
+
+    step = phase / float(fr.AUDIO_LATENT_FPS)
+    t0 = start / float(fr.FPS) + step
+    t1 = (start + n) / float(fr.FPS) + step
+    end = frames / float(fr.FPS)
+    a, b = max(0.0, t0), min(t1, end)
+    got = ne._decode_audio_range(path, a, b)
+    if got is None or (t0 >= 0 and t1 <= end):
+        return got
+    sr = int(got["sample_rate"])
+    wave = got["waveform"]
+    lead = int(round((a - t0) * sr))
+    total = int(round((t1 - t0) * sr))
+    return {"waveform": shifted_samples(wave, -lead, total - lead),
+            "sample_rate": sr}
+
+
+def header_audio_synced(header):
+    """Was this clip's MP4 saved with its sound cut on its own frames?"""
+    return str((header or {}).get("audio_synced", "")) == "1"
 
 
 def _prepare_clip_pin(i, spec, snap_down):
@@ -594,31 +765,33 @@ def _prepare_clip_pin(i, spec, snap_down):
                 "H3MCtxApplyPins: %d steps cover %d frames, expected %d. "
                 "Upstream VAE grid change; refusing." % (steps, covered, n))
 
-        # Audio: end-aligned with the video window's END, boundaries on
-        # the cumulative grid, never converted deltas.
+        # Audio: end-aligned with the video window's END. It starts on the
+        # step nearest the window's first frame in TRUE time -- the
+        # source's own audio phase included (slice_step) -- so the take's
+        # sound is never more than half a step off its frames, however
+        # many off-grid windows a chain goes through.
         a_frames = int(spec.get("audio_window", 0)) or n
         total_t = int(audio.shape[-1])
         a_lo = max(0, raw_end - a_frames)
-        start_idx = fr.audio_total(a_lo)
-        end_idx = min(total_t, fr.audio_total(raw_end))
+        meta_phase = header_audio_phase(meta)
+        start_idx = max(0, slice_step(a_lo, meta_phase))
+        want = fr.audio_span(a_lo, raw_end)
+        end_idx = min(total_t, start_idx + want)
         rt = max(0, end_idx - start_idx)
-        if rt < fr.audio_span(a_lo, raw_end):
+        if rt < want:
             _LOG.warning("obvpm.h3: audio window wants %d steps, the latent "
-                         "supplies %d; pinning what there is",
-                         fr.audio_span(a_lo, raw_end), rt)
-        # The grid overhang only exists at the CLIP's end; an interior
-        # window ends exactly on its boundary coordinate.
-        if raw_end == raw_frames:
-            overhang = fr.audio_overhang(total_t, raw_frames)
-            if overhang is None:
-                _LOG.warning("obvpm.h3: unexpected audio grid (%d steps for "
-                             "%d frames); assuming no overhang",
-                             total_t, raw_frames)
-                overhang = 0.0
-        else:
-            overhang = 0.0
+                         "supplies %d; pinning what there is", want, rt)
+        if raw_end == raw_frames and fr.audio_overhang(total_t,
+                                                       raw_frames) is None:
+            _LOG.warning("obvpm.h3: unexpected audio grid (%d steps for %d "
+                         "frames)", total_t, raw_frames)
         audio_slice = (audio[:1, ..., start_idx:end_idx].clone()
                        if rt > 0 else None)
+        # Where the held sound sits against the window's first frame, in
+        # audio steps (see pins_audio_phase), and so how far its end
+        # reaches past the window's last frame
+        phase = meta_phase + (start_idx - a_lo * fr.FRAME_RESCALE)
+        overhang = phase + rt - (raw_end - a_lo) * fr.FRAME_RESCALE
 
         return {
             "kind": "clip",
@@ -629,6 +802,7 @@ def _prepare_clip_pin(i, spec, snap_down):
             "audio": audio_slice,
             "audio_steps": rt,
             "overhang": overhang,
+            "audio_phase": phase,
             "width": int(video.shape[4]) * 16,
             "height": int(video.shape[3]) * 16,
             "origin": bundle.get("origin", "sampled"),
@@ -644,6 +818,10 @@ def _prepare_clip_pin(i, spec, snap_down):
                 {k: v for k, v in spec.items() if k != "source"},
                 source_start=raw_start,
                 source_frames=n,
+                # the source's audio steps it holds: where the upscale lays
+                # this clip's sound against its parent's (nodes_joint)
+                audio_start_step=start_idx,
+                audio_steps=rt,
             ),
         }
 
@@ -884,9 +1062,10 @@ class H3MCtxApplyPins:
                 # on the target timeline: frame `covered` for a
                 # before-pin, `frame_count` for an after-pin. The sliced
                 # audio reaches `overhang` of a step past the source
-                # slice's end (nonzero only when the slice ends at the
-                # source clip's end), so the end coordinate moves by that
-                # much, then snaps onto the target's own audio grid (a
+                # slice's end, or short of it when negative (nonzero only
+                # when the slice ends at the source clip's end), so the
+                # end coordinate moves by that much, then snaps onto the
+                # target's own audio grid (a
                 # third of a step is 8.3 ms; the snap stops the offset
                 # cycling across chains). Core anchors an audio window's
                 # START at FRAME_RESCALE * resolved_frame_index and
@@ -1033,16 +1212,28 @@ class H3TrimPinned:
                     "H3TrimPinned: trimming %.3fs+%.3fs from %.3fs of audio "
                     "leaves nothing. Wire the audio decoded from this same "
                     "clip." % (cut_head / sr, cut_tail / sr, length / sr))
-            waveform = waveform[..., cut_head:length - cut_tail]
+            # Cut on the take's OWN frames: its sound sits `phase` audio
+            # steps off them (a pin window that started between steps),
+            # so the delivered sound starts that much earlier or later in
+            # the decode. The latents keep it -- see pins_audio_phase.
+            phase = pins_audio_phase(pins, total)
+            shift = phase_samples(phase, sr)
+            start = cut_head - shift
             # tail-match unconditionally: exactly one right answer (the
             # ~8 ms/clip audio surplus compounds at every join otherwise)
             want = int(round(remaining / float(fr.FPS) * sr))
-            have = int(waveform.shape[-1])
-            if have > want:
+            # never invent more than the shift itself past the decode
+            end = min(start + want, length - cut_tail + abs(shift))
+            if length - cut_head - cut_tail > want:
                 _LOG.info("obvpm.h3: tail-matched audio, cut %d samples "
-                          "(%.2f ms)", have - want,
-                          (have - want) / sr * 1000.0)
-                waveform = waveform[..., :want]
+                          "(%.2f ms)", length - cut_head - cut_tail - want,
+                          (length - cut_head - cut_tail - want) / sr * 1000.0)
+            if shift:
+                _LOG.info("obvpm.h3: delivered sound cut %.1f ms %s, on the "
+                          "take's own frames (its pin window started "
+                          "between two audio steps)", abs(shift) / sr * 1000.0,
+                          "earlier" if shift > 0 else "later")
+            waveform = shifted_samples(waveform, start, end)
             out_audio = {"waveform": waveform, "sample_rate": sr}
         elif head or tail:
             _LOG.info("obvpm.h3: trimmed %d head / %d tail frames with no "

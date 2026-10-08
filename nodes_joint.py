@@ -259,6 +259,64 @@ def raw_starts(lines, headers, cuts=None):
     return starts
 
 
+def lineage_ticks(headers, ticks):
+    """Each clip's first audio step on the joint, by its lineage.
+
+    A clip pinned to another clip of this stretch holds that clip's
+    sound from a known step (the slice's `audio_start_step`; recipes
+    from before it was recorded are recomputed by the rule they were
+    sliced with), so its sound goes exactly there: the parent's first
+    step plus that one. `ticks` -- each clip's start rounded onto the
+    grid -- stands for the rest, and for a clip whose pin is not from a
+    latent of this stretch (pixel-encoded, or from elsewhere).
+
+    Rounding every clip's own start was right while every window started
+    on a step or every source sat on its frames. It was not for a take
+    extended from an off-grid cut of a take that is itself a third of a
+    step off: the two thirds made a whole step, and the junction skipped
+    or repeated 25 ms of sound in the upscale.
+    """
+    ids = {h.get("self_id"): i for i, h in enumerate(headers)
+           if h.get("self_id")}
+    links = []
+    for i, header in enumerate(headers):
+        pins = mctx.parse_pins(header)
+        link = None
+        if len(pins) == 1 and pins[0].get("source_kind") == "clip":
+            p = pins[0]
+            j = ids.get(p.get("source_id"))
+            if j is not None and j != i:
+                start = int(p.get("source_start", 0) or 0)
+                n = int(p.get("source_frames", 0) or 0)
+                a_lo = start + n - (int(p.get("audio_window", 0) or 0) or n)
+                got = p.get("audio_start_step")
+                s0 = (int(got) if got not in (None, "")
+                      else fr.audio_total(a_lo))
+                if p.get("place") == "before":
+                    link = (j, s0)
+                elif p.get("place") == "after":
+                    rt = p.get("audio_steps")
+                    rt = (int(rt) if rt not in (None, "")
+                          else fr.audio_span(a_lo, start + n))
+                    raw = int(header.get("raw_frames", 0) or 0)
+                    # a masked arrival holds it at the end of its own run
+                    link = (j, s0 - (fr.audio_total(raw) - rt))
+        links.append(link)
+    out = [int(t) for t in ticks]
+    for _ in range(len(headers)):
+        moved = False
+        for i, link in enumerate(links):
+            if link is None:
+                continue
+            want = out[link[0]] + link[1]
+            if out[i] != want:
+                out[i] = want
+                moved = True
+        if not moved:
+            break
+    return out
+
+
 def owners(spans, junctions, total):
     """Who owns each unit of the timeline: the clip the cut shows there.
 
@@ -320,6 +378,8 @@ def timeline_layout(lines, headers, audio_ticks, cuts=None):
         n = fr.frames_to_latents(int(header.get("raw_frames", 0) or 0))
         steps.append((s, n))
         ticks.append((fr.audio_total(rel), int(a_len)))
+    ticks = [(t, m) for t, (_, m) in
+             zip(lineage_ticks(headers, [t for t, _ in ticks]), ticks)]
     total_steps = max(s + n for s, n in steps)
     total_frames = fr.pixel_frames(total_steps)
     total_ticks = max(fr.audio_total(total_frames), max(t + n for t, n in ticks))

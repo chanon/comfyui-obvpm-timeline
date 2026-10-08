@@ -592,7 +592,13 @@ def rerendered_sides(pins):
     return out
 
 
-def _overlap_bytes(untrimmed_images, untrimmed_audio, n, crf, tail=False):
+def _pins_phase(pins, raw_frames):
+    from .nodes_pins import pins_audio_phase
+    return pins_audio_phase(pins, raw_frames)
+
+
+def _overlap_bytes(untrimmed_images, untrimmed_audio, n, crf, tail=False,
+                   phase=0.0):
     """The take's own re-render of a pinned window, as a small MP4.
 
     This is the one thing a crossfade needs and the delivered clip does
@@ -609,6 +615,9 @@ def _overlap_bytes(untrimmed_images, untrimmed_audio, n, crf, tail=False):
     Returns None whenever it cannot be captured -- no untrimmed frames
     wired, or a root clip with no pinned head. Takes saved without it
     stay valid; they simply cannot be crossfaded.
+
+    Its sound is cut on the take's own frames, like the delivered sound
+    (`phase`, see nodes_pins.pins_audio_phase), so the two fade in step.
     """
     if untrimmed_images is None or n <= 0:
         return None
@@ -622,9 +631,11 @@ def _overlap_bytes(untrimmed_images, untrimmed_audio, n, crf, tail=False):
     audio = None
     if untrimmed_audio is not None:
         try:
+            from .nodes_pins import phase_samples, shifted_samples
             wave = untrimmed_audio["waveform"]
             rate = int(untrimmed_audio["sample_rate"])
             cut = int(round(n / float(fr.FPS) * rate))
+            shift = phase_samples(phase, rate)
             if tail:
                 # The head of the audio is a real boundary; its END is
                 # not -- H3 ships ~8 ms of surplus per clip, which the
@@ -632,12 +643,12 @@ def _overlap_bytes(untrimmed_images, untrimmed_audio, n, crf, tail=False):
                 # from this untrimmed copy. Count back from where the
                 # picture actually ends, or the overlap carries the
                 # surplus and drifts against its own frames.
-                end = min(int(wave.shape[-1]),
-                          int(round(total / float(fr.FPS) * rate)))
-                audio = {"waveform": wave[..., max(0, end - cut):end],
+                end = int(round(total / float(fr.FPS) * rate)) - shift
+                audio = {"waveform": shifted_samples(wave, end - cut, end),
                          "sample_rate": rate}
             else:
-                audio = {"waveform": wave[..., :min(cut, wave.shape[-1])],
+                audio = {"waveform": shifted_samples(wave, -shift,
+                                                     cut - shift),
                          "sample_rate": rate}
         except (KeyError, TypeError, ValueError):
             audio = None
@@ -855,11 +866,13 @@ class H3SaveVideoWithMCtx:
         # a guided one (the model re-drew it) or one encoded from pixels
         # (the VAE round trip did). Nothing else can be crossfaded.
         guided = rerendered_sides(pins)
+        from .nodes_pins import pins_audio_phase
+        phase = pins_audio_phase(pins, raw_frames)
         overlap = (_overlap_bytes(untrimmed_images, untrimmed_audio,
-                                  head, crf)
+                                  head, crf, phase=phase)
                    if "before" in guided else None)
         overlap_tail = (_overlap_bytes(untrimmed_images, untrimmed_audio,
-                                       tail, crf, tail=True)
+                                       tail, crf, tail=True, phase=phase)
                         if "after" in guided else None)
         sidecar_blobs = dict(blobs or {})
         if overlap:
@@ -885,6 +898,11 @@ class H3SaveVideoWithMCtx:
             "user_meta": user_meta,
             "overlap_frames": str(head if overlap else 0),
             "overlap_tail_frames": str(tail if overlap_tail else 0),
+            # where the stored sound sits against the frames, in audio
+            # steps (nodes_pins.pins_audio_phase), and that the MP4's
+            # sound was cut on the frames -- so the preview leaves it be
+            "audio_phase": "%.6f" % phase,
+            "audio_synced": "1",
         }
         sidecar = mctx.write_sidecar(
             mctx.sidecar_path(video_path), video_lat, audio_lat, meta,
@@ -1058,6 +1076,9 @@ class H3SaveMCtxForVideo:
             "parent_grade": grade,
             "pins": mctx.serialize_pins(specs_public),
             "user_meta": user_meta,
+            # the video was saved elsewhere: its sound was not cut here,
+            # so it is not marked synced -- the preview corrects it
+            "audio_phase": "%.6f" % _pins_phase(pins, raw_frames),
         }
         sidecar = mctx.write_sidecar(
             mctx.sidecar_path(path), video_lat, audio_lat, meta,

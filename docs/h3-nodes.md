@@ -201,6 +201,29 @@ H3 keyframe anchors.
 Outputs: `conditioning` (feed the guider/sampler), `pins` (the resolved
 slices — feed Trim / Save so they record what actually happened).
 
+**Audio phase.** Audio steps (40 Hz) and frames (24 fps) meet only every
+third frame, so a pin window that starts between two steps -- from a
+clip whose length is not a multiple of 3 (124, 362, ... frames), or a
+cut that is not -- is sliced from an audio step, and the take's sound
+sits up to half a step (by a third: 8.3 ms) off its own frames: its
+*audio phase*. The step is the one nearest the window's first frame in
+true time, the source's own phase included, so a phase never grows
+along a chain however many such windows it goes through. The latents
+keep it: the take's sound stays on its parent's audio grid, and the
+joint upscale lays a pinned clip's sound by that lineage -- the parent's
+first step plus the step the slice took (recorded as
+`audio_start_step`) -- so every junction in the upscale continues the
+parent's sound exactly. Where sound meets
+frames it is made up instead: H3 Trim Pinned cuts the delivered sound
+that much earlier or later (the log says so), the crossfade overlap
+likewise, and the sidecar records `audio_phase` and `audio_synced`, so
+the MP4 plays in sync and every preview and export built from MP4s
+joins without the 8.3 ms skip. Takes saved before this are corrected
+the same way when a preview or export is built, from their recipe.
+Measured on a real extend of a
+124-frame clip: the join as the preview plays it moved from 267 samples
+(8.3 ms) off to 0; the upscale's join was and stays at 0.
+
 Accepts at most **one pin per side**: one `before`, one `after`, or one
 of each (bridging). Refuses when the pinned frames leave no room for
 generated content, when a source's resolution differs from the

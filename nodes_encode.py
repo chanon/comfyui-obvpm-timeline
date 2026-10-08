@@ -352,7 +352,8 @@ def decode_window(path, start, count, info=None):
 
 
 def encode_bundle(images, vae, audio_vae, width, height, fps=fr.FPS,
-                  keep="tail", max_frames=0, fit="cover", audio=None):
+                  keep="tail", max_frames=0, fit="cover", audio=None,
+                  audio_phase=0.0):
     """Footage -> an encoded MCTX bundle. THE pixels->latents crossing.
 
     A module function, not just the node's body, because two callers need
@@ -448,6 +449,9 @@ def encode_bundle(images, vae, audio_vae, width, height, fps=fr.FPS,
         "delivered_frames": str(n),
         "pins": "[]",
         "user_meta": "",
+        # where `audio` sits against the frames (nodes_pins: audio phase);
+        # 0 unless the caller read it off them on purpose
+        "audio_phase": "%.6f" % float(audio_phase),
     }
     _LOG.info("obvpm.h3: encoded %d frames at %dx%d -> %d video steps + "
               "%d audio steps (pixel-grade, unverified)",

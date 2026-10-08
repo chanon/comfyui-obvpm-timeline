@@ -48,6 +48,7 @@ from . import frames as fr
 from . import levellock
 from . import mctx
 from . import nodes_assemble as na
+from . import nodes_pins
 from . import yuv
 from .nodes_save import (COLOUR_BT709, H3SaveVideoWithMCtx, folder_text,
                          source_colour)
@@ -62,7 +63,7 @@ DEFAULT_PREVIEW_NAME = "obvpm_h3_preview"
 # an older version is served as current -- and a fix looks like it did
 # nothing. Raise it with any change to how frames are decoded, corrected
 # or encoded.
-BUILD_VERSION = 10
+BUILD_VERSION = 12
 
 
 def _decode_audio(path):
@@ -940,7 +941,17 @@ def _build_preview(sequence, crf, probe=False, base_folder="",
         lo_s = round(e["enter"] / fr.FPS * sample_rate)
         hi_s = round(hi / fr.FPS * sample_rate)
         wav = a["waveform"]
-        part = wav[..., lo_s:min(hi_s, wav.shape[-1])]
+        # A take saved before its sound was cut on its own frames still
+        # plays it a third of a step off them (its pin window started
+        # between two audio steps): cut it here instead, from its recipe.
+        # Newer files are synced already (nodes_pins: audio phase).
+        header = e.get("header")
+        shift = (0 if nodes_pins.header_audio_synced(header)
+                 else nodes_pins.phase_samples(
+                     nodes_pins.header_audio_phase(header), sample_rate))
+        part = (nodes_pins.shifted_samples(
+                    wav, lo_s - shift, min(hi_s, wav.shape[-1]) - shift)
+                if shift else wav[..., lo_s:min(hi_s, wav.shape[-1])])
         # sound gets the same handover the picture does: the fade runs
         # over the same span, so a level change and a timbre change
         # arrive together instead of a frame apart
