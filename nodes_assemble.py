@@ -455,6 +455,27 @@ def pin_mode_for(role):
     return PIN_MODE_FOR_ROLE.get(role, "masked")
 
 
+def next_on_timeline(sequence, part, clip, cut):
+    """The clip on the line right after the pinned one, or None.
+
+    The pinned line is the one named by its part id, or -- a pin from
+    before part ids -- the first line of that clip entering at that cut.
+    A gap or the sequence's end after it means nothing follows.
+    """
+    entries = _parse_sequence(sequence)
+    for i, e in enumerate(entries):
+        if not e["clip"]:
+            continue
+        if part:
+            if e.get("part") != part:
+                continue
+        elif e["clip"] != clip or e["enter_override"] != cut:
+            continue
+        nxt = entries[i + 1] if i + 1 < len(entries) else None
+        return nxt["clip"] if nxt and nxt["clip"] else None
+    return None
+
+
 def _stamp_part(specs, part, cut):
     """Mark one side's specs with the timeline part they came from.
 
@@ -1368,8 +1389,23 @@ class H3Timeline:
             out["source2"] = source2
         return out
 
+    def _prepend_through(self, bundle, role, window, at_frame, pin_mode,
+                         mask_shape, sequence, part, clip):
+        """A prepend's specs from the take after the pinned line, when
+        that take continues the clip (nodes_load.prepend_through); None
+        when there is none."""
+        nxt = next_on_timeline(sequence, part, clip, at_frame)
+        if not nxt:
+            return None
+        nbundle = nodes_load.verified_bundle_or_none(nxt)
+        if nbundle is None:
+            return None
+        return nodes_load.prepend_through(
+            bundle, nbundle, nxt, self._PIN_ROLES[role], window,
+            at_frame=at_frame, pin_mode=pin_mode, mask_shape=mask_shape)
+
     def _specs_for(self, clip, role, window, at_frame, pin_mode="guide",
-                   mask_shape=None):
+                   mask_shape=None, sequence="", part=None):
         """One side's pin specs, latent-grade if the clip allows it.
 
         The choice is made HERE rather than refused: the timeline lists
@@ -1381,6 +1417,30 @@ class H3Timeline:
         claiming a lineage the encode cannot support.
         """
         bundle = nodes_load.verified_bundle_or_none(clip)
+        if bundle is not None and role == "prepend":
+            meta = bundle["meta"]
+            end = nodes_load.prepend_end(meta, window, at_frame)
+            room = (int(meta.get("delivered_frames", 0) or 0)
+                    + int(meta.get("pinned_tail_frames", 0) or 0))
+            if end > room:
+                specs = self._prepend_through(
+                    bundle, role, window, at_frame, pin_mode, mask_shape,
+                    sequence, part, clip)
+                if specs is not None:
+                    return specs
+                start = end - int(window)
+                if at_frame is not None:
+                    raise ValueError(
+                        "H3Timeline: a prepend at frame %d of %s needs %s "
+                        "frames from there, but only %d are left before "
+                        "the clip ends%s, and the clip after it on the "
+                        "timeline does not continue it. Prepend at an "
+                        "earlier cut, use a smaller window, or put the "
+                        "take that continues this clip after it."
+                        % (start, clip, window, max(0, room - start),
+                           "" if start == at_frame else
+                           " (the cut moved onto the latent grid from "
+                           "frame %d)" % at_frame))
         if bundle is not None:
             return nodes_load._create_pins(
                 bundle, clip, self._PIN_ROLES[role], window,
@@ -1478,7 +1538,9 @@ class H3Timeline:
                      _stamp_part(
                         self._specs_for(state["source2"], "prepend",
                                         state["window"], state.get("cut2"),
-                                        arrive, mask_shape=shape),
+                                        arrive, mask_shape=shape,
+                                        sequence=sequence,
+                                        part=state.get("part2")),
                         state.get("part2"), state.get("cut2")))
             _LOG.info("obvpm.h3: timeline pins a BRIDGE: extends %s (%s) "
                       "+ prepends into %s (%s%s), window %s",
@@ -1490,7 +1552,8 @@ class H3Timeline:
         specs = _stamp_part(
             self._specs_for(state["source"], state["role"],
                             state["window"], state.get("cut"),
-                            state["mode"], mask_shape=shape),
+                            state["mode"], mask_shape=shape,
+                            sequence=sequence, part=state.get("part")),
             state.get("part"), state.get("cut"))
         _LOG.info("obvpm.h3: timeline pins %s (%s, %s mode%s, window %s%s)",
                   state["source"], state["role"], state["mode"],

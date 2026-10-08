@@ -43,6 +43,7 @@ if pack is None:
 import folder_paths  # noqa: E402
 from obvpm_tl_test import frames as fr  # noqa: E402
 from obvpm_tl_test import mctx  # noqa: E402
+from obvpm_tl_test import nodes_assemble as na  # noqa: E402
 from obvpm_tl_test import nodes_encode as ne  # noqa: E402
 from obvpm_tl_test import nodes_joint as nj  # noqa: E402
 from obvpm_tl_test import nodes_load  # noqa: E402
@@ -52,13 +53,15 @@ EXTEND = "extend (pin tail)"
 PREPEND = "prepend (pin head)"
 
 
-def take(head=35, delivered=33, tail=0):
+def take(head=35, delivered=33, tail=0, self_id="T", clip="t.mp4",
+         pins=None):
     raw = head + delivered + tail
     steps = next(s for s in range(1, 200) if fr.pixel_frames(s) == raw)
-    return {"self_id": "T", "clip": "t.mp4",
+    return {"self_id": self_id, "clip": clip,
             "meta": {"raw_frames": str(raw), "delivered_frames": str(delivered),
                      "pinned_head_frames": str(head),
-                     "pinned_tail_frames": str(tail)},
+                     "pinned_tail_frames": str(tail),
+                     "pins": json.dumps(pins or [])},
             "video_latent": torch.arange(steps, dtype=torch.float32)
                                  .view(1, 1, steps, 1, 1).expand(1, 4, steps, 2, 2)
                                  .clone(),
@@ -220,15 +223,17 @@ class OutputFolder(unittest.TestCase):
                   metadata=full)
         return full
 
-    def family(self, parent_head=0, take_dir="proj", recorded=None):
+    def family(self, parent_head=0, take_dir="proj", recorded=None,
+               start=61):
         """clip_00046 (100 delivered after `parent_head` held) and a
-        33-frame take extending it from parent raw 61..100."""
+        33-frame take extending it from parent raw `start`..`start + 39`
+        (35 of them held)."""
         parent = self.video("proj/clip_00046.mp4", b"parent frames")
         pmeta = self.sidecar(parent, delivered_frames=100,
                              pinned_head_frames=parent_head,
                              raw_frames=100 + parent_head)
         p = {"place": "before", "source_kind": "clip",
-             "source_id": pmeta["self_id"], "source_start": 61,
+             "source_id": pmeta["self_id"], "source_start": start,
              "source_frames": 39, "mode": "masked"}
         if recorded:
             p["source_path"] = recorded
@@ -515,6 +520,183 @@ class PrependPixelRoute(PixelRoute):
 
     # the extend cases do not apply here
     test_the_parents_frames_then_the_takes = None
+    test_without_the_parent_it_is_refused = None
+
+
+# A, a 124-frame root, and X, the take that extends it: X held A's raw
+# 85..123 (35 held, 4 handed over), so X's raw r is A's raw 85 + r and X
+# joins A at its frame 120. Its held sound started on A's audio step 142.
+A_BUNDLE = dict(clip="proj/a.mp4", self_id="A")
+X_PIN = {"place": "before", "source_kind": "clip", "source_id": "A",
+         "source_start": 85, "source_frames": 39, "mode": "masked",
+         "handover_edge": True, "audio_start_step": 142, "audio_steps": 65}
+
+
+def a_and_x(x_pin=X_PIN):
+    return (take(0, 124, **A_BUNDLE),
+            take(35, 106, self_id="X", clip="proj/x.mp4", pins=[x_pin]))
+
+
+def through(at_frame=102, x_pin=X_PIN):
+    a, x = a_and_x(x_pin)
+    return nodes_load.prepend_through(a, x, "proj/x.mp4", PREPEND, "39",
+                                      at_frame=at_frame, pin_mode="both")
+
+
+class PrependThrough(unittest.TestCase):
+    """A prepend at a cut close to a clip's end: the window runs on past
+    the clip, into the take that continues it."""
+
+    def test_the_window_end(self):
+        a, _ = a_and_x()
+        self.assertEqual(nodes_load.prepend_end(a["meta"], "39", 102), 141)
+        # off the latent grid: moved on to the next group, as _create_pins
+        self.assertEqual(nodes_load.prepend_end(a["meta"], "39", 100), 141)
+
+    def test_it_is_taken_from_the_take(self):
+        (spec,) = through()
+        # the take's raw 17 is A's 102; its delivered frames start at 35
+        self.assertEqual((spec["take_from"], spec["take_from_frame"]),
+                         ("at_frame", 21))
+        self.assertEqual(spec["source_id"], "X")
+        self.assertEqual(spec["via"]["raw_offset"], 85)
+        self.assertEqual(spec["via"]["file_offset"], 120)
+
+    def test_sliced_from_the_take_and_recorded_as_the_clip(self):
+        (spec,) = through()
+        (pin,) = nodes_pins._prepare_pins([spec], False)
+        plain = nodes_pins._prepare_clip_pin(
+            0, {k: v for k, v in spec.items() if k != "via"}, False)
+        # the take's latent from its raw 17 (its step 5)
+        self.assertEqual(pin["video"][0, 0, :, 0, 0].tolist(),
+                         list(range(5, 5 + fr.steps_for_frames(39))))
+        s = pin["spec"]
+        self.assertEqual((pin["source_id"], s["source_id"]), ("A", "A"))
+        self.assertEqual((s["source_start"], s["source_frames"]), (102, 39))
+        self.assertEqual(s["source_path"], "proj/a.mp4")
+        self.assertNotIn("via", s)
+        # its sound in A's audio steps: where the take's held sound began
+        self.assertEqual(s["audio_start_step"],
+                         142 + plain["spec"]["audio_start_step"])
+
+    def test_the_new_take_leads_into_the_clip_at_the_cut(self):
+        (spec,) = through()
+        (pin,) = nodes_pins._prepare_pins([spec], False)
+        rel, sid, join = mctx.summarize_pins([pin["spec"]])
+        self.assertEqual((rel, sid), ("prepends", "A"))
+        self.assertGreaterEqual(join, 102)
+        self.assertLess(join, 120)          # before the take's join
+
+    def test_an_older_takes_sound_is_placed_by_rule(self):
+        x_pin = {k: v for k, v in X_PIN.items()
+                 if k not in ("audio_start_step", "audio_steps")}
+        (spec,) = through(x_pin=x_pin)
+        (pin,) = nodes_pins._prepare_pins([spec], False)
+        self.assertNotIn("audio_start_step", pin["spec"])
+
+    def test_not_before_what_the_take_holds(self):
+        self.assertIsNone(through(at_frame=68))
+
+    def test_not_a_take_of_another_clip(self):
+        self.assertIsNone(through(x_pin=dict(X_PIN, source_id="B")))
+
+
+class NextOnTimeline(unittest.TestCase):
+    SEQ = chr(10).join(["g.mp4 [id=g1]", "proj/a.mp4 @ 102..120 [id=a1]",
+                        "proj/x.mp4 [id=x1]", "~ 24", "c.mp4 [id=c1]"])
+
+    def test_by_part(self):
+        self.assertEqual(na.next_on_timeline(self.SEQ, "a1", "proj/a.mp4",
+                                             102), "proj/x.mp4")
+
+    def test_by_clip_and_cut(self):
+        self.assertEqual(na.next_on_timeline(self.SEQ, None, "proj/a.mp4",
+                                             102), "proj/x.mp4")
+
+    def test_a_gap_or_the_end_is_nothing(self):
+        self.assertIsNone(na.next_on_timeline(self.SEQ, "x1", "", 0))
+        self.assertIsNone(na.next_on_timeline(self.SEQ, "c1", "", 0))
+
+
+class TimelinePrepend(unittest.TestCase):
+    """The Timeline's prepend side: through the take after the cut on
+    the timeline, or refused saying why."""
+
+    def setUp(self):
+        a, x = a_and_x()
+        self.bundles = {"proj/a.mp4": a, "proj/x.mp4": x}
+        self._saved = nodes_load.verified_bundle_or_none
+        nodes_load.verified_bundle_or_none = self.bundles.get
+
+    def tearDown(self):
+        nodes_load.verified_bundle_or_none = self._saved
+
+    def specs(self, seq, cut=102, part="a1"):
+        return na.H3Timeline()._specs_for(
+            "proj/a.mp4", "prepend", "39", cut, "both", sequence=seq,
+            part=part)
+
+    def test_through_the_take_after_it(self):
+        (spec,) = self.specs(chr(10).join(["proj/a.mp4 @ 102..120 [id=a1]",
+                                           "proj/x.mp4 [id=x1]"]))
+        self.assertEqual(spec["source_id"], "X")
+        self.assertEqual(spec["via"]["source_id"], "A")
+
+    def test_a_cut_that_fits_takes_the_clip_alone(self):
+        (spec,) = self.specs(chr(10).join(["proj/a.mp4 @ 68 [id=a1]",
+                                           "proj/x.mp4 [id=x1]"]), cut=68)
+        self.assertEqual(spec["source_id"], "A")
+        self.assertNotIn("via", spec)
+
+    def test_nothing_after_it_is_refused_saying_why(self):
+        with self.assertRaisesRegex(
+                ValueError, "a prepend at frame 102 of proj/a.mp4 needs 39 "
+                            "frames from there, but only 22 are left"):
+            self.specs("proj/a.mp4 @ 102 [id=a1]")
+
+
+class PrependThroughPixels(PixelRoute):
+    """The pixel pin of the same: the take's file, which reaches back
+    into the clip's for the frames before its own. clip_00047 extends
+    clip_00046 from raw 51 (joining it at 86); a prepend at 68 runs past
+    00046's 100 frames."""
+
+    def setUp(self):
+        OutputFolder.setUp(self)
+        self.parent, self.child, self.header = self.family(start=51)
+        self.stub_files({self.parent: (100, 1000), self.child: (33, 2000)})
+
+    def pin(self):
+        spec = {"source_kind": "clip_pixels",
+                "source_path": "proj/clip_00047.mp4",
+                "take_from": "at_frame", "take_from_frame": 21,
+                "requested_window": 39, "place": "after", "mode": "both",
+                "fit": "stretch",
+                "via": {"source_id": mctx.hash_file(self.parent),
+                        "raw_offset": 51, "file_offset": 86,
+                        "audio_offset": None,
+                        "source_path": "proj/clip_00046.mp4"}}
+        ctx = {"vae": object(), "audio_vae": object(),
+               "width": 64, "height": 32}
+        (pin,) = nodes_pins._prepare_pins([spec], False, ctx)
+        return pin
+
+    def test_the_clips_frames_then_the_takes(self):
+        self.pin()
+        firsts = self.encoded["images"][:, 0, 0, 0].tolist()
+        self.assertEqual(firsts, [1000 + f for f in range(68, 86)]
+                         + [2000 + f for f in range(0, 21)])
+
+    def test_recorded_as_the_clips(self):
+        s = self.pin()["spec"]
+        self.assertEqual((s["source_kind"], s["source_start"],
+                          s["source_frames"]), ("clip_pixels", 68, 39))
+        self.assertEqual(s["source_id"], mctx.hash_file(self.parent))
+        self.assertEqual(s["source_path"], "proj/clip_00046.mp4")
+
+    test_the_parents_frames_then_the_takes = None
+    test_the_sound_follows_the_same_files = None
+    test_a_window_that_fits_reads_the_take_alone = None
     test_without_the_parent_it_is_refused = None
 
 

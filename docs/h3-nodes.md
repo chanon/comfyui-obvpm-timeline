@@ -251,6 +251,16 @@ clip it continues, and a prepend's frames after them from the file of
 the clip it leads into (each found as the Result Preview finds it),
 and the window is refused if that file is gone.
 
+**A prepend close to a clip's end.** A prepend's window starts at the
+cut and runs on; from a cut close to the clip's end it runs past it.
+When the next line on the timeline is a take that extends this clip,
+the Timeline takes the window from that take instead: it stores this
+clip's frames up to their join (its held head, the very same latents)
+and then its own, which is exactly what plays after the cut. The pin is
+still recorded as this clip's -- the new take leads into it at the cut
+-- with its window simply running on past the clip's end. Without such
+a take the Timeline refuses, saying how many frames are left.
+
 **Pins from clips with no sidecar.** When a spec names a file instead of
 carrying latents (`source_kind: clip_pixels` — what the Timeline emits
 for imported footage), Apply decodes just the pinned window out of that

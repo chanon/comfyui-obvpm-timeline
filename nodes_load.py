@@ -245,6 +245,78 @@ def _create_pins(bundle, clip, create_pins, pin_window, at_frame=None,
     return specs
 
 
+def prepend_end(meta, pin_window, at_frame=None):
+    """Where a prepend's window ENDS in the clip's delivered frames: `w`
+    on from the cut (or the clip's head), after the shift onto the
+    latent grid _create_pins applies. Past the frames the clip holds
+    (delivered + pinned tail), the clip alone cannot supply it."""
+    ph = int(meta.get("pinned_head_frames", 0) or 0)
+    w = int(pin_window)
+    end = (0 if at_frame is None else int(at_frame)) + w
+    off = (ph + end - w) % fr.FRAMES_PER_GROUP
+    return end + (fr.FRAMES_PER_GROUP - off if off else 0)
+
+
+def prepend_through(bundle, next_bundle, next_clip, create_pins,
+                    pin_window, at_frame=None, pin_mode="masked",
+                    mask_shape=None):
+    """A prepend whose window runs past the end of `bundle`'s clip, taken
+    from the take that continues it -- or None when `next_bundle` is no
+    such take or does not hold the window.
+
+    The take after a clip on the timeline, when it extends that clip,
+    stores the clip's frames it continued from (its held head) and then
+    its own: one continuous latent, identical to the clip's own over the
+    held part. So a prepend at a cut close to the clip's end slices the
+    window from there -- the clip's frames up to the take's join, then
+    the take's -- which is exactly what the timeline plays after the
+    cut. The specs are the take's, marked `via` the clip: Apply slices
+    the take and records the pin as the clip's (nodes_pins._seen_from),
+    so the new take leads into the clip at the cut, as asked, and every
+    reader of its recipe finds the clip it visibly leads into.
+    """
+    meta, nmeta = bundle["meta"], next_bundle["meta"]
+    befores = [s for s in mctx.parse_pins(nmeta)
+               if s.get("place") == "before"
+               and s.get("source_kind") == "clip"
+               and s.get("source_id") == bundle.get("self_id")]
+    if len(befores) != 1:
+        return None
+    p = befores[0]
+    s = int(p.get("source_start", 0) or 0)
+    ph, nph = (int(m.get("pinned_head_frames", 0) or 0)
+               for m in (meta, nmeta))
+    # the take's raw frame r is the clip's raw frame s + r
+    cut_raw = (0 if at_frame is None else int(at_frame)) + ph
+    if cut_raw < s:
+        return None             # starts before what the take holds
+    try:
+        specs = _create_pins(next_bundle, next_clip, create_pins, pin_window,
+                             at_frame=cut_raw - s - nph, pin_mode=pin_mode,
+                             mask_shape=mask_shape)
+    except ValueError:
+        return None
+    a0 = p.get("audio_start_step")
+    via = {"source_id": bundle.get("self_id", ""),
+           # the take's raw frames -> the clip's raw frames
+           "raw_offset": s,
+           # the take's FILE frames -> the clip's (a pixel pin reads the
+           # file): its delivered frame 0 is its raw nph
+           "file_offset": s + nph - ph,
+           # the take's audio steps -> the clip's (its held sound starts
+           # on the clip's step a0); unknown for an older take
+           "audio_offset": None if a0 is None else int(a0),
+           "source_path": (str(bundle["clip"]).replace("\\", "/")
+                           if bundle.get("clip") else "")}
+    for spec in specs:
+        spec["via"] = via
+    _LOG.info("obvpm.h3: the prepend window runs past the end of %s; it "
+              "is taken from %s, which continues it (the clip's frames up "
+              "to their join, then its own)",
+              bundle.get("clip") or bundle.get("self_id", "")[:12], next_clip)
+    return specs
+
+
 def _create_pixel_pins(clip, create_pins, pin_window, at_frame=None,
                        pin_mode="masked", mask_shape=None):
     """The same convenience pin, for a clip with no usable sidecar.

@@ -354,17 +354,52 @@ def _prepare_pins(pin_specs, snap_window_down_to_available, ctx=None):
     for i, spec in enumerate(pin_specs):
         kind = spec.get("source_kind")
         if kind == "clip":
-            pins.append(_prepare_clip_pin(
-                i, spec, snap_window_down_to_available))
+            pin = _prepare_clip_pin(i, spec, snap_window_down_to_available)
         elif kind == "clip_pixels":
-            pins.append(_prepare_pixel_pin(
-                i, spec, snap_window_down_to_available, ctx))
+            pin = _prepare_pixel_pin(i, spec, snap_window_down_to_available,
+                                     ctx)
         else:
             raise ValueError(
                 "H3MCtxApplyPins: spec %d has source_kind %r; known kinds "
                 "are 'clip' (latents from a sidecar) and 'clip_pixels' "
                 "(a file, VAE-encoded)." % (i, kind))
+        pins.append(_seen_from(pin, spec))
     return pins
+
+
+def _seen_from(pin, spec):
+    """A pin sliced from the take that continues the clip it was asked of
+    (nodes_load.prepend_through), recorded as the clip's.
+
+    The window is the clip's frames up to that take's join and the
+    take's own after it -- one latent, held in the take. The recipe names
+    the clip, in its coordinates, so the new take leads into the clip at
+    the cut it was queued from; its window simply runs on past the
+    clip's end, into what the timeline plays after it. Both routes: a
+    latent pin slices the take's latent (raw frames), a pixel pin decodes
+    the take's file (file frames)."""
+    via = spec.get("via")
+    if not via:
+        return pin
+    s = {k: v for k, v in (pin.get("spec") or {}).items() if k != "via"}
+    if s.get("source_kind") == "clip_pixels":
+        s["source_start"] = int(s.get("source_start", 0)) + via["file_offset"]
+    else:
+        s["source_start"] = int(s.get("source_start", 0)) + via["raw_offset"]
+        if s.get("audio_start_step") is not None:
+            if via.get("audio_offset") is None:
+                # placed by the rule an older recipe is placed by
+                s.pop("audio_start_step", None)
+                s.pop("audio_steps", None)
+            else:
+                s["audio_start_step"] = (int(s["audio_start_step"])
+                                         + via["audio_offset"])
+    s["source_id"] = via["source_id"]
+    if via.get("source_path"):
+        s["source_path"] = via["source_path"]
+    else:
+        s.pop("source_path", None)
+    return dict(pin, spec=s, source_id=via["source_id"])
 
 
 def _lineage_pin(header, place):
