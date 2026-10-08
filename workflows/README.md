@@ -8,6 +8,16 @@ v`[comfyui-obvpm-timeline nodepack version to use it with]`-`[workflow version n
 
 Use the latest workflow where possible. Older ones are kept for reference or in case a newer one has bugs or compatibility issues with a ComfyUI install.
 
+## v0.1.4-007 (Latest HEAD)
+
+- New workflow [`h3_obvpm_timeline_r2v_v0.1.4-007.json`](h3_obvpm_timeline_r2v_v0.1.4-007.json). It runs on this pack's 0.1.4.
+- **Needs [comfyui-obvpm](https://github.com/chanon/comfyui-obvpm) 0.2.14 or newer and comfyui-obvpm-timeline 0.1.4 or newer.** The Compatibility Check node says so when the workflow loads.
+- The generation and upscale engines are switched on and off as whole groups: a **Mute Group If** switch in each engine group (Run when Generating, Run when Upscaling) mutes the engine that is not used for the run, decided from the timeline's `upscaling` before the run starts. Before, a gate inside each engine stopped it during the run.
+- **H3 Model** (an Override Bundle Values node): turn on its `model` override to run a different model than the one in the engine settings preset, without editing the preset.
+- Generation and upscale load their VAEs separately: generation defaults to the faster `minimax_h3_video_vae_int8_convrot.safetensors`, while the upscale keeps `minimax_h3_video_vae_fp16.safetensors` for the final quality.
+- A **Megapixels Resolution Reference** note beside the timeline lists the width x height each megapixels setting gives at 16:9 and 4:3.
+- The live preview while sampling comes from the new **H3 Live Preview** node (with `taeh3.safetensors` in `models/vae_approx`) instead of KJNodes' Model Preview Override: the whole clip, pinned frames included, plays under the Result Preview's bar while it samples.
+
 ## v0.1.1-006 (2026-09-28)
 
 - New workflow [`h3_obvpm_timeline_r2v_v0.1.1-006.json`](h3_obvpm_timeline_r2v_v0.1.1-006.json). It runs on the pack's 0.1.1, with the same requirements as 005.

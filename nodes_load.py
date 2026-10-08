@@ -34,10 +34,24 @@ def resolve_clip_path(clip):
 
     The Timeline's source arrives as serialized widget text, so traversal
     is guarded HERE, once, rather than at each caller.
+
+    Confined by the path AS WRITTEN, like core ComfyUI's /view and the
+    rest of this pack (saving, the result preview, the hunt): `..`,
+    absolute and drive paths cannot leave the output folder, but a
+    symlink or Windows junction INSIDE it is followed wherever it points.
+    Only someone with the machine's files can put one there, and a
+    project folder linked to another drive is exactly what it is for.
+    (This used to resolve links first, so takes saved into such a folder
+    -- saving checked the path as written -- were listed and then
+    refused as "escaping" when extended, loaded or upscaled.)
     """
-    root = os.path.realpath(folder_paths.get_output_directory())
-    path = os.path.realpath(os.path.join(root, clip))
-    if os.path.commonprefix([path, root + os.sep]) != root + os.sep:
+    root = os.path.abspath(folder_paths.get_output_directory())
+    path = os.path.abspath(os.path.join(root, str(clip)))
+    try:
+        inside = path != root and os.path.commonpath([root, path]) == root
+    except ValueError:              # another drive
+        inside = False
+    if not inside:
         raise ValueError(
             "obvpm.h3: %s escapes the output folder; clips are "
             "output-relative paths only." % clip)
@@ -392,20 +406,49 @@ _HASH_CACHE = {}
 
 
 def _list_clips():
-    """Video files under the output folder, relative paths, depth-limited."""
+    """Video files under the output folder, relative paths, depth-limited.
+
+    Linked folders (symlinks, Windows junctions) are walked like real
+    ones -- see resolve_clip_path -- unless the real folder they lead to
+    was already walked, so a link pointing back up the tree neither
+    loops nor lists the same clips again. Real folders are always walked:
+    a link never takes a folder's place in the list.
+    """
     root = folder_paths.get_output_directory()
     out = []
-    for dirpath, dirnames, filenames in os.walk(root):
+    seen = {os.path.normcase(os.path.realpath(root))}
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
         rel = os.path.relpath(dirpath, root)
         depth = 0 if rel == "." else rel.count(os.sep) + 1
         if depth >= _SCAN_DEPTH:
             dirnames[:] = []
+        dirnames[:] = _walkable(seen, dirpath, dirnames)
         for f in filenames:
             if f.lower().endswith(_VIDEO_EXTS):
                 p = f if rel == "." else os.path.join(rel, f)
                 out.append(p.replace(os.sep, "/"))
     out.sort()
     return out
+
+
+def _walkable(seen, dirpath, names):
+    """The subfolders of `dirpath` a walk should enter: every real one
+    (marked in `seen`), then each link whose real folder is not marked
+    yet. `seen` holds normcased real paths."""
+    here = os.path.realpath(dirpath)
+    plain, links = [], []
+    for name in names:
+        real = os.path.normcase(os.path.realpath(os.path.join(dirpath, name)))
+        if real == os.path.normcase(os.path.join(here, name)):
+            plain.append(name)
+            seen.add(real)
+        else:
+            links.append((name, real))
+    for name, real in links:
+        if real not in seen:
+            seen.add(real)
+            plain.append(name)
+    return plain
 
 
 def _cached_hash(path):
