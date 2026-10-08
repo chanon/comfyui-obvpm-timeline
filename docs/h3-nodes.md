@@ -588,6 +588,12 @@ re-renders sound that is already finished.
 
 Wire the sampler's `latent_image` from here.
 
+It also refuses the Run, before the refine samples anything, when the
+latent upscaler feeding it (MinimaxH3LatentUpscaler3D) has
+`enable_temporal_chunking` off: upscaling without it was seen inventing
+details the clip never had, which the refine then keeps. Turn it on in
+the upscaler and run again.
+
 ## H3 Context Windowing
 
 A model patch that samples a long AV latent in windows of

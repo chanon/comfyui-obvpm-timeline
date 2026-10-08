@@ -1128,6 +1128,56 @@ def hold_audio(latent, audio_denoise=0.0):
     return out
 
 
+# The latent upscaler (LBH-123-AI's Comfyui_Minimax_h3_latent_Upscaler)
+# with temporal chunking off was seen inventing details the clip never
+# had -- hallucinations the refine then keeps. Nothing is gained by
+# turning it off, so a Run that would upscale that way is refused by the
+# first node of ours after the upscaler, before the refine samples
+# anything (H3 Joint Audio Mask).
+UPSCALER_CLASS = "MinimaxH3LatentUpscaler3D"
+
+
+def unchunked_upscalers(prompt, node_id):
+    """The latent upscalers this prompt node's inputs come from, at any
+    depth, that run with enable_temporal_chunking off -- their ids."""
+    if not isinstance(prompt, dict) or node_id is None:
+        return []
+    seen, stack, found = set(), [str(node_id)], []
+    while stack:
+        node = prompt.get(stack.pop())
+        if not isinstance(node, dict):
+            continue
+        for value in (node.get("inputs") or {}).values():
+            if not (isinstance(value, list) and len(value) == 2
+                    and isinstance(value[1], int)):
+                continue                # a value, not a link
+            src = str(value[0])
+            if src in seen:
+                continue
+            seen.add(src)
+            source = prompt.get(src)
+            if (isinstance(source, dict)
+                    and source.get("class_type") == UPSCALER_CLASS
+                    and (source.get("inputs") or {}).get(
+                        "enable_temporal_chunking") is False):
+                found.append(src)
+            stack.append(src)
+    return sorted(found)
+
+
+def refuse_unchunked_upscale(prompt, node_id, who):
+    """Refuse the Run when a latent upscaler feeding this node has
+    temporal chunking off (see UPSCALER_CLASS)."""
+    bad = unchunked_upscalers(prompt, node_id)
+    if bad:
+        raise ValueError(
+            "%s: the latent upscaler (node %s) has enable_temporal_chunking "
+            "off. Upscaling without it is known to invent details the clip "
+            "never had (hallucinations). Turn enable_temporal_chunking on "
+            "in that node, then run again."
+            % (who, ", ".join("#" + b for b in bad)))
+
+
 class H3JointAudioMask:
     CATEGORY = "obvpm/h3"
     FUNCTION = "mask"
@@ -1158,9 +1208,12 @@ class H3JointAudioMask:
                                "picture (0.5 for lip sync); save the source "
                                "audio then."}),
             },
+            "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"},
         }
 
-    def mask(self, latent, audio_denoise=0.0):
+    def mask(self, latent, audio_denoise=0.0, prompt=None, unique_id=None):
+        # before the refine samples anything: the upscaler feeding it
+        refuse_unchunked_upscale(prompt, unique_id, "H3 Joint Audio Mask")
         return (hold_audio(latent, audio_denoise),)
 
 
