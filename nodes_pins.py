@@ -1220,10 +1220,24 @@ class H3MCtxApplyPins:
                 continue
             yield from (node.get("inputs") or {}).values()
 
-    def apply(self, conditioning, latent, snap_window_down_to_available,
-              freeze_audio=False, pin_specs=None, video_vae=None,
-              audio_vae=None, masked_audio_feather=8, audio_denoise=0.0,
-              dynprompt=None, unique_id=None):
+    def apply(self, **kwargs):
+        out = self._apply(**kwargs)
+        # the live preview (nodes_live) trims nothing but has to know where
+        # the take sits inside the latent it watches: the pins prepared for
+        # a latent of this length
+        try:
+            from .nodes_live import note_pins
+            video, _ = unpack_av(out[1], name="latent")
+            note_pins(int(video.shape[2]), out[2])
+        except Exception as exc:
+            _LOG.debug("obvpm.h3: pins not noted for the live preview (%s)",
+                       exc)
+        return out
+
+    def _apply(self, conditioning, latent, snap_window_down_to_available,
+               freeze_audio=False, pin_specs=None, video_vae=None,
+               audio_vae=None, masked_audio_feather=8, audio_denoise=0.0,
+               dynprompt=None, unique_id=None):
         if not pin_specs:
             if freeze_audio:
                 # the first clip of a refine has nothing to pin and still

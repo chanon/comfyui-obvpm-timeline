@@ -14,6 +14,7 @@ one pack, so saved workflows keep loading.
 from .nodes_assemble import H3Assemble, H3Timeline
 from .nodes_budget import H3VramHeadroom
 from .nodes_encode import H3MCtxFromFrames
+from .nodes_live import H3LivePreview
 from .nodes_joint import (H3ContextWindows, H3JointAudioMask,
                           H3JointConditioning, H3JointLatent)
 from .nodes_load import H3LoadMCtx, H3LoadVideoWithMCtx
@@ -57,6 +58,7 @@ NODE_CLASS_MAPPINGS = {
     "H3Assemble": H3Assemble,
     "H3Timeline": H3Timeline,
     "H3ResultPreview": H3ResultPreview,
+    "H3LivePreview": H3LivePreview,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -78,6 +80,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3Assemble": "H3 MCtx Assemble",
     "H3Timeline": "H3 MCtx Timeline",
     "H3ResultPreview": "H3 MCtx Result Preview",
+    "H3LivePreview": "H3 Live Preview",
 }
 
 WEB_DIRECTORY = "./web"

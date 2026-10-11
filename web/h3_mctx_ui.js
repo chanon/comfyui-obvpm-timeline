@@ -1,6 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { specHandover } from "./h3_handover.js";
+import { LiveClip, tlPlayerBar } from "./h3_player.js";
 // drop-resolution helpers shared with the loader drop handler -- same
 // trust rules for drops into the timeline strip (in-place when the
 // content already lives in output, upload to dropped/ otherwise)
@@ -2115,7 +2116,10 @@ function tlSpaceTarget(ev) {
     const sel = alive.filter((t) => app.canvas?.selected_nodes?.[t.node.id]
         === t.node);
     if (sel.length === 1) return sel[0];
-    return alive.length === 1 ? alive[0] : null;
+    // a player that is not a timeline (the Result Preview) answers only
+    // when pointed at or selected: the lone timeline keeps its Space
+    const main = alive.filter((t) => !t.hoverOnly);
+    return main.length === 1 ? main[0] : null;
 }
 if (!window.__obvpmTlSpace) {
     window.__obvpmTlSpace = true;
@@ -10268,7 +10272,6 @@ function buildResultPreview(node) {
     });
 
     const video = document.createElement("video");
-    video.controls = true;
     video.playsInline = true;
     Object.assign(video.style, {
         width: "100%", flex: "1", minHeight: "0",
@@ -10276,72 +10279,50 @@ function buildResultPreview(node) {
         background: "#000",
     });
 
-    // The LIVE picture while a run this preview owns is sampling: KJ's
-    // Model Preview Override pushes each step's preview over the
-    // websocket as a `kj_preview_override` event (a JPEG, an animated
-    // WebP, or an MP4 when NVENC is available), tagged with ITS node id
-    // and painted on that node by its own script. Listening here as
-    // well puts the same picture in the box the result will take over,
-    // so the two previews read as one panel and the KJ node can be
-    // collapsed. No KJ node in the graph -> no events -> nothing here
-    // changes. An <img> plays an animated WebP by itself; MP4 needs
-    // the <video>.
-    const liveImg = document.createElement("img");
-    const liveVideo = document.createElement("video");
-    liveVideo.muted = true;
-    liveVideo.loop = true;
-    liveVideo.autoplay = true;
-    liveVideo.playsInline = true;
-    for (const el of [liveImg, liveVideo]) {
-        Object.assign(el.style, {
-            width: "100%", flex: "1", minHeight: "0",
-            objectFit: "contain", borderRadius: "4px", display: "none",
-            background: "#000",
-        });
-    }
-    let liveUrl = null;          // the object URL on screen, if any
+    // The LIVE picture while a run this preview owns is sampling. H3 Live
+    // Preview sends each step as a short clip on the take's own timeline
+    // (`obvpm.h3.live`); KJNodes' Model Preview Override sends its own
+    // picture (`kj_preview_override`: a JPEG, an animated WebP, or an MP4
+    // when NVENC is available), tagged with ITS node id and painted on
+    // that node by its own script. Listening here as well puts the
+    // picture in the box the result will take over, so the two read as
+    // one panel. Neither node in the graph -> no events -> nothing here
+    // changes. Each step's clip replaces the last WITHOUT starting it
+    // over (LiveClip keeps its place), and the bar drives it like a take.
+    const liveClip = new LiveClip();
+    const liveBox = document.createElement("div");
+    Object.assign(liveBox.style, {
+        width: "100%", flex: "1", minHeight: "0", display: "none",
+        borderRadius: "4px", overflow: "hidden", background: "#000",
+    });
+    let liveOn = false;          // the live picture fills the preview
     let liveStep = null;         // {step, total} of the last frame
     function liveClear() {
-        liveImg.style.display = "none";
-        liveVideo.style.display = "none";
-        liveVideo.pause();
-        liveImg.removeAttribute("src");
-        liveVideo.removeAttribute("src");
-        if (liveUrl) URL.revokeObjectURL(liveUrl);
-        liveUrl = null;
+        liveClip.clear();
+        liveClip.el.remove();
+        liveBox.style.display = "none";
+        liveOn = false;
         liveStep = null;
+        setBarMembers();
     }
     function liveShow(data) {
-        const mime = typeof data.mime === "string" ? data.mime : "image/jpeg";
-        let blob;
-        try {
-            const bin = atob(data.image);
-            const bytes = new Uint8Array(bin.length);
-            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-            blob = new Blob([bytes], { type: mime });
-        } catch (err) {
-            return;
-        }
-        const url = URL.createObjectURL(blob);
-        const old = liveUrl;
-        liveUrl = url;
         // the result of the previous run gives way to the live picture,
         // its clip strip and buttons with it; stopClock() brings them
         // back if this run leaves no result
+        video.pause();
         video.style.display = "none";
         strip.style.display = "none";
         btnRow.style.display = "none";
-        if (mime === "video/mp4") {
-            liveImg.style.display = "none";
-            liveVideo.src = url;
-            liveVideo.style.display = "block";
-            void liveVideo.play?.().catch?.(() => {});
-        } else {
-            liveVideo.style.display = "none";
-            liveImg.src = url;
-            liveImg.style.display = "block";
-        }
-        if (old) URL.revokeObjectURL(old);
+        if (liveClip.el.parentElement !== liveBox) liveBox.appendChild(liveClip.el);
+        liveBox.style.display = "block";
+        const first = !liveOn;
+        liveOn = true;
+        void liveClip.update(data).then(() => {
+            if (first && liveOn) {
+                setBarMembers();
+                bar.play();
+            }
+        });
     }
 
     const strip = document.createElement("div");
@@ -10398,7 +10379,38 @@ function buildResultPreview(node) {
 
     const rpProgress = tlProgressBar();
     const dropRpProgress = tlOnProgress(() => RP_PREVIEW_NAME, rpProgress);
-    container.append(liveImg, liveVideo, video, strip, rpProgress.el, btnRow, status);
+    const stage = document.createElement("div");
+    Object.assign(stage.style, {
+        display: "flex", flexDirection: "column", gap: "3px", flex: "1",
+        minHeight: "0", background: "transparent",
+    });
+    // One bar under the picture, whatever it is: the take, or the live
+    // picture while a run samples -- play / pause, frame steps, seek,
+    // sound, loop and fullscreen, instead of the browser's controls drawn
+    // over the bottom of the frame.
+    const bar = tlPlayerBar({
+        pal: () => PAL, loopKey: "result-preview", loop: true,
+        fullscreen: () => stage,
+    });
+    stage.append(liveBox, video, bar.el);
+    bar.attach(video);
+    bar.attach(liveBox);
+    stage.addEventListener("fullscreenchange", () => {
+        stage.style.background = document.fullscreenElement === stage
+            ? "#000" : "transparent";
+    });
+    // what the bar drives: the picture on screen
+    function setBarMembers() {
+        let list = [];
+        if (liveOn) list = [liveClip];
+        else if (current && video.getAttribute("src")) list = [video];
+        bar.setMembers(list);
+        bar.el.style.display = list.length ? "flex" : "none";
+    }
+    bar.el.style.display = "none";
+    container.append(stage, strip, rpProgress.el, btnRow, status);
+    TL_SPACE.set(node, { node, el: container, hoverOnly: true,
+                         toggle: () => bar.toggle() });
     const widget = node.addDOMWidget("mctx_result", "div", container,
                                      { hideOnZoom: false });
     widget.serialize = false;
@@ -10464,8 +10476,8 @@ function buildResultPreview(node) {
         b.append(nm, s);
         b.addEventListener("click", () => {
             if (video.src && starts[k] !== undefined) {
-                video.currentTime = starts[k] / TL_FPS;
-                void video.play().catch(() => {});
+                bar.seek(starts[k] / TL_FPS);
+                bar.play();
             }
         });
         return b;
@@ -10677,8 +10689,13 @@ function buildResultPreview(node) {
         if (current) void render(current, { keep: true });
     }
 
+    // `opts.play`: false when the take is only being RESTORED (the
+    // workflow was opened or refreshed) -- shown paused at its start. A
+    // take a Run just made starts playing by itself; a rebuild of the
+    // take on screen (`keep`) plays on only if it was playing.
     async function render(d, opts) {
         PAL = themePalette();
+        const play = opts?.play ?? (opts?.keep ? bar.wanted : true);
         current = d;
         const seq = ++reqSeq;
         blockEls = [];
@@ -10865,6 +10882,10 @@ function buildResultPreview(node) {
             }
             video.src = src;
             video.style.display = "block";
+            setBarMembers();
+            bar.seek(0);
+            if (play) bar.play();
+            else bar.pause();
             // The strip already says who relates to whom and how well, so
             // the status line normally stays quiet. It does have to
             // resolve one apparent contradiction though: the seam pill
@@ -10915,7 +10936,7 @@ function buildResultPreview(node) {
             if (JSON.stringify(next) === JSON.stringify(PAL)) return;
             PAL = next;
             applyRpChrome();
-            if (current) void render(current);
+            if (current) void render(current, { play: bar.wanted });
         }, 150);
     });
     for (const t of [document.documentElement, document.body]) {
@@ -11011,7 +11032,7 @@ function buildResultPreview(node) {
         }
         // the live picture goes with the run; the previous result comes
         // back until (and unless) a new one renders over it
-        if (liveUrl) {
+        if (liveOn || liveClip.mode) {
             liveClear();
             if (video.getAttribute("src")) video.style.display = "block";
             if (current) strip.style.display = "flex";
@@ -11044,6 +11065,7 @@ function buildResultPreview(node) {
     api.addEventListener("execution_interrupted", onRunEnd);
     api.addEventListener("status", onQueueStatus);
     api.addEventListener("kj_preview_override", onLivePreview);
+    api.addEventListener("obvpm.h3.live", onLivePreview);
 
     // The Result Preview plays the take with the SAME seam repair the
     // export will apply, taken from the Timeline that owns this folder.
@@ -11117,6 +11139,7 @@ function buildResultPreview(node) {
         video.removeAttribute("src");
         video.load();
         video.style.display = "none";
+        setBarMembers();
         strip.replaceChildren();
         strip.style.display = "none";
         btnRow.style.display = "none";
@@ -11140,7 +11163,7 @@ function buildResultPreview(node) {
         // added take (or one decided before dismissals were told apart)
         // would otherwise come back on every open with no way to clear it.
         // Not over the live picture: that result is not on screen
-        btnRow.style.display = current && !liveUrl ? "flex" : "none";
+        btnRow.style.display = current && !liveOn ? "flex" : "none";
     }
     // timelines register/unregister (and their sequences change) as
     // the user works; re-check on hover so the row is honest at the
@@ -11207,7 +11230,8 @@ function buildResultPreview(node) {
 
     let lastShownKey = null;
     let lastShownAt = 0;
-    node._h3ShowResult = (d) => {
+    // opts.play === false: restored on open, shown paused (see render)
+    node._h3ShowResult = (d, opts = {}) => {
         // Both delivery paths can land the same payload in the same tick;
         // re-rendering would restart the preview build and the video for
         // nothing. Only collapse near-simultaneous repeats: an identical
@@ -11218,7 +11242,7 @@ function buildResultPreview(node) {
         if (key === lastShownKey && now - lastShownAt < 2000) return;
         lastShownKey = key;
         lastShownAt = now;
-        void render(d);
+        void render(d, opts);
     };
 
     // Pick up a run that finished while this workflow was in the
@@ -11238,7 +11262,7 @@ function buildResultPreview(node) {
             clips.map((c) => serverFileSize(c).catch(() => null)));
         const missing = clips.filter((c, i) => sizes[i] === null);
         if (!missing.length) {
-            node._h3ShowResult(d);
+            node._h3ShowResult(d, { play: false });
             return;
         }
         if (missing.includes(d.clip)) {
@@ -11254,7 +11278,7 @@ function buildResultPreview(node) {
         node._h3ShowResult({
             ...d, parent: null, parent2: null, relation: "",
             sequence: d.clip, seam: null, seam2: null,
-        });
+        }, { play: false });
     }
 
     // true when this session holds a result for this preview
@@ -11293,7 +11317,7 @@ function buildResultPreview(node) {
         // older take
         if (!d?.clip || current || !node.graph || rpDismissed(d.clip)
                 || rpClearedHides(scope, d)) return;
-        node._h3ShowResult(d);
+        node._h3ShowResult(d, { play: false });
     }
     // Workflows saved before the preview stopped keeping anything in them
     // carry the decision and the seam tuning as node properties: carried
@@ -11362,7 +11386,10 @@ function buildResultPreview(node) {
         api.removeEventListener("execution_interrupted", onRunEnd);
         api.removeEventListener("status", onQueueStatus);
         api.removeEventListener("kj_preview_override", onLivePreview);
+        api.removeEventListener("obvpm.h3.live", onLivePreview);
         liveClear();
+        bar.destroy();
+        if (TL_SPACE.get(node)?.hoverOnly) TL_SPACE.delete(node);
         dropRpProgress();
         video.pause();
         video.removeAttribute("src");

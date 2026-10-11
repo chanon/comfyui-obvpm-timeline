@@ -15,6 +15,7 @@ Pinning · [H3 MCtx Pin Spec](#h3-mctx-pin-spec) ·
 [H3 MCtx Trim Pinned](#h3-mctx-trim-pinned)
 Composing · [H3 MCtx Timeline](#h3-mctx-timeline) ·
 [H3 MCtx Result Preview](#h3-mctx-result-preview) ·
+[H3 Live Preview](#h3-live-preview) ·
 [H3 MCtx Assemble](#h3-mctx-assemble)
 Refining · [The joint refine](#the-joint-refine) ·
 [H3 Join Latents](#h3-join-latents) ·
@@ -456,16 +457,53 @@ through reloads and workflow switches. A cut
 from H3 Joint VAE Decode and Save is the finished product, so the
 preview offers delete and dismiss for it but not add to timeline.
 
-**Live preview while sampling.** With KJNodes' Model Preview Override
-on the sampler's model, the frames it pushes each step are shown in
-this panel too, in the box the result takes over when the take lands,
-with the step count on the status line. That node can then be
-collapsed: it stays the place where the preview's frame count and
-resolution are set, but nothing needs to be looked at there. Only the
-sampler of this preview's own branch is shown -- an upscale branch in
-the same workflow is not its run. To go without the live picture, take
-the KJ node off the model; without it the panel behaves exactly as
-before.
+**The player bar.** The take plays with a bar of its own below the
+picture, not the browser's controls over the bottom of the frame: play /
+pause, frame step, seek, time, sound with a volume slider, loop and
+fullscreen. Click the picture to play or pause, double click for
+fullscreen (the bar then lies over the picture and slides away while the
+mouse rests), and scroll sideways over the picture or the bar to step
+along it. Space plays or pauses the preview under the mouse, or the
+selected one. A take a Run just made starts playing by itself; a take
+shown again when the workflow opens is shown paused at its start. Sound,
+volume and loop are remembered in this browser.
+
+**Live preview while sampling.** With [H3 Live Preview](#h3-live-preview)
+(or KJNodes' Model Preview Override) on the sampler's model, the clip it
+sends each step is shown in this panel, in the box the result takes over
+when the take lands, with the step count on the status line. Each step
+replaces the last without starting it over, and the same bar plays it:
+the whole clip can be watched, paused, seeked and looped while the Run
+samples. Only the sampler of this preview's own branch is shown -- an
+upscale branch in the same workflow is not its run. To go without the
+live picture, take that node off the model; without it the panel behaves
+exactly as before.
+
+## H3 Live Preview
+
+The sampler's picture while it samples, in the Result Preview. Put it on
+the model the sampler uses (model in, model out); every sampling pass of
+that model sends each step as a short clip.
+
+The clip is on the **take's own timeline**: each latent step's picture is
+held for exactly the frames that step covers (H3 codes 17 frames in 5
+steps), so a 5 s take's preview is 5 s at 24 fps -- there is no frame rate
+to set. It shows the **whole latent**, the pinned frames at the ends
+included: the parent's frames at the head of an extend, the target's at
+the tail of a prepend. That is where a seam is made, so a bad join can be
+seen while it is being made. How many frames are pinned comes from the
+pins H3 MCtx Apply Pins prepared -- nothing to wire.
+
+| Input | Type | Notes |
+|---|---|---|
+| `model` | MODEL | the model the sampler uses |
+| `tiny_vae` | combo | the decoder, from `models/vae_approx`: a tiny VAE for H3 (`taeh3`) -- [madebyollin's temporal one](https://github.com/madebyollin/taehv/tree/main/safetensors) shows every frame and is both closer to the take and quicker; [Kijai's 2D one](https://huggingface.co/Kijai/MiniMax-H3-TAE) shows a picture per latent step, held for the frames it covers. Both are published as `taeh3.safetensors`: which one a file is comes from its layers, so the name does not matter. Or the latent's own colours (coarse, no file needed) |
+| `max_size` | INT | the preview's long side in pixels (640). Smaller is quicker to encode and send |
+
+Encoded as H.264 on the CPU, on a thread of its own: sampling never waits
+for it, and a step that arrives while the last one is still encoding
+replaces it. It takes the place of KJNodes' Model Preview Override, which
+the Result Preview still shows when that is what is in the graph.
 
 ## H3 MCtx Assemble
 
