@@ -9533,6 +9533,29 @@ app.registerExtension({
             // was generated to lead into.
             // One sequence write for both edits, so the undo step and the
             // refresh see a single change.
+            // Frames the take moves its parent's edge beside the hole by:
+            // a prepend that enters the parent at frame 13 takes 13 off
+            // its start, an extend that leaves it early takes some off
+            // its end. The hole gets them back, so the parent's frames
+            // stay where they were on the timeline, and everything after
+            // it with them. Measured as the parent's played edge now
+            // against once the take is in (a manual cut, as reconcileCut
+            // just left it, beats the derived seam -- the same rule
+            // refresh() plays by).
+            function parentShift(aim, meta) {
+                const p = lastEntries[aim.parentIdx];
+                if (!p || p.gap != null || !p.meta) return 0;
+                const now = tlParseSequence(seqWidget.value)[aim.parentIdx];
+                if (aim.side === "before") {
+                    const will = now?.enterOverride
+                        ?? tlDeriveSeam(meta, p.meta).enterR ?? 0;
+                    return will - (p.enter ?? 0);
+                }
+                const end = Number(p.frames) || 0;
+                const will = now?.exitOverride
+                    ?? tlDeriveSeam(p.meta, meta).exitL ?? end;
+                return (p.exit ?? end) - will;
+            }
             function insertFilling(aim, clip, meta) {
                 const es = lastEntries;
                 const ls = currentLines();
@@ -9548,7 +9571,8 @@ app.registerExtension({
                     const bridged = aim.side === "after" && !!child
                         && es[gi + 1]?.meta?.self_id === child.id;
                     const left = bridged ? 0
-                        : Math.max(0, Math.round(Number(hole.gap) || 0) - took);
+                        : Math.max(0, Math.round(Number(hole.gap) || 0)
+                            + parentShift(aim, meta) - took);
                     if (left > 0) {
                         ls[map[gi]] = `~ ${left}`;
                         filled = `, ${(left / TL_FPS).toFixed(2)}s of empty `
