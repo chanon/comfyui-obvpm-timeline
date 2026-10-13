@@ -65,21 +65,40 @@ COND_KEY = "obvpm_h3_joint"
 _MARKER = re.compile(r"^(\s*@\s*)(\d*)(\.\.)?(\d*)(?=\s|\[|$)")
 
 
-def parse_sequence(text):
-    """The timeline's `sequence` widget -> clip paths, in delivery order.
+def sequence_items(text):
+    """The sequence as it plays: ("clip", line) and ("gap", frames), in order.
 
-    The same shape H3Assemble reads: one output-relative clip per line,
-    `# ...` and the `loop` directive ignored, and an optional ` @ N` cut
-    marker which is about where a clip ENTERS the cut and is not part of
-    its identity.
+    The same shape H3Assemble reads: one output-relative clip per line
+    (an optional ` @ N` cut marker and `[...]` seam settings after it),
+    `~ N` for N frames of empty space, `# ...` and the `loop` directive
+    ignored.
     """
-    clips = []
+    out = []
     for line in str(text or "").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or na.LOOP_RE.match(line):
             continue
-        clips.append(line.split("@")[0].strip())
-    return [c for c in clips if c]
+        gap = na._GAP_RE.match(line)
+        if gap:
+            out.append(("gap", int(gap.group("frames"))))
+        elif clip_of_line(line):
+            out.append(("clip", line))
+    return out
+
+
+def clip_of_line(line):
+    """A sequence line's clip path: no cut marker, no seam settings."""
+    return na.split_seam_opts(str(line).strip())[0].split("@")[0].strip()
+
+
+def parse_sequence(text):
+    """The timeline's `sequence` widget -> clip paths, in delivery order.
+
+    A cut marker is about where a clip ENTERS the cut and seam settings
+    about how it is joined; neither is part of its identity.
+    """
+    return [clip_of_line(line) for kind, line in sequence_items(text)
+            if kind == "clip"]
 
 
 def parse_sequence_lines(text):
@@ -88,14 +107,7 @@ def parse_sequence_lines(text):
     Aligned with it by construction -- same filter, same order -- so
     position N in one is position N in the other.
     """
-    out = []
-    for line in str(text or "").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or na.LOOP_RE.match(line):
-            continue
-        if line.split("@")[0].strip():
-            out.append(line)
-    return out
+    return [line for kind, line in sequence_items(text) if kind == "clip"]
 
 # ---------------------------------------------------------------------------
 # the timeline as one latent
@@ -110,7 +122,7 @@ def clip_headers(clips):
     return out
 
 
-def marker_starts(lines, headers):
+def marker_starts(lines, headers, cuts=None):
     """Each clip's RAW-latent start on the timeline from the cut alone.
 
     Delivered frame f of clip i sits at T_i + (f - enter_i), where T_i is
@@ -125,7 +137,9 @@ def marker_starts(lines, headers):
     pinned clips are re-placed by their pin in `raw_starts`.
     """
     starts, t = [], 0
-    for (enter, exit_), header in zip(shown_cuts(lines, headers), headers):
+    if cuts is None:
+        cuts = shown_cuts(lines, headers)
+    for (enter, exit_), header in zip(cuts, headers):
         enter = enter or 0
         delivered = int(header.get("delivered_frames", 0) or 0)
         head = int(header.get("pinned_head_frames", 0) or 0)
@@ -135,11 +149,8 @@ def marker_starts(lines, headers):
     return starts
 
 
-def shown_cuts(lines, headers):
-    """[[enter, exit]] per clip -- the delivered frames the cut SHOWS,
-    None where neither the text nor the lineage says (0 / the clip's end).
-    """
-    # What the TEXT says, None where it says nothing...
+def text_cuts(lines):
+    """[[enter, exit]] per line as the TEXT says it, None where it is silent."""
     cuts = []
     for line in lines:
         suffix = line[len(line.split("@")[0].rstrip()):]
@@ -147,6 +158,19 @@ def shown_cuts(lines, headers):
         cuts.append([int(m.group(2)) if m and m.group(2) else None,
                      int(m.group(4)) if m and m.group(3) and m.group(4)
                      else None])
+    return cuts
+
+
+def shown_cuts(lines, headers, derive=None):
+    """[[enter, exit]] per clip -- the delivered frames the cut SHOWS,
+    None where neither the text nor the lineage says (0 / the clip's end).
+
+    `derive[i]` False leaves the join in front of clip i to the text
+    alone: empty space between two clips breaks their lineage, exactly as
+    in the cut itself (resolve_sequence does not derive across a gap).
+    """
+    # What the TEXT says, None where it says nothing...
+    cuts = text_cuts(lines)
     # ...and where it says nothing, what the LINEAGE derives -- the same
     # seam the timeline, the preview and the export all play. The widget
     # writes a marker only for a cut made by hand, so a parent cut before
@@ -159,6 +183,8 @@ def shown_cuts(lines, headers):
     # bridge leaving a cut at frame 107 of 115 put at frame 76, not 68).
     for i in range(1, len(lines)):
         if cuts[i - 1][1] is not None and cuts[i][0] is not None:
+            continue
+        if derive is not None and not derive[i]:
             continue
         try:
             exit_f, enter_f, _ = na._derive_seam(
@@ -205,7 +231,7 @@ def timeline_pin(header, ids):
     return None
 
 
-def raw_starts(lines, headers):
+def raw_starts(lines, headers, cuts=None):
     """Each clip's RAW-latent start on the timeline, in frames.
 
     A pinned clip sits where its pin says: its held frames ARE the
@@ -216,7 +242,7 @@ def raw_starts(lines, headers):
     extending, so the held head sat on the wrong rows (rel diff 1.25 on
     what must be an exact hold) and the refine flickered at the seam.
     """
-    starts = marker_starts(lines, headers)
+    starts = marker_starts(lines, headers, cuts)
     ids = {h.get("self_id"): i for i, h in enumerate(headers) if h.get("self_id")}
     rel = [timeline_pin(h, ids) for h in headers]
     for _ in range(len(headers)):
@@ -231,6 +257,64 @@ def raw_starts(lines, headers):
         if not moved:
             break
     return starts
+
+
+def lineage_ticks(headers, ticks):
+    """Each clip's first audio step on the joint, by its lineage.
+
+    A clip pinned to another clip of this stretch holds that clip's
+    sound from a known step (the slice's `audio_start_step`; recipes
+    from before it was recorded are recomputed by the rule they were
+    sliced with), so its sound goes exactly there: the parent's first
+    step plus that one. `ticks` -- each clip's start rounded onto the
+    grid -- stands for the rest, and for a clip whose pin is not from a
+    latent of this stretch (pixel-encoded, or from elsewhere).
+
+    Rounding every clip's own start was right while every window started
+    on a step or every source sat on its frames. It was not for a take
+    extended from an off-grid cut of a take that is itself a third of a
+    step off: the two thirds made a whole step, and the junction skipped
+    or repeated 25 ms of sound in the upscale.
+    """
+    ids = {h.get("self_id"): i for i, h in enumerate(headers)
+           if h.get("self_id")}
+    links = []
+    for i, header in enumerate(headers):
+        pins = mctx.parse_pins(header)
+        link = None
+        if len(pins) == 1 and pins[0].get("source_kind") == "clip":
+            p = pins[0]
+            j = ids.get(p.get("source_id"))
+            if j is not None and j != i:
+                start = int(p.get("source_start", 0) or 0)
+                n = int(p.get("source_frames", 0) or 0)
+                a_lo = start + n - (int(p.get("audio_window", 0) or 0) or n)
+                got = p.get("audio_start_step")
+                s0 = (int(got) if got not in (None, "")
+                      else fr.audio_total(a_lo))
+                if p.get("place") == "before":
+                    link = (j, s0)
+                elif p.get("place") == "after":
+                    rt = p.get("audio_steps")
+                    rt = (int(rt) if rt not in (None, "")
+                          else fr.audio_span(a_lo, start + n))
+                    raw = int(header.get("raw_frames", 0) or 0)
+                    # a masked arrival holds it at the end of its own run
+                    link = (j, s0 - (fr.audio_total(raw) - rt))
+        links.append(link)
+    out = [int(t) for t in ticks]
+    for _ in range(len(headers)):
+        moved = False
+        for i, link in enumerate(links):
+            if link is None:
+                continue
+            want = out[link[0]] + link[1]
+            if out[i] != want:
+                out[i] = want
+                moved = True
+        if not moved:
+            break
+    return out
 
 
 def owners(spans, junctions, total):
@@ -256,28 +340,46 @@ def owners(spans, junctions, total):
     return owner
 
 
-def timeline_layout(lines, headers, audio_ticks):
+def timeline_layout(lines, headers, audio_ticks, cuts=None):
     """Where each clip's raw latent sits on one joint latent.
 
     `lines` are the sequence lines (markers kept), `headers` the clips'
-    sidecar headers, `audio_ticks` each clip's audio length in ticks.
+    sidecar headers, `audio_ticks` each clip's audio length in ticks,
+    `cuts` the shown [enter, exit] per clip when the caller has derived
+    them over a wider sequence (default: `shown_cuts` of these lines).
     Returns {"steps": [(start, len)], "ticks": [(start, len)],
     "total_steps", "total_frames", "total_ticks"}.
     """
-    starts_frames = raw_starts(lines, headers)
+    if cuts is None:
+        cuts = shown_cuts(lines, headers)
+    starts_frames = raw_starts(lines, headers, cuts)
     first = min(starts_frames)
     steps, ticks = [], []
-    for header, start, a_len in zip(headers, starts_frames, audio_ticks):
+    for i, (header, start, a_len) in enumerate(zip(headers, starts_frames, audio_ticks)):
         rel = start - first
         s = fr.steps_for_frames(rel)
         if s is None:
+            lo_ok = next(f for f in range(rel, -1, -1) if fr.steps_for_frames(f) is not None)
+            hi_ok = next(f for f in range(rel, rel + 20) if fr.steps_for_frames(f) is not None)
+            # Inside a segment every clip is joined by a seamless seam its
+            # recipe describes, and latent pins sit on the 17-frame grid, so
+            # this is a GUARD: it means a take's sidecar disagrees with itself
+            # (or a hand-built graph pinned a take at pixel grade off the grid)
             raise ValueError(
-                "H3 Join Latents: a clip starts %d frames into the timeline, "
-                "which is not on the latent grid; the joint latent needs "
-                "every clip on one grid (masked/both chains are)." % rel)
+                "H3 Join Latents: %s would start %d frames into its stretch "
+                "of the timeline, which is not on the latent grid (the "
+                "nearest frames that are: %d and %d). This should not happen "
+                "with takes made by the timeline: the take's sidecar looks "
+                "inconsistent -- please report it. To work around it, move "
+                "the cut before it by %d or %d frames; the join is then "
+                "refined like a hard cut."
+                % (clip_of_line(lines[i]) if i < len(lines) else "a clip",
+                   rel, lo_ok, hi_ok, rel - lo_ok, hi_ok - rel))
         n = fr.frames_to_latents(int(header.get("raw_frames", 0) or 0))
         steps.append((s, n))
         ticks.append((fr.audio_total(rel), int(a_len)))
+    ticks = [(t, m) for t, (_, m) in
+             zip(lineage_ticks(headers, [t for t, _ in ticks]), ticks)]
     total_steps = max(s + n for s, n in steps)
     total_frames = fr.pixel_frames(total_steps)
     total_ticks = max(fr.audio_total(total_frames), max(t + n for t, n in ticks))
@@ -310,8 +412,7 @@ def timeline_layout(lines, headers, audio_ticks):
     # sit at known joint positions, so the rows under them are its own
     # whatever the recipe looks like. On a single-pin chain this writes
     # what the junctions already wrote.
-    for i, ((enter, exit_), header) in enumerate(
-            zip(shown_cuts(lines, headers), headers)):
+    for i, ((enter, exit_), header) in enumerate(zip(cuts, headers)):
         base = starts_frames[i] - first + int(
             header.get("pinned_head_frames", 0) or 0)
         lo_f = base + int(enter or 0)
@@ -348,6 +449,177 @@ def timeline_layout(lines, headers, audio_ticks):
             "owner_steps": owner_steps,
             "owner_ticks": owner_ticks,
             "heads": heads, "hard_hold": hard}
+
+
+# ---------------------------------------------------------------------------
+# segments: the stretches of the cut that are one continuous take
+#
+# A joint latent is one continuous piece of film: the model samples it
+# with every row in view of its neighbours, the upscaler convolves along
+# it, the windows blend across it. That is exactly right for clips joined
+# by a seamless (green) seam and exactly wrong across a hard cut, where
+# the two sides are different shots. So the cut is split into SEGMENTS at
+# every join that is not a seamless lineage link as the cut plays it, and
+# each segment becomes its own joint latent: H3 Join Latents hands out a
+# LIST, ComfyUI runs the upscaler, the sampler and everything between
+# once per segment, and H3 Joint VAE Decode and Save writes each as its
+# own take and joins them into the finished cut.
+#
+# Each segment is also CROPPED to what the cut shows of it (plus a little
+# context), so a take trimmed to a few seconds is no longer upscaled and
+# sampled whole, and the render keeps exactly the shown frames -- the last
+# clip's cut included.
+# ---------------------------------------------------------------------------
+
+# A crop starts on a 51-frame boundary: 51 frames are exactly 85 audio
+# ticks (51 / 24 * 40), so every tick position inside the cropped latent is
+# the same whole number the uncropped one had, and the window handler's
+# tick arithmetic (fr.audio_total from the latent's own frame 0) stays
+# exact. 51 frames are three 5-step cycles, so the crop is on the cycle too.
+_CROP_FRAMES = 3 * fr.FRAMES_PER_GROUP
+_CROP_STEPS = 3 * fr.LATENTS_PER_GROUP
+
+
+def _linked(lh, rh):
+    """Is this join a lineage link -- right extends left, or left prepends
+    into right? The same test as the timeline's green seam (tlDeriveSeam)."""
+    if not lh or not rh:
+        return False
+    ex = na._extend_parent(rh)
+    if ex and ex[0] and ex[0] == lh.get("self_id"):
+        return True
+    pr = na._prepend_child(lh)
+    return bool(pr and pr[0] and pr[0] == rh.get("self_id"))
+
+
+def segment_breaks(lines, headers):
+    """Per clip, True when the cut is NOT continuous into it from the clip
+    before (the first clip: False).
+
+    Continuous = a lineage link (green on the timeline) that the cut plays
+    at its natural frame. A cut marker written by hand that moves either
+    side of a green seam makes it a jump cut, so it breaks too: before, the
+    joint placed the take by its pin and silently played the natural join
+    instead of the hand cut.
+    """
+    text = text_cuts(lines)
+    out = [False] * len(lines)
+    for i in range(1, len(lines)):
+        lh, rh = headers[i - 1], headers[i]
+        if not _linked(lh, rh):
+            out[i] = True
+            continue
+        try:
+            exit_f, enter_f, _ = na._derive_seam(
+                {"clip": lines[i - 1], "header": lh},
+                {"clip": lines[i], "header": rh})
+        except Exception:
+            out[i] = True
+            continue
+        natural_exit = (int(lh.get("delivered_frames", 0) or 0)
+                        if exit_f is None else int(exit_f))
+        t_exit, t_enter = text[i - 1][1], text[i][0]
+        out[i] = ((t_exit is not None and t_exit != natural_exit)
+                  or (t_enter is not None and t_enter != int(enter_f or 0)))
+    return out
+
+
+def split_segments(items, headers):
+    """The cut's segments, in order: [{"clips": [clip indices],
+    "gap_before": frames, "gap_after": frames}].
+
+    `items` are sequence_items (clips and gaps), `headers` the clips'
+    headers in the same order as the clip items. Empty space always
+    breaks, and its length is kept so the finished cut can show it.
+    """
+    lines = [line for kind, line in items if kind == "clip"]
+    breaks = segment_breaks(lines, headers)
+    segs, gap, c = [], 0, 0
+    for kind, value in items:
+        if kind == "gap":
+            gap += int(value)
+            continue
+        if not segs or gap or breaks[c]:
+            segs.append({"clips": [], "gap_before": gap, "gap_after": 0})
+            gap = 0
+        segs[-1]["clips"].append(c)
+        c += 1
+    if segs:
+        segs[-1]["gap_after"] = gap
+    return segs
+
+
+def derive_flags(items):
+    """Per clip, may its join with the clip before be derived from the
+    lineage? Not across empty space (see shown_cuts)."""
+    out, gap = [], False
+    for kind, _ in items:
+        if kind == "gap":
+            gap = True
+            continue
+        # the first clip has no join in front of it, whatever precedes it
+        out.append(not gap or not out)
+        gap = False
+    return out
+
+
+def shown_range(layout, headers, cuts):
+    """[lo, hi): the joint frames the cut shows of this layout's clips --
+    the first clip's enter to the last clip's exit."""
+    starts, heads = layout["starts"], layout["heads"]
+    lo = starts[0] + heads[0] + int(cuts[0][0] or 0)
+    exit_ = cuts[-1][1]
+    if exit_ is None:
+        exit_ = int(headers[-1].get("delivered_frames", 0) or 0)
+    hi = starts[-1] + heads[-1] + int(exit_)
+    return int(lo), int(hi)
+
+
+def crop_range(total_steps, lo, hi):
+    """[cs, ce) latent steps that hold joint frames [lo, hi) plus context.
+
+    cs is the last 51-frame boundary at least one 17-frame cycle before
+    lo (see _CROP_FRAMES); ce the first step at least one cycle past hi
+    that leaves the crop clip-shaped (5k+2 steps, the shape the model and
+    the decoder expect), or the layout's own end.
+    """
+    total = int(total_steps)
+    cs_f = max(0, ((int(lo) - fr.FRAMES_PER_GROUP) // _CROP_FRAMES) * _CROP_FRAMES)
+    cs = (cs_f // _CROP_FRAMES) * _CROP_STEPS
+    want = int(hi) + fr.FRAMES_PER_GROUP
+    ce = cs
+    while ce < total and fr.frame_at_latent(ce) < want:
+        ce += 1
+    while ce < total and (ce - cs) % fr.LATENTS_PER_GROUP != fr.LATENT_BASE:
+        ce += 1
+    return int(cs), int(min(ce, total))
+
+
+def crop_layout(layout, cs, ce):
+    """The layout of joint steps [cs, ce) only, in its own coordinates.
+
+    A clip's span may now start before 0 or end past the crop: it is still
+    where it was, only partly inside. Owners are sliced; audio ticks start
+    at the crop's frame, which is on a 51-frame boundary, so they stay
+    whole numbers on the same grid.
+    """
+    cs, ce = int(cs), int(ce)
+    cs_f = fr.frame_at_latent(cs)
+    ta = fr.audio_total(cs_f)
+    tb = (int(layout["total_ticks"]) if ce >= int(layout["total_steps"])
+          else fr.audio_total(fr.frame_at_latent(ce)))
+    out = dict(layout)
+    out["steps"] = [(int(s) - cs, int(n)) for s, n in layout["steps"]]
+    out["ticks"] = [(int(t) - ta, int(m)) for t, m in layout["ticks"]]
+    out["starts"] = [int(s) - cs_f for s in layout["starts"]]
+    out["owner_steps"] = list(layout["owner_steps"][cs:ce])
+    out["owner_ticks"] = list(layout["owner_ticks"][ta:tb])
+    out["total_steps"] = ce - cs
+    out["total_frames"] = fr.pixel_frames(ce - cs)
+    out["total_ticks"] = tb - ta
+    out["crop"] = {"steps": [cs, ce], "frames": [cs_f, fr.frame_at_latent(ce)],
+                   "ticks": [ta, tb]}
+    return out
 
 
 def fit_keyframes(keyframes, target_shape, who="clip"):
@@ -525,6 +797,13 @@ def assemble(videos, audios, layout):
     a_owner = torch.tensor(layout["owner_ticks"], dtype=torch.long)
     v_written = v_owner >= 0
     a_written = a_owner >= 0
+
+    def inside(start, n, total):
+        # a clip's rows that fall inside the joint: a cropped segment can
+        # start inside a clip or end before one does
+        lo, hi = max(0, int(start)), min(int(total), int(start) + int(n))
+        return lo, max(lo, hi)
+
     for i, (v, a) in enumerate(zip(videos, audios)):
         s, n = layout["steps"][i]
         if v.shape[2] != n:
@@ -534,25 +813,29 @@ def assemble(videos, audios, layout):
             raise ValueError("H3 Join Latents: clip %d is %s, clip 0 is %s; "
                              "one timeline needs one size"
                              % (i, tuple(v.shape[3:]), tuple(v0.shape[3:])))
-        mine = v_owner[s:s + n] == i
-        idx = torch.nonzero(mine).flatten()
-        video[:, :, s + idx] = v[:, :, idx].to(video.dtype)
+        lo, hi = inside(s, n, T)
+        idx = torch.nonzero(v_owner[lo:hi] == i).flatten() + lo
+        video[:, :, idx] = v[:, :, idx - s].to(video.dtype)
         t, m = layout["ticks"][i]
-        m = min(m, a.shape[-1], A - t)
-        aidx = torch.nonzero(a_owner[t:t + m] == i).flatten()
-        audio[..., t + aidx] = a[..., aidx].to(audio.dtype)
+        lo, hi = inside(t, min(m, a.shape[-1]), A)
+        aidx = torch.nonzero(a_owner[lo:hi] == i).flatten() + lo
+        audio[..., aidx] = a[..., aidx - t].to(audio.dtype)
     for i, v in enumerate(videos):
         s, n = layout["steps"][i]
-        theirs = torch.nonzero(v_owner[s:s + n] != i).flatten()
-        if len(theirs) == 0:
+        lo, hi = inside(s, n, T)
+        # joint rows this clip covers but another clip owns, and the same
+        # rows as this clip's own row numbers
+        rows = torch.nonzero(v_owner[lo:hi] != i).flatten() + lo
+        if len(rows) == 0:
             continue
-        have = video[:, :, s + theirs].float()
+        theirs = rows - s
+        have = video[:, :, rows].float()
         new = v[:, :, theirs].float()
         rel = float(((have - new) ** 2).mean().sqrt() / (have ** 2).mean().sqrt().clamp(min=1e-8))
         head = int(fr.frames_to_latents(int(layout.get("heads", [0] * len(videos))[i])))
         held = int((theirs < head).sum()) if head else 0
         if held and layout.get("hard_hold", [False] * len(videos))[i]:
-            hv = video[:, :, s + theirs[:held]].float()
+            hv = video[:, :, rows[:held]].float()
             hn = v[:, :, theirs[:held]].float()
             hrel = float(((hv - hn) ** 2).mean().sqrt() / (hv ** 2).mean().sqrt().clamp(min=1e-8))
             if hrel > 1e-3:
@@ -564,10 +847,11 @@ def assemble(videos, audios, layout):
                   "another clip; kept theirs (rel diff %.4f)", i, len(theirs), rel)
     if not v_written.all():
         holes = torch.nonzero(~v_written).flatten().tolist()
-        raise ValueError("H3 Join Latents: the timeline has gaps at latent "
-                         "step(s) %s -- clips that do not touch cannot be "
-                         "refined as one. Refine such a timeline in runs, "
-                         "or bridge the gap." % holes[:12])
+        raise ValueError("H3 Join Latents: a seamless stretch of the "
+                         "timeline has holes at latent step(s) %s -- its "
+                         "clips do not touch where their seams say they do. "
+                         "Re-check the takes' seams on the timeline."
+                         % holes[:12])
     if not a_written.all():
         # the audio grid's last tick can fall past every clip's last tick;
         # carry the previous tick rather than leave silence
@@ -584,18 +868,25 @@ class H3JointLatent:
     FUNCTION = "build"
     RETURN_TYPES = ("LATENT", wt.JOINT)
     RETURN_NAMES = ("latent", "layout")
+    # one of each per SEGMENT of the cut: ComfyUI runs every node after
+    # this one once per segment, and H3 Joint VAE Decode and Save (which
+    # takes the whole list) writes them and joins them
+    OUTPUT_IS_LIST = (True, True)
     DESCRIPTION = (
-        "Lays every clip of the timeline onto ONE raw AV latent at its true "
-        "position (held windows coincide), for the joint refine: upscale it "
-        "as one, sample it as one under H3 Context Windowing, and render it "
-        "as one finished video with H3 Joint VAE Decode and Save. Texture is then "
-        "decided across the joins, not per clip."
+        "Lays the timeline's clips onto raw AV latents at their true "
+        "positions (held windows coincide), for the joint refine: upscale, "
+        "sample under H3 Context Windowing and render with H3 Joint VAE "
+        "Decode and Save. Texture is then decided across the joins, not per "
+        "clip. The cut is split at every hard cut or gap into SEGMENTS, one "
+        "latent each (the nodes after this run once per segment), and each "
+        "is cropped to the frames the cut shows of it."
     )
     OUTPUT_TOOLTIPS = (
-        "The joint raw AV latent (video + audio), for the upscaler -- and "
-        "for H3 Joint VAE Decode and Save's source_audio when the sound is re-sampled.",
-        "Where each clip sits on it. Wire to H3 Joint Conditioning and H3 "
-        "Joint VAE Decode and Save.",
+        "One joint raw AV latent (video + audio) per segment of the cut, for "
+        "the upscaler -- and for H3 Joint VAE Decode and Save's source_audio "
+        "when the sound is re-sampled.",
+        "Where each clip sits on its segment's latent. Wire to H3 Joint "
+        "Conditioning and H3 Joint VAE Decode and Save.",
     )
 
     @classmethod
@@ -616,43 +907,104 @@ class H3JointLatent:
         return float("nan")
 
     def build(self, sequence):
-        clips = parse_sequence(sequence)
-        lines = parse_sequence_lines(sequence)
+        items = sequence_items(sequence)
+        lines = [line for kind, line in items if kind == "clip"]
+        clips = [clip_of_line(line) for line in lines]
         if not clips:
             raise ValueError("H3 Join Latents: the sequence is empty.")
         headers = clip_headers(clips)
+        segs = split_segments(items, headers)
+        loops = na.sequence_loops(sequence)
+        if loops and len(segs) == 1 and not segs[0]["gap_before"] \
+                and not segs[0]["gap_after"]:
+            latent, record = self._loop(sequence, clips, lines, headers)
+            return ([latent], [dict(record, segment=0, segments=1,
+                                    gap_before=0, gap_after=0)])
+        if loops:
+            _LOG.info("obvpm.h3 joint: the sequence loops but has hard cuts or "
+                      "empty space, so its wrap is rendered as a cut (no tie)")
+        cuts = shown_cuts(lines, headers, derive_flags(items))
+        latents, records = [], []
+        for k, seg in enumerate(segs):
+            idx = seg["clips"]
+            latent, record = self._segment(
+                [clips[i] for i in idx], [lines[i] for i in idx],
+                [headers[i] for i in idx], [cuts[i] for i in idx])
+            record.update(segment=k, segments=len(segs),
+                          gap_before=int(seg["gap_before"]),
+                          gap_after=int(seg["gap_after"]))
+            latents.append(latent)
+            records.append(record)
+        if len(segs) > 1:
+            _LOG.info("obvpm.h3 joint: the cut has %d segments (split at hard "
+                      "cuts and empty space); each is upscaled, refined and "
+                      "rendered on its own, then joined", len(segs))
+        return (latents, records)
+
+    @staticmethod
+    def _load(clips):
         videos, audios = [], []
         for clip in clips:
             v, a, _ = mctx.load_sidecar(mctx.sidecar_path(
                 nodes_load.resolve_clip_path(clip)))
             videos.append(v)
             audios.append(a)
+        return videos, audios
+
+    def _segment(self, clips, lines, headers, cuts):
+        """One segment: laid out, cropped to what the cut shows, assembled."""
+        videos, audios = self._load(clips)
+        layout = timeline_layout(lines, headers, [a.shape[-1] for a in audios],
+                                 cuts=cuts)
+        lo, hi = shown_range(layout, headers, cuts)
+        if hi <= lo:
+            raise ValueError("H3 Join Latents: the cut shows nothing of %s "
+                             "(frames %d..%d)." % (", ".join(clips), lo, hi))
+        cs, ce = crop_range(layout["total_steps"], lo, hi)
+        full_frames = layout["total_frames"]
+        layout = crop_layout(layout, cs, ce)
+        cs_f = layout["crop"]["frames"][0]
+        video, audio = assemble(videos, audios, layout)
+        record = dict(layout, clips=list(clips), lines=list(lines),
+                      keep_frames=[lo - cs_f, hi - cs_f])
+        info = "\n".join(
+            "%s: steps %d..%d, ticks %d..%d"
+            % (clip, s, s + n, t, t + m)
+            for clip, (s, n), (t, m) in zip(clips, layout["steps"], layout["ticks"]))
+        _LOG.info("obvpm.h3 joint: %d clip(s) -> %d steps (%d frames, of %d "
+                  "laid out; the cut shows %d), %d audio ticks\n%s",
+                  len(clips), layout["total_steps"], layout["total_frames"],
+                  full_frames, hi - lo, layout["total_ticks"], info)
+        return avpack.pack_av(video, audio, name="joint"), record
+
+    def _loop(self, sequence, clips, lines, headers):
+        """A looping cut in one piece: the whole joint, the wrap as the crop."""
+        videos, audios = self._load(clips)
         layout = timeline_layout(lines, headers, [a.shape[-1] for a in audios])
         video, audio = assemble(videos, audios, layout)
-        record = dict(layout, clips=list(clips), lines=list(lines))
-        if na.sequence_loops(sequence):
-            # the cut's own wrap, hash-verified and with manual cuts in,
-            # as the frames the RENDER keeps; the joint itself is whole
-            entries = na.resolve_sequence(sequence)
-            record["keep_frames"] = wrap_keep_frames(layout, entries, headers)
-            record["wrap_tie"] = wrap_tie(layout, headers)
-            tie = record["wrap_tie"]
-            if tie:
-                _LOG.info("obvpm.h3 joint: the opening is on the joint twice "
-                          "-- steps %d..%d and %d..%d -- and the refine will "
-                          "keep the two identical (the take's copy leads for "
-                          "%d step(s), the first clip's after)", tie["a"],
-                          tie["a"] + tie["n"], tie["b"], tie["b"] + tie["n"],
-                          tie["hand"])
-            else:
-                _LOG.info("obvpm.h3 joint: the sequence loops but its last clip "
-                          "holds no window of its first; the wrap is "
-                          "refined untied")
-            lo, hi = record["keep_frames"]
-            _LOG.info("obvpm.h3 joint: the sequence loops -- the render keeps "
-                      "frames %d..%d of %d (%d off the head, %d off the "
-                      "tail, which reproduce the opening)", lo, hi,
-                      layout["total_frames"], lo, layout["total_frames"] - hi)
+        record = dict(layout, clips=list(clips), lines=list(lines), loop=True)
+        # the cut's own wrap, hash-verified and with manual cuts in,
+        # as the frames the RENDER keeps; the joint itself is whole
+        entries = na.resolve_sequence(sequence)
+        record["keep_frames"] = wrap_keep_frames(layout, entries, headers)
+        record["wrap_tie"] = wrap_tie(layout, headers)
+        tie = record["wrap_tie"]
+        if tie:
+            _LOG.info("obvpm.h3 joint: the opening is on the joint twice "
+                      "-- steps %d..%d and %d..%d -- and the refine will "
+                      "keep the two identical (the take's copy leads for "
+                      "%d step(s), the first clip's after)", tie["a"],
+                      tie["a"] + tie["n"], tie["b"], tie["b"] + tie["n"],
+                      tie["hand"])
+        else:
+            _LOG.info("obvpm.h3 joint: the sequence loops but its last clip "
+                      "holds no window of its first; the wrap is "
+                      "refined untied")
+        lo, hi = record["keep_frames"]
+        _LOG.info("obvpm.h3 joint: the sequence loops -- the render keeps "
+                  "frames %d..%d of %d (%d off the head, %d off the "
+                  "tail, which reproduce the opening)", lo, hi,
+                  layout["total_frames"], lo, layout["total_frames"] - hi)
         info = "\n".join(
             "%s: steps %d..%d, ticks %d..%d"
             % (clip, s, s + n, t, t + m)
@@ -660,7 +1012,7 @@ class H3JointLatent:
         _LOG.info("obvpm.h3 joint: %d clip(s) -> %d steps (%d frames), %d "
                   "audio ticks\n%s", len(clips), layout["total_steps"],
                   layout["total_frames"], layout["total_ticks"], info)
-        return (avpack.pack_av(video, audio, name="joint"), record)
+        return avpack.pack_av(video, audio, name="joint"), record
 
 
 # ---------------------------------------------------------------------------
@@ -786,6 +1138,16 @@ def build_table(layout, load):
             "wrap_tie": layout.get("wrap_tie")}
 
 
+def _signed_frame(step):
+    """First frame of latent step `step`, also for a step before the
+    latent's start (a clip that begins before a cropped segment does; its
+    start is on the 5-step cycle, so whole cycles of 17 frames)."""
+    step = int(step)
+    if step >= 0:
+        return fr.frame_at_latent(step)
+    return -fr.frame_at_latent(-step)
+
+
 def window_owner(spans, s, e):
     """Index of the clip with the most rows in window [s, e); ties -> earlier."""
     best, owner = -1, 0
@@ -826,6 +1188,56 @@ def hold_audio(latent, audio_denoise=0.0):
     return out
 
 
+# The latent upscaler (LBH-123-AI's Comfyui_Minimax_h3_latent_Upscaler)
+# with temporal chunking off was seen inventing details the clip never
+# had -- hallucinations the refine then keeps. Nothing is gained by
+# turning it off, so a Run that would upscale that way is refused by the
+# first node of ours after the upscaler, before the refine samples
+# anything (H3 Joint Audio Mask).
+UPSCALER_CLASS = "MinimaxH3LatentUpscaler3D"
+
+
+def unchunked_upscalers(prompt, node_id):
+    """The latent upscalers this prompt node's inputs come from, at any
+    depth, that run with enable_temporal_chunking off -- their ids."""
+    if not isinstance(prompt, dict) or node_id is None:
+        return []
+    seen, stack, found = set(), [str(node_id)], []
+    while stack:
+        node = prompt.get(stack.pop())
+        if not isinstance(node, dict):
+            continue
+        for value in (node.get("inputs") or {}).values():
+            if not (isinstance(value, list) and len(value) == 2
+                    and isinstance(value[1], int)):
+                continue                # a value, not a link
+            src = str(value[0])
+            if src in seen:
+                continue
+            seen.add(src)
+            source = prompt.get(src)
+            if (isinstance(source, dict)
+                    and source.get("class_type") == UPSCALER_CLASS
+                    and (source.get("inputs") or {}).get(
+                        "enable_temporal_chunking") is False):
+                found.append(src)
+            stack.append(src)
+    return sorted(found)
+
+
+def refuse_unchunked_upscale(prompt, node_id, who):
+    """Refuse the Run when a latent upscaler feeding this node has
+    temporal chunking off (see UPSCALER_CLASS)."""
+    bad = unchunked_upscalers(prompt, node_id)
+    if bad:
+        raise ValueError(
+            "%s: the latent upscaler (node %s) has enable_temporal_chunking "
+            "off. Upscaling without it is known to invent details the clip "
+            "never had (hallucinations). Turn enable_temporal_chunking on "
+            "in that node, then run again."
+            % (who, ", ".join("#" + b for b in bad)))
+
+
 class H3JointAudioMask:
     CATEGORY = "obvpm/h3"
     FUNCTION = "mask"
@@ -856,9 +1268,12 @@ class H3JointAudioMask:
                                "picture (0.5 for lip sync); save the source "
                                "audio then."}),
             },
+            "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"},
         }
 
-    def mask(self, latent, audio_denoise=0.0):
+    def mask(self, latent, audio_denoise=0.0, prompt=None, unique_id=None):
+        # before the refine samples anything: the upscaler feeding it
+        refuse_unchunked_upscale(prompt, unique_id, "H3 Joint Audio Mask")
         return (hold_audio(latent, audio_denoise),)
 
 
@@ -952,23 +1367,27 @@ def anchored_windows(total, length, overlap, spans, owners):
     than `overlap` steps at the hand-over (no held head) is stretched to
     keep at least that much blend, clip-shaped, within the next clip.
     """
-    order = sorted(range(len(spans)), key=lambda i: (int(spans[i][0]), i))
     first_owned = {}
     for t, j in enumerate(owners):
         if j >= 0 and j not in first_owned:
             first_owned[j] = t
+    # A cropped segment can hold clips that start before its first row
+    # (their start is clamped to 0, still on the cycle: crops start on it)
+    # and clips it shows nothing of (no rows owned: no windows of their own).
+    start = {i: max(0, int(spans[i][0])) for i in first_owned}
+    order = sorted(first_owned, key=lambda i: (start[i], i))
     out = []
     for pos, i in enumerate(order):
-        a = int(spans[i][0])
+        a = start[i]
         later = [first_owned[j] for j in order[pos + 1:]
-                 if j in first_owned and first_owned[j] > a]
+                 if first_owned[j] > a]
         b = min(later) if later else total
         nxt = order[pos + 1] if pos + 1 < len(order) else None
-        if nxt is not None and b - int(spans[nxt][0]) < overlap:
-            k = max(overlap, b - int(spans[nxt][0]))
-            while (int(spans[nxt][0]) + k - a) % fr.LATENTS_PER_GROUP != fr.LATENT_BASE:
+        if nxt is not None and b - start[nxt] < overlap:
+            k = max(overlap, b - start[nxt])
+            while (start[nxt] + k - a) % fr.LATENTS_PER_GROUP != fr.LATENT_BASE:
                 k += 1
-            b = min(int(spans[nxt][0]) + k, int(spans[nxt][0]) + int(spans[nxt][1]), total)
+            b = min(start[nxt] + k, int(spans[nxt][0]) + int(spans[nxt][1]), total)
         b = min(b, total)
         if b <= a:
             continue
@@ -1482,7 +1901,7 @@ class H3WindowHandler:
         params["seed"] = (payload.cond or {}).get("seed", 0) if payload is not None else 0
         keyframes = params.get("minimax_keyframes")
         if keyframes:
-            shift = fr.frame_at_latent(clip_start) - fr.frame_at_latent(s)
+            shift = _signed_frame(clip_start) - fr.frame_at_latent(s)
             keyframes = [
                 dict(kf, resolved_frame_index=kf.get("resolved_frame_index", 0) + shift)
                 if isinstance(kf, dict) else kf for kf in keyframes]
@@ -1583,6 +2002,10 @@ def timeline_steps(conds):
     for cond_list in lists:
         for cond in cond_list or []:
             table = cond.get(COND_KEY) if isinstance(cond, dict) else None
+            if table and table.get("owners"):
+                # one owner per step: exactly the latent's length, also
+                # when a cropped segment ends inside a clip's span
+                return len(table["owners"])
             if table and table.get("spans"):
                 return max(int(s) + int(n) for s, n in table["spans"])
     return None

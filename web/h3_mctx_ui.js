@@ -1,6 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { specHandover } from "./h3_handover.js";
+import { LiveClip, tlPlayerBar } from "./h3_player.js";
 // drop-resolution helpers shared with the loader drop handler -- same
 // trust rules for drops into the timeline strip (in-place when the
 // content already lives in output, upload to dropped/ otherwise)
@@ -334,6 +335,7 @@ app.registerExtension({
             widget.serialize = false;
             widget.options.serialize = false;
             tlPanWithMiddleButton(container);
+            tlNoSelect(container);
             widget.computeLayoutSize = () => ({ minHeight, minWidth });
             // THE frozen-width culprit (diagnosed via the sampler): once
             // something stores widget.width (the Vue legacy-widget mirror
@@ -564,6 +566,44 @@ function tlApplyValues(liveNode, saved, report, apply, only) {
         return false;
     }
     let touched = false;
+    // A node that knows its own settings better than its raw widgets --
+    // Value Presets (comfyui-obvpm) answers per field and per preset,
+    // with the schema and presets rows unticked by default -- is asked
+    // for its rows, and applies the ticked ones itself.
+    if (typeof liveNode.obvpmRestoreRows === "function"
+            && typeof liveNode.obvpmRestoreApply === "function") {
+        let rows = [];
+        try {
+            rows = liveNode.obvpmRestoreRows(got.values) ?? [];
+        } catch (err) {
+            tldbg("restore: obvpmRestoreRows threw", liveNode.type, err);
+            report.skipped.push(`${tlNodeName(liveNode)} — could not `
+                + `compare its settings (see the console)`);
+            rows = null;
+        }
+        if (rows) {
+            const picked = new Set();
+            for (const row of rows) {
+                const key = `${liveNode.id}::${row.key}`;
+                if (only && !only.has(key)) continue;
+                touched = true;
+                picked.add(row.key);
+                report.changes.push({ id: liveNode.id, type: liveNode.type,
+                                      name: tlNodeName(liveNode), key: key,
+                                      what: row.what, from: row.from,
+                                      to: row.to, checked: row.checked !== false,
+                                      details: row.details ?? null });
+            }
+            if (apply && picked.size) {
+                try {
+                    liveNode.obvpmRestoreApply(got.values, picked);
+                } catch (err) {
+                    tldbg("restore: obvpmRestoreApply threw", liveNode.type, err);
+                }
+            }
+        }
+        return tlApplyMode(liveNode, saved, report, apply, only) || touched;
+    }
     for (const w of liveNode.widgets ?? []) {
         if (!(w.name in got.values)) continue;
         const v = got.values[w.name];
@@ -603,20 +643,22 @@ function tlApplyValues(liveNode, saved, report, apply, only) {
             tldbg("restore: widget callback threw", liveNode.type, w.name, err);
         }
     }
-    // bypass / mute / always -- explicitly requested, and it is just a
-    // number on the node (0 always, 2 never/mute, 4 bypass)
+    return tlApplyMode(liveNode, saved, report, apply, only) || touched;
+}
+
+// bypass / mute / always -- explicitly requested, and it is just a
+// number on the node (0 always, 2 never/mute, 4 bypass)
+function tlApplyMode(liveNode, saved, report, apply, only) {
     const modeKey = `${liveNode.id}::__mode__`;
-    if (typeof saved.mode === "number" && saved.mode !== liveNode.mode
-            && (!only || only.has(modeKey))) {
-        report.changes.push({ id: liveNode.id, type: liveNode.type,
-                              name: tlNodeName(liveNode), key: modeKey,
-                              what: "node state",
-                              from: TL_MODE[liveNode.mode] ?? liveNode.mode,
-                              to: TL_MODE[saved.mode] ?? saved.mode });
-        if (apply) liveNode.mode = saved.mode;
-        touched = true;
-    }
-    return touched;
+    if (typeof saved.mode !== "number" || saved.mode === liveNode.mode
+            || (only && !only.has(modeKey))) return false;
+    report.changes.push({ id: liveNode.id, type: liveNode.type,
+                          name: tlNodeName(liveNode), key: modeKey,
+                          what: "node state",
+                          from: TL_MODE[liveNode.mode] ?? liveNode.mode,
+                          to: TL_MODE[saved.mode] ?? saved.mode });
+    if (apply) liveNode.mode = saved.mode;
+    return true;
 }
 
 // A group's rect, live object or serialized -- Rectangle is indexable.
@@ -764,6 +806,34 @@ const TL_PROGRESS_EVENT = "obvpm.h3.build_progress";
 // canvas element as a copy of itself and the pan just works; the copy
 // carries the same clientX/Y and pointerId, which is all the canvas
 // reads. Left and right buttons are untouched: those are the panel's.
+// A panel holding video: never text-selectable. A double click or a drag
+// across the canvas otherwise selects the panel, and the browser paints
+// its blue selection over the whole picture. Text fields inside stay
+// selectable, and so are the status lines marked with tlSelectable --
+// a file name or a "next run" line is worth copying. Any other <video>
+// on the page (ComfyUI's own video previews, other packs') is kept out
+// of the selection the same way.
+const TL_NOSELECT = "obvpm-h3-noselect";
+const TL_SELECTABLE = "obvpm-h3-selectable";
+if (!document.getElementById(TL_NOSELECT)) {
+    const style = document.createElement("style");
+    style.id = TL_NOSELECT;
+    style.textContent = `.${TL_NOSELECT}, .${TL_NOSELECT} *, video {`
+        + " -webkit-user-select: none; user-select: none; }"
+        + ` .${TL_NOSELECT} input, .${TL_NOSELECT} textarea,`
+        + ` .${TL_NOSELECT} [contenteditable="true"],`
+        + ` .${TL_NOSELECT} .${TL_SELECTABLE},`
+        + ` .${TL_NOSELECT} .${TL_SELECTABLE} * {`
+        + " -webkit-user-select: text; user-select: text; }";
+    document.head.appendChild(style);
+}
+function tlNoSelect(el) {
+    el.classList.add(TL_NOSELECT);
+}
+function tlSelectable(el) {
+    el.classList.add(TL_SELECTABLE);
+}
+
 function tlPanWithMiddleButton(el) {
     el.addEventListener("pointerdown", (e) => {
         if (e.button !== 1) return;
@@ -839,6 +909,7 @@ function tlProgressBar() {
         font: "10px sans-serif",
     });
     const label = document.createElement("div");
+    tlSelectable(label);
     Object.assign(label.style, {
         whiteSpace: "nowrap", overflow: "hidden",
         textOverflow: "ellipsis",
@@ -1517,6 +1588,62 @@ function tlAudioSeamDialog({ get, set, seams, onChange, onClose }) {
     return close;
 }
 
+// The collapsed details of a load-settings row: a toggle, which the
+// caller puts INSIDE the row (under its Current text -- a row of its own
+// started below the row's full height, a two-line node name included,
+// which read as a gap), then one row per thing that differs (a schema
+// field's default, a preset's value) in the dialog's OWN columns -- what
+// under Setting, the current and the take's under Current and New --
+// hidden until the toggle opens them, and a spacer closing the block.
+// Rows of the main table rather than a table inside a <details>, which
+// could not line up with the columns above it.
+function tlDetailsRows(details, PAL) {
+    const cell = (text, style) => {
+        const td = document.createElement("td");
+        Object.assign(td.style, { padding: "2px 10px 2px 0", verticalAlign: "top" });
+        if (text != null) {
+            const d = document.createElement("div");
+            d.textContent = String(text);
+            Object.assign(d.style, { whiteSpace: "pre-wrap", overflowWrap: "anywhere",
+                                     lineHeight: "1.4", fontSize: "12px",
+                                     maxHeight: "min(200px, 30vh)", overflowY: "auto" },
+                          style || {});
+            td.appendChild(d);
+        }
+        return td;
+    };
+    const toggle = document.createElement("div");
+    const label = details.summary || details.lines.length + " change(s)";
+    Object.assign(toggle.style, { cursor: "pointer", color: PAL.sub, fontSize: "12px",
+                                  userSelect: "none", marginTop: "3px",
+                                  width: "fit-content" });
+    toggle.title = "Show or hide what differs";
+
+    const lines = details.lines.map((line) => {
+        const tr = document.createElement("tr");
+        tr.append(cell(null),
+                  cell(line.what, { color: PAL.sub, paddingLeft: "12px", maxHeight: "none" }),
+                  cell(line.from, { opacity: "0.7" }),
+                  cell(line.to, {}),
+                  cell(null));
+        return tr;
+    });
+    let open = false;
+    const show = () => {
+        toggle.textContent = (open ? "▾ " : "▸ ") + label;
+        for (const tr of lines) tr.style.display = open ? "" : "none";
+    };
+    toggle.addEventListener("click", () => { open = !open; show(); });
+    show();
+    // air after the block, open or closed, before the next row
+    const spacer = document.createElement("tr");
+    const gap = document.createElement("td");
+    gap.colSpan = 5;
+    Object.assign(gap.style, { height: "10px", padding: "0" });
+    spacer.appendChild(gap);
+    return { toggle, rows: [...lines, spacer] };
+}
+
 function tlLoadDialog({ clip, keyword, plan, pinRole }) {
     return new Promise((resolve) => {
         // Theme colours only. themePalette() has no `bg`/`accent` keys --
@@ -1672,7 +1799,9 @@ function tlLoadDialog({ clip, keyword, plan, pinRole }) {
             };
             const box = document.createElement("input");
             box.type = "checkbox";
-            box.checked = true;
+            // a row can ask to start unticked (a Value Presets schema or
+            // preset: the node's design, not the take's settings)
+            box.checked = c.checked !== false;
             box.title = "Apply this change";
             Object.assign(box.style, { cursor: "pointer", margin: "0" });
             boxes.set(c.key, box);
@@ -1693,15 +1822,27 @@ function tlLoadDialog({ clip, keyword, plan, pinRole }) {
                 mk(tlValueText(c.from), { opacity: "0.7" }),
                 mk(tlValueText(c.to), {}),
                 tick);
+            // A row's details (what changed inside a schema or a preset)
+            // sit on a row of their own under it, collapsed: the row is
+            // the decision, the details are there when wanted.
+            const more = c.details?.lines?.length
+                ? tlDetailsRows(c.details, PAL) : null;
+            // the toggle sits in the row itself, under the Current text
+            if (more) tr.children[2].appendChild(more.toggle);
+            const extra = more ? more.rows : [];
             // dim a row the user has opted out of, so the table shows
             // what will happen rather than what was proposed
-            box.addEventListener("change", () => {
-                for (const td of tr.children) {
-                    td.style.opacity = box.checked ? "1" : "0.4";
+            const dim = () => {
+                for (const row of [tr, ...extra]) {
+                    for (const td of row.children) {
+                        td.style.opacity = box.checked ? "1" : "0.4";
+                    }
                 }
-            });
+            };
+            box.addEventListener("change", dim);
             lastNode = c.name;
-            tbody.appendChild(tr);
+            tbody.append(tr, ...extra);
+            dim();
         }
         table.appendChild(tbody);
         body.appendChild(table);
@@ -1817,6 +1958,82 @@ function tlLoadDialog({ clip, keyword, plan, pinRole }) {
     });
 }
 
+// A question with two answers, on the same overlay and palette as the
+// load-settings dialog -- never window.confirm: that blocks the page, is
+// not implemented at all in some hosts (ComfyUI Desktop is Electron), and
+// looks foreign. Resolves true for `yes`, false for `no`; Escape and a
+// click outside answer `no`, the choice that changes nothing.
+function tlAskChoice({ title, message, yes, no }) {
+    return new Promise((resolve) => {
+        const PAL = themePalette();
+        const BG = (typeof LiteGraph !== "undefined"
+            && LiteGraph.NODE_DEFAULT_BGCOLOR) || PAL.rest;
+        const FG = (typeof LiteGraph !== "undefined"
+            && LiteGraph.NODE_TEXT_COLOR) || PAL.text;
+        const overlay = document.createElement("div");
+        Object.assign(overlay.style, {
+            position: "fixed", inset: "0", zIndex: "10000",
+            background: "rgba(0,0,0,0.5)", display: "flex",
+            alignItems: "center", justifyContent: "center",
+            font: "13px sans-serif",
+        });
+        const panel = document.createElement("div");
+        Object.assign(panel.style, {
+            background: BG, color: FG,
+            border: "1px solid " + PAL.edge, borderRadius: "8px",
+            boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
+            width: "min(520px, 92vw)", padding: "16px 18px",
+            display: "flex", flexDirection: "column", gap: "12px",
+        });
+        const h = document.createElement("div");
+        h.textContent = title;
+        Object.assign(h.style, { fontSize: "15px", fontWeight: "600" });
+        const body = document.createElement("div");
+        body.textContent = message;
+        Object.assign(body.style, { whiteSpace: "pre-wrap", lineHeight: "1.5" });
+        const foot = document.createElement("div");
+        Object.assign(foot.style, { display: "flex", gap: "10px",
+                                    justifyContent: "flex-end" });
+        const mkBtn = (label, primary) => {
+            const b = document.createElement("button");
+            b.textContent = label;
+            Object.assign(b.style, {
+                background: primary ? PAL.active : BG,
+                color: primary ? PAL.activeText : FG,
+                border: "1px solid " + (primary ? "transparent" : PAL.edge),
+                borderRadius: "4px", padding: "6px 16px", cursor: "pointer",
+                font: "13px/19px sans-serif", whiteSpace: "nowrap",
+            });
+            return b;
+        };
+        const noBtn = mkBtn(no, false);
+        const yesBtn = mkBtn(yes, true);
+        foot.append(noBtn, yesBtn);
+        panel.append(h, body, foot);
+        overlay.appendChild(panel);
+        let done = false;
+        const close = (value) => {
+            if (done) return;
+            done = true;
+            document.removeEventListener("keydown", onKey, true);
+            overlay.remove();
+            resolve(value);
+        };
+        function onKey(ev) {
+            if (ev.key === "Escape") { ev.stopPropagation(); close(false); }
+            else if (ev.key === "Enter") { ev.stopPropagation(); close(true); }
+        }
+        document.addEventListener("keydown", onKey, true);
+        overlay.addEventListener("mousedown", (ev) => {
+            if (ev.target === overlay) close(false);
+        });
+        noBtn.addEventListener("click", () => close(false));
+        yesBtn.addEventListener("click", () => close(true));
+        document.body.appendChild(overlay);
+        yesBtn.focus();
+    });
+}
+
 // The take's own pin options: what the Timeline was set to when that
 // clip was generated. Restored regardless of the group keyword -- it is
 // this node's own state, and it is the setting that reproduces the take.
@@ -1859,6 +2076,71 @@ const TL_UPSCALE_HOVER = "rgba(38,132,144,0.95)";
 // report a deleted one. Frontend-only on purpose -- the graph stays
 // unwired, the Timeline stays outside execution.
 const TL_REGISTRY = new Map();
+
+// ---- spacebar: play / pause ------------------------------------------------
+// Each Timeline registers {node, el, toggle}; one document listener picks
+// the timeline a Space is meant for and calls its toggle (which plays the
+// full build when there is one, quick otherwise -- see spaceToggle).
+//
+// It acts on the key going DOWN (auto-repeats ignored). Waiting for a
+// clean tap -- released quickly, pointer still -- to leave ComfyUI's
+// held-Space canvas pan alone dropped real presses whenever the hand
+// moved the mouse a little; the pan still works, it now also toggles.
+// The keydown itself is left alone, so the canvas still sees it. Typing
+// keeps its Space, and so does a focused control that is not the
+// timeline's own (a dialog button, a menu); a focused timeline button
+// would otherwise be clicked by the same Space, so that click is
+// cancelled (Chrome clicks a button on the Space keyUP).
+//
+// Which timeline: the one under the pointer, else the one selected, else
+// the only one in the graph on screen. Keyed by NODE, not id: ids repeat
+// across workflows, and a removed node keeps its graph reference.
+const TL_SPACE = new Map();
+const tlSpaceIs = (ev) => ev.code === "Space" || ev.key === " ";
+let tlSpaceHandled = false;       // the keyup of a Space we acted on
+function tlSpaceTarget(ev) {
+    const el = ev.target instanceof Element ? ev.target : null;
+    if (el?.closest("input, textarea, select, [contenteditable]"
+            + ":not([contenteditable='false'])")) {
+        return null;
+    }
+    const g = app.canvas?.graph;
+    const alive = [...TL_SPACE.values()].filter((t) => g && t.node.graph === g
+        && g.getNodeById?.(t.node.id) === t.node);
+    if (!alive.length) return null;
+    const ctl = el?.closest("button, a, [role='button'], [role='menuitem'], "
+        + "[role='option'], [role='dialog']");
+    if (ctl && !alive.some((t) => t.el.contains(ctl))) return null;
+    const hover = alive.find((t) => t.el.matches(":hover"));
+    if (hover) return hover;
+    const sel = alive.filter((t) => app.canvas?.selected_nodes?.[t.node.id]
+        === t.node);
+    if (sel.length === 1) return sel[0];
+    // a player that is not a timeline (the Result Preview) answers only
+    // when pointed at or selected: the lone timeline keeps its Space
+    const main = alive.filter((t) => !t.hoverOnly);
+    return main.length === 1 ? main[0] : null;
+}
+if (!window.__obvpmTlSpace) {
+    window.__obvpmTlSpace = true;
+    document.addEventListener("keydown", (ev) => {
+        if (!tlSpaceIs(ev) || ev.repeat) return;
+        tlSpaceHandled = false;
+        if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey) return;
+        const t = tlSpaceTarget(ev);
+        if (!t) return;
+        const onButton = ev.target instanceof Element
+            && !!ev.target.closest("button");
+        if (onButton) ev.preventDefault();  // the button's own click
+        tlSpaceHandled = onButton;
+        t.toggle();
+    }, true);
+    document.addEventListener("keyup", (ev) => {
+        if (!tlSpaceIs(ev) || !tlSpaceHandled) return;
+        tlSpaceHandled = false;
+        ev.preventDefault();                // Chrome clicks on keyup
+    }, true);
+}
 
 // Dormant, like DEBUG above: flip on when hunting timeline bugs. The
 // call sites stay -- they are the map of where past bugs lived.
@@ -1910,6 +2192,47 @@ const TL_SEAM_ORDER = ["level_lock", "level_lock_frames",
                        "crossfade", "crossfade_frames", "audio_declick"];
 const TL_TRUE = ["1", "on", "true", "yes"];
 const TL_FALSE = ["0", "off", "false", "no"];
+// A PART ID rides in the same brackets, first: `clip.mp4 @ 40..80
+// [id=k3x9]` (mirrors nodes_assemble.PART_KEY / line_part). It names the
+// LINE, so a pin -- and the take made from it -- can say which part of a
+// file it continues when the file stands in the cut more than once. It
+// is written only where a pin or a split needs it.
+const TL_PART_KEY = "id";
+const TL_PART_RE = /^[A-Za-z0-9_-]{1,24}$/;
+// A new id no line in `taken` already uses. Random rather than counted:
+// a counter would hand a deleted part's id to the next new part, and a
+// take recorded against the old one would then find its way to the new.
+function tlNewPart(taken) {
+    for (;;) {
+        const id = Math.random().toString(36).slice(2, 6);
+        if (id.length === 4 && !taken.has(id)) return id;
+    }
+}
+
+// A part id names ONE line, but copying a line in the text editor copies
+// its id too, and then only the first copy could ever be pinned. The
+// first keeps the id; each later line repeating it gets a fresh one.
+// Every other line is returned exactly as written.
+function tlDedupeParts(text) {
+    const lines = String(text ?? "").split("\n");
+    const all = new Set();
+    for (const raw of lines) {
+        const p = tlSplitSeamOpts(raw.trim()).part;
+        if (p) all.add(p);
+    }
+    const seen = new Set();
+    return lines.map((raw) => {
+        const t = raw.trim();
+        if (!tlIsEntryLine(t) || TL_GAP_RE.test(t)) return raw;
+        const p = tlSplitSeamOpts(t).part;
+        if (!p) return raw;
+        if (!seen.has(p)) { seen.add(p); return raw; }
+        const [e] = tlParseSequence(t);
+        e.part = tlNewPart(all);
+        all.add(e.part);
+        return tlFormatLine(e);
+    }).join("\n");
+}
 
 // An unknown key or unreadable value is DROPPED, not refused: a wrong
 // setting degrades to the timeline's default, while an unknown ENTRY
@@ -1917,14 +2240,19 @@ const TL_FALSE = ["0", "off", "false", "no"];
 // deliberately does not.
 function tlSplitSeamOpts(line) {
     const m = line.match(TL_OPTS_RE);
-    if (!m) return { head: line, seam: {} };
+    if (!m) return { head: line, seam: {}, part: null };
     const seam = {};
+    let part = null;
     for (const token of m[2].split(/\s+/)) {
         if (!token) continue;
         const at = token.indexOf("=");
         if (at < 0) continue;
         const key = token.slice(0, at);
         const raw = token.slice(at + 1).trim();
+        if (key === TL_PART_KEY) {
+            if (TL_PART_RE.test(raw)) part = raw;
+            continue;
+        }
         const kind = TL_SEAM_KEYS[key];
         if (!kind) continue;
         if (kind === "bool") {
@@ -1935,13 +2263,12 @@ function tlSplitSeamOpts(line) {
         }
         if (/^-?\d+$/.test(raw)) seam[key] = Number(raw);
     }
-    return { head: m[1].trim(), seam };
+    return { head: m[1].trim(), seam, part };
 }
 
-function tlFormatSeamOpts(seam) {
-    if (!seam) return "";
-    const parts = [];
-    for (const key of TL_SEAM_ORDER) {
+function tlFormatSeamOpts(seam, part = null) {
+    const parts = part ? [TL_PART_KEY + "=" + part] : [];
+    for (const key of seam ? TL_SEAM_ORDER : []) {
         const v = seam[key];
         if (v === undefined || v === null) continue;
         parts.push(key + "=" + (TL_SEAM_KEYS[key] === "bool"
@@ -2080,10 +2407,10 @@ function tlParseSequence(text) {
         if (g) {
             out.push({ clip: null, gap: Number(g[1]),
                        enterOverride: null, exitOverride: null,
-                       seamOpts: {} });
+                       seamOpts: {}, part: null });
             continue;
         }
-        const { head, seam } = tlSplitSeamOpts(line);
+        const { head, seam, part } = tlSplitSeamOpts(line);
         const m = head.match(TL_LINE_RE);
         // seamOpts, NOT seam: `entry.seam` is already the DERIVED seam
         // descriptor ({kind, note}) that drawLinks paints the boundary
@@ -2094,7 +2421,7 @@ function tlParseSequence(text) {
         out.push({ clip: m[1].trim(), gap: null,
                    enterOverride: m[2] === undefined ? null : Number(m[2]),
                    exitOverride: m[3] === undefined ? null : Number(m[3]),
-                   seamOpts: seam });
+                   seamOpts: seam, part });
     }
     return out;
 }
@@ -2330,25 +2657,152 @@ function tlCanCut(entries, i, side, linked) {
 // even though C no longer sits after B and nothing would replace it.
 // Occupancy is positional AND live: the immediate neighbour on that
 // side, with the link actually joining them there.
-//   side "after"  -> the clip following `sourceClip` (an extend)
+//   side "after"  -> the clip following entry `k` (an extend)
 //   side "before" -> the clip preceding it (a prepend)
-function tlOccupant(entries, sourceClip, side, linked) {
+function tlOccupant(entries, k, side, linked) {
     const list = entries ?? [];
-    const k = list.findIndex((e) => e.clip === sourceClip);
-    if (k < 0) return null;
+    if (k == null || k < 0) return null;
     const j = side === "after" ? k + 1 : k - 1;
     const src = list[k], occ = list[j];
     if (!occ || occ.gap != null || !occ.meta || !src?.meta) return null;
-    if (occ.clip === sourceClip) return null;
+    if (occ.clip === src.clip) return null;
     const live = side === "after"
         ? linked(src.meta, occ.meta) : linked(occ.meta, src.meta);
     return live ? { idx: j, entry: occ } : null;
 }
 
+// A pin names an ENTRY, not a file. The same file can stand in the
+// sequence more than once -- a split clip -- and each occurrence starts
+// and ends somewhere else, so "extend this clip" has to say which one.
+// pin_state carries it as `part` (for `source`) and `part2` (for
+// `source2`): the line's part id ([id=...], see TL_PART_KEY). The id
+// travels with its line through every edit -- moves, trims, splits of
+// OTHER parts, deletes of other parts -- which a position would not.
+// A pin without one (written before part ids) names the file's first
+// entry, as it always did. A pin whose part has left the cut names
+// nothing, and is cleared rather than moved onto a different part.
+function tlPartEntry(entries, clip, part) {
+    if (!clip || !entries) return -1;
+    return entries.findIndex((e) => e.gap == null && e.clip === clip
+        && (part ? e.part === part : true));
+}
+// Which occurrence of a file entry i is (0 = the first), for labels.
+function tlOccOf(entries, i) {
+    const clip = entries?.[i]?.clip;
+    if (!clip) return 0;
+    let n = 0;
+    for (let j = 0; j < i; j++) if (entries[j].clip === clip) n++;
+    return n;
+}
+// The part a TAKE was generated from, as its recipe records it (see
+// nodes_assemble._stamp_part): {part, cut} for the side it extends
+// ("after") or prepends into ("before"); null for a take made before
+// part ids, or from a line that had none. `cut` is the cut the run was
+// QUEUED at -- null for the clip's own edge.
+function tlTakePart(meta, side) {
+    const place = side === "after" ? "before" : "after";
+    const p = tlPins(meta).find((s) => s.place === place && s.tl_part);
+    return p ? { part: String(p.tl_part),
+                 cut: p.tl_cut == null ? null : Number(p.tl_cut) } : null;
+}
+// Does a take's join land on THIS part's edge? The 17-frame grid may
+// have moved it (an extend's window only ever shifts EARLIER, less than
+// a group; a prepend's only LATER), so "on the edge" is that one group.
+// An edge that is not cut (the clip's own end, or a derived one) takes
+// any join inside the part: the join then decides where it exits, as it
+// always has. `side` "after" = the take extends entry e, "before" = it
+// prepends into it. Mirrors reconcileCut's grid rule.
+//
+// The grid moves the take's WINDOW, not its join: a soft hold hands over
+// some frames inside the window (h3_handover), so a prepend's join can lie
+// a whole group past the cut while its window start moved only a frame or
+// two. A cut is therefore compared with the window edge (tlWindowEdge).
+function tlJoinFits(e, meta, side) {
+    const link = side === "after" ? tlExtendParent(meta)
+                                  : tlPrependChild(meta);
+    if (!e?.meta || !link || link.id !== e.meta.self_id) return false;
+    const ph = Number(e.meta.pinned_head_frames) || 0;
+    const at = link.join - ph;
+    const w = tlWindowEdge(meta, side) - ph;
+    const frames = Number(e.frames ?? e.meta.delivered_frames) || 0;
+    if (side === "after") {
+        const cut = e.exitOverride;
+        if (cut != null) return w <= cut && cut - w < TL_GROUP;
+        return at > (e.enterOverride ?? 0) && at <= frames;
+    }
+    const cut = e.enterOverride;
+    if (cut != null) return w >= cut && w - cut < TL_GROUP;
+    return at < (e.exitOverride ?? frames);
+}
+// Where a take's pinned window meets its neighbour, in the neighbour's
+// sidecar frames: an extend's window END (side "after"), a prepend's
+// window START (side "before") -- the edge the 17-frame grid moves. A take
+// whose recipe says nothing about it falls back to its join.
+function tlWindowEdge(meta, side) {
+    const place = side === "after" ? "before" : "after";
+    const p = tlPins(meta).find((s) => s.place === place &&
+        s.source_kind === "clip" && s.source_id);
+    if (!p) {
+        const link = side === "after" ? tlExtendParent(meta)
+                                      : tlPrependChild(meta);
+        return link ? link.join : 0;
+    }
+    const start = Number(p.source_start) || 0;
+    return side === "after" ? start + (Number(p.source_frames) || 0) : start;
+}
+// Which occurrence of a take's PARENT the take belongs to. `side`
+// "after" = the parent it extends, "before" = the clip it prepends
+// into. In order:
+//   1. the part id its recipe carries, when that part is still in the
+//      cut AND the take's join still lands on its edge (tlJoinFits);
+//   2. else a part whose edge the join does land on, nearest -- the
+//      recorded part may have been SPLIT since the take was queued, and
+//      the edge it continues from (the clip's end, or a cut) now belongs
+//      to the other half, which kept no claim to the id;
+//   3. else the recorded part after all: nothing fits because ITS cut
+//      was moved while the take generated, which reconcileParentCut
+//      asks about;
+//   4. else, for a take without a recorded part, the nearest edge.
+// The pinned occurrence only breaks a tie (the same file listed twice
+// with the same cut): a take added later from the Result Preview need
+// not be the one the current pin asked for.
+function tlParentIdx(entries, meta, side, pinnedIdx = -1) {
+    const link = side === "after" ? tlExtendParent(meta)
+                                  : tlPrependChild(meta);
+    if (!link || !entries) return -1;
+    const rec = tlTakePart(meta, side);
+    const own = rec ? entries.findIndex((e) => e.gap == null
+        && e.part === rec.part && e.meta?.self_id === link.id) : -1;
+    if (own >= 0 && tlJoinFits(entries[own], meta, side)) return own;
+    const off = (i) => {
+        const e = entries[i];
+        const ph = Number(e.meta.pinned_head_frames) || 0;
+        const edge = side === "after"
+            ? (e.exit ?? e.frames ?? Number(e.meta.delivered_frames))
+            : (e.enter ?? 0);
+        return Math.abs(Number(edge) - (link.join - ph));
+    };
+    const nearest = (keep) => {
+        let best = -1;
+        entries.forEach((e, i) => {
+            if (!e.meta || e.meta.self_id !== link.id || !keep(e)) return;
+            if (best < 0 || off(i) < off(best)
+                    || (off(i) === off(best) && i === pinnedIdx)) {
+                best = i;
+            }
+        });
+        return best;
+    };
+    const fits = nearest((e) => tlJoinFits(e, meta, side));
+    if (fits >= 0) return fits;
+    if (own >= 0) return own;
+    return nearest(() => true);
+}
+
 function tlFormatLine(e) {
     if (e.gap != null) return `~ ${Math.max(1, Math.round(e.gap))}`;
     const a = e.enterOverride, b = e.exitOverride;
-    const t = tlFormatSeamOpts(e.seamOpts);
+    const t = tlFormatSeamOpts(e.seamOpts, e.part ?? null);
     if (a == null && b == null) return `${e.clip}${t}`;
     if (b == null) return `${e.clip} @ ${a}${t}`;
     if (a == null) return `${e.clip} @ ..${b}${t}`;
@@ -2420,9 +2874,18 @@ function tlDeriveSeam(lh, rh) {
         const exitF = ex.join - num(lh, "pinned_head_frames");
         const delivered = num(lh, "delivered_frames");
         const clean = exitF === delivered;
+        // a window that ends at the parent's end but hands over a latent
+        // step inside it (handover_edge, nodes_masked.handover_frames):
+        // the parent stops short of its decode edge -- the join, not a cut
+        const pin = tlPins(rh).find((s) => s.place === "before" &&
+            s.source_id === lh.self_id && s.handover_edge);
+        const edge = !!pin && (Number(pin.source_start) || 0)
+            + (Number(pin.source_frames) || 0)
+            - num(lh, "pinned_head_frames") === delivered;
         return { exitL: clean ? null : exitF, enterR: 0,
                  kind: "seamless",
                  note: clean ? "extends: seamless"
+                     : edge ? `extends: seamless, hands over at frame ${exitF}`
                      : `extends at a cut: exits at frame ${exitF}` };
     }
     const pr = tlPrependChild(lh);
@@ -2991,7 +3454,6 @@ app.registerExtension({
             // scaffolding included, but only the kept span reaches the
             // timeline, so you need both spans and where they sit.
             function durBreakdown(f, secs, wired, masks, plan) {
-                const name = (p) => String(p || "").split("/").pop();
                 const span = (a, b) => secTxt(a) + "-" + secTxt(b);
                 const L = [];
                 L.push((wired ? "Driven by a wire: " : "Asked ")
@@ -3010,7 +3472,7 @@ app.registerExtension({
                     L.push("What the run is made of:");
                     if (plan.head) {
                         L.push("  " + span(0, plan.head) + "  " + plan.head
-                               + "f pinned from " + name(st.source)
+                               + "f pinned from " + pinName(st)
                                + " (context; trimmed off)");
                     }
                     const freeTo = f - plan.tailWin;
@@ -3019,8 +3481,7 @@ app.registerExtension({
                     if (plan.tailWin) {
                         L.push("  " + span(freeTo, f) + "  " + plan.tailWin
                                + "f pinned into "
-                               + name(st.role === "bridge"
-                                      ? st.source2 : st.source)
+                               + pinName(st, st.role === "bridge")
                                + (plan.runway
                                   ? " (the first " + plan.runway
                                     + "f of it are delivered)"
@@ -3293,6 +3754,14 @@ app.registerExtension({
                 // still hand it over until onConfigure coerces it
                 return v === true || v === "true" || v === "upscale";
             }
+            // The `upscaling` OUTPUT is this widget passed straight
+            // through (emit() returns it), so its value is known before a
+            // Run. comfyui-obvpm asks for it to resolve the switches it
+            // drives -- the engine settings selector picks the upscale or
+            // the generation preset by it -- without running anything.
+            node.obvpmStaticOutput = (slot) =>
+                node.outputs?.[slot]?.name === "upscaling"
+                    ? upscaleMode() : undefined;
             // A TOGGLE, not a two-value selector: the label is fixed and
             // the fill says whether it is on, exactly like snap cuts.
             // Generation is the resting state of this workflow, so it is
@@ -3425,6 +3894,7 @@ app.registerExtension({
             // the pin options (window cycle, clear). Framed as a
             // CONTROL panel; colors re-applied per render (theme-live).
             const nextRunRow = document.createElement("div");
+            tlSelectable(nextRunRow);
             Object.assign(nextRunRow.style, {
                 // HARD-FIXED height: content changes (buttons
                 // appearing, longer text) must NEVER reflow the
@@ -3439,6 +3909,7 @@ app.registerExtension({
             // frames) with the prepend/extend toggles OUTSIDE it, to
             // the right; fixed height like the next-run row
             const infoRow = document.createElement("div");
+            tlSelectable(infoRow);
             Object.assign(infoRow.style, {
                 display: "flex", flexWrap: "nowrap", gap: "6px",
                 alignItems: "stretch", height: "24px",
@@ -3559,10 +4030,16 @@ app.registerExtension({
                 });
                 ta.value = String(seqWidget.value || "");
                 let deb = null;
+                // compared against what was last APPLIED, not the widget:
+                // the widget holds the text with repeated ids renamed
+                // (tlDedupeParts), which the textarea does not show --
+                // rewriting it under the cursor would fight the typing
+                let applied = ta.value;
                 const apply = () => {
                     deb = null;
-                    if (ta.value !== seqWidget.value) {
-                        setSequence(ta.value);
+                    if (ta.value !== applied) {
+                        applied = ta.value;
+                        setSequence(tlDedupeParts(ta.value));
                     }
                 };
                 ta.addEventListener("input", () => {
@@ -3605,37 +4082,96 @@ app.registerExtension({
                     return null;
                 }
             }
-            // which pin role a given clip carries under the current
-            // state (a bridge gives its extend side to `source` and its
-            // prepend side to `source2`)
-            function pinRoleFor(clip, st) {
-                if (!st) return null;
-                if (st.role === "bridge") {
-                    return st.source === clip ? "extend"
-                        : st.source2 === clip ? "prepend" : null;
-                }
-                return st.source === clip ? st.role : null;
+            // The entry a pin names (see tlPartEntry): `source` by
+            // default, `source2` with second=true; -1 when that part is
+            // not in `es`. `es` defaults to the rendered list -- a render
+            // in progress passes its own, since lastEntries is still the
+            // previous one until it finishes.
+            function pinIdx(st, second = false, es = lastEntries) {
+                if (!st) return -1;
+                return second ? tlPartEntry(es, st.source2, st.part2)
+                              : tlPartEntry(es, st.source, st.part);
             }
-            // Does the clip carry THIS role? Asked per side, because a
-            // clip bridged onto itself (the take that loops a lone clip)
-            // carries both, and pinRoleFor can only answer one.
-            function pinHasRole(clip, st, role) {
-                if (!st) return false;
-                if (st.role === "bridge") {
-                    return role === "extend" ? st.source === clip
-                                             : st.source2 === clip;
+            // The pin fields naming entry i, to spread into a new state.
+            // Pinning a line whose FILE is in the cut more than once
+            // gives the line a part id if it has none, so the pin keeps
+            // meaning THIS line whatever happens to the cut around it.
+            // A file that is there once needs no id (the pin names the
+            // file, and a later split gives both halves ids and moves the
+            // pin -- see splitEntry), so a plain cut stays plain text.
+            // The id is written into the sequence text here without a
+            // refresh: every caller hands the result straight to
+            // setPinState, whose refresh and undo step cover both.
+            function pinAt(i, second = false, es = lastEntries) {
+                const e = es?.[i];
+                if (e && e.gap == null && !e.part
+                        && es.filter((x) => x.clip === e.clip).length > 1) {
+                    givePart(i, es);
                 }
-                return st.source === clip && st.role === role;
+                const clip = e?.clip;
+                const part = e?.part ?? null;
+                const out = second ? { source2: clip } : { source: clip };
+                if (part) out[second ? "part2" : "part"] = part;
+                return out;
+            }
+            function givePart(i, es) {
+                const lines = currentLines();
+                const map = entryLines();
+                const parsed = tlParseSequence(seqWidget.value);
+                if (map[i] == null || parsed[i]?.clip !== es[i].clip) return;
+                const id = tlNewPart(new Set(parsed.map((p) => p.part)
+                                               .filter(Boolean)));
+                parsed[i].part = id;
+                lines[map[i]] = tlFormatLine(parsed[i]);
+                writeSequence(lines.join("\n"));
+                queueTimelinePersist();
+                es[i].part = id;
+                if (lastEntries !== es && lastEntries[i]?.clip === es[i].clip) {
+                    lastEntries[i].part = id;
+                }
+            }
+            // which pin role entry i carries under the current state (a
+            // bridge gives its extend side to `source` and its prepend
+            // side to `source2`)
+            function pinRoleAt(i, st, es = lastEntries) {
+                if (!st || i < 0) return null;
+                if (st.role === "bridge") {
+                    return pinIdx(st, false, es) === i ? "extend"
+                        : pinIdx(st, true, es) === i ? "prepend" : null;
+                }
+                return pinIdx(st, false, es) === i ? st.role : null;
+            }
+            // Does entry i carry THIS role? Asked per side, because a
+            // clip bridged onto itself (the take that loops a lone clip)
+            // carries both, and pinRoleAt can only answer one.
+            function pinHasRoleAt(i, st, role, es = lastEntries) {
+                if (!st || i < 0) return false;
+                if (st.role === "bridge") {
+                    return pinIdx(st, role !== "extend", es) === i;
+                }
+                return st.role === role && pinIdx(st, false, es) === i;
             }
             // A bridge from the LAST entry into the FIRST is the take
             // that closes a loop -- the same clip on both sides when the
             // strip holds only one.
-            function impliesLoop(st) {
-                if (!st || st.role !== "bridge" || !lastEntries?.length) {
+            function impliesLoop(st, es = lastEntries) {
+                if (!st || st.role !== "bridge" || !es?.length) {
                     return false;
                 }
-                return st.source === lastEntries[lastEntries.length - 1].clip
-                    && st.source2 === lastEntries[0].clip;
+                return pinIdx(st, false, es) === es.length - 1
+                    && pinIdx(st, true, es) === 0;
+            }
+            // The pinned clip's name for a label, with which part it is
+            // when the file stands in the sequence more than once.
+            function pinName(st, second = false) {
+                const clip = second ? st?.source2 : st?.source;
+                if (!clip) return "";
+                const base = clip.split("/").pop();
+                const es = lastEntries ?? [];
+                const count = es.filter((e) => e.clip === clip).length;
+                if (count < 2) return base;
+                return `${base} (part ${tlOccOf(es, pinIdx(st, second)) + 1}`
+                    + `/${count})`;
             }
             // Arming that bridge is deciding the cut loops: a take with
             // both feet on the strip's ends has nowhere else to land.
@@ -3701,8 +4237,8 @@ app.registerExtension({
                 // clips): cycling the window or the mask of an armed pin
                 // must not keep overwriting a length that was typed.
                 if (st && st.role && (!prev || prev.role !== st.role
-                        || prev.source !== st.source
-                        || (prev.source2 ?? null) !== (st.source2 ?? null))) {
+                        || pinIdx(prev) !== pinIdx(st)
+                        || pinIdx(prev, true) !== pinIdx(st, true))) {
                     fitDurationToGap(st);
                 }
                 tlNoteEdit();
@@ -4034,15 +4570,85 @@ app.registerExtension({
                 const z = r.width / (el.offsetWidth || 1) || 1;
                 return (ev.clientX - r.left) / z + strip.scrollLeft;
             }
-            // The ruler IS the scale, so a bare wheel over it zooms --
-            // no modifier, and no argument with the canvas, which never
-            // sees a wheel there anyway.
-            ruler.addEventListener("wheel", (ev) => {
-                if (!totalFrames) return;
+            // The timeline's wheel, all in one place:
+            //   - SIDEWAYS (a mouse's thumb / tilt wheel, Shift + wheel; a
+            //     touchpad swipe sends the same event) over the ruler or
+            //     the strip moves the playhead: the distance scrolled is
+            //     the distance it travels on screen, and the strip follows
+            //     it. It used to pan a zoomed strip, or go to the canvas;
+            //     following the playhead still reaches all of the cut.
+            //   - up/down over the RULER zooms: the ruler IS the scale, so
+            //     no modifier is needed there;
+            //   - Ctrl / Cmd + wheel over the strip zooms too;
+            //   - a bare up/down wheel over the strip is left alone, so it
+            //     reaches the canvas (tlWheelToCanvas): the graph's own
+            //     zoom is what people expect from a bare wheel over a
+            //     node, and stealing it would make the timeline a trap to
+            //     scroll past.
+            // Listened for on WINDOW, capture phase: the very first
+            // listener there is. In Nodes 2.0 the node's own wheel
+            // handling passed a wheel over it to the canvas before any
+            // listener on the ruler or the strip saw it, so ruler zoom
+            // never worked there (the memory's "the wheel never reaches a
+            // widget").
+            let jogAcc = 0;
+            // how far the playhead travels per pixel scrolled: 1 (the
+            // same distance on screen) was too quick on a thumb wheel
+            const TL_JOG_GAIN = 0.5;
+            function keepInView(f) {
+                const x = frameToX(f);
+                const w = strip.clientWidth || 0;
+                const margin = Math.min(40, w / 4);
+                if (x < strip.scrollLeft + margin) {
+                    strip.scrollLeft = Math.max(0, x - margin);
+                } else if (x > strip.scrollLeft + w - margin) {
+                    strip.scrollLeft = x - w + margin;
+                }
+            }
+            const onTimelineWheel = (ev) => {
+                if (!(ev.target instanceof Node)
+                        || !timelineWrap.contains(ev.target)) return;
+                const zoomKey = ev.ctrlKey || ev.metaKey;
+                const overRuler = ruler.contains(ev.target);
+                // shift+wheel is the browser's own sideways scroll
+                const dx = ev.shiftKey && !ev.deltaX ? ev.deltaY : ev.deltaX;
+                const dy = ev.shiftKey && !ev.deltaX ? 0 : ev.deltaY;
+                const sideways = !!dx && Math.abs(dx) > Math.abs(dy);
+                if (zoomKey || (overRuler && !sideways)) {
+                    if (!totalFrames) return;
+                    ev.preventDefault();
+                    ev.stopImmediatePropagation();
+                    zoomBy(wheelFactor(ev),
+                           anchorFrom(ev, overRuler ? ruler : strip));
+                    return;
+                }
+                if (!sideways) return;
                 ev.preventDefault();
-                ev.stopPropagation();
-                zoomBy(wheelFactor(ev), anchorFrom(ev, ruler));
-            }, { passive: false });
+                ev.stopImmediatePropagation();
+                if (!totalFrames) return;
+                const unit = ev.deltaMode === 1 ? 16
+                    : ev.deltaMode === 2 ? 400 : 1;
+                // screen px -> layout px (the canvas zoom scales the
+                // widget) -> frames
+                const r = timelineWrap.getBoundingClientRect();
+                const z = r.width / (timelineWrap.offsetWidth || 1) || 1;
+                jogAcc += (dx * unit * TL_JOG_GAIN / z) / (scaleNow() || 1);
+                const step = Math.trunc(jogAcc);
+                if (!step) return;
+                jogAcc -= step;
+                const from = displayFrame() ?? heldFrame ?? 0;
+                const f = Math.max(0, Math.min(Math.round(from) + step,
+                                               Math.max(totalFrames - 1, 0)));
+                // like the ruler: prefer the seamless file when built
+                if (single && playIdx < 0 && !usingSingle) usingSingle = true;
+                heldFrame = f;
+                seekGlobal(f);
+                keepInView(f);
+                drawRuler();
+                setPlayhead(f);
+            };
+            window.addEventListener("wheel", onTimelineWheel,
+                                    { passive: false, capture: true });
 
             zoomInBtn.addEventListener("click", (ev) => {
                 ev.stopPropagation();
@@ -4064,20 +4670,6 @@ app.registerExtension({
                 drawLinks(lastEntries);
                 setPlayhead(displayFrame() ?? heldFrame);
             });
-            // ctrl+wheel zooms about the cursor. Plain wheel goes to the
-            // canvas (tlWheelToCanvas on the container hands it over): the
-            // graph's own zoom is what people expect from a bare wheel
-            // over a node, and stealing it would make the timeline a trap
-            // to scroll past.
-            // Over the blocks a bare wheel belongs to the canvas, so
-            // zooming there needs the modifier. Same smooth path.
-            strip.addEventListener("wheel", (ev) => {
-                if (!ev.ctrlKey && !ev.metaKey) return;
-                if (!totalFrames) return;
-                ev.preventDefault();
-                ev.stopPropagation();
-                zoomBy(wheelFactor(ev), anchorFrom(ev, strip));
-            }, { passive: false });
 
             function drawRuler() {
                 const w = timelineWrap.clientWidth || 300;
@@ -4129,7 +4721,7 @@ app.registerExtension({
             function pinLanding(st = shownPin()) {
                 const es = lastEntries;
                 if (!st || !es?.length || !cumStarts.length) return null;
-                const k = es.findIndex((e) => e.clip === st.source);
+                const k = pinIdx(st, false, es);
                 if (k < 0) return null;
                 const secs = durSeconds();
                 const plan = secs == null ? null
@@ -4138,7 +4730,7 @@ app.registerExtension({
                 const isGap = (i) => es[i] != null && es[i].gap != null;
                 const endOf = (i) => cumStarts[i] + playedArr[i];
                 if (st.role === "prepend") {
-                    const occ = tlOccupant(es, st.source, "before", linkedMeta);
+                    const occ = tlOccupant(es, k, "before", linkedMeta);
                     if (occ) {
                         return { start: cumStarts[occ.idx], gapIdx: -1,
                                  frames: kept ?? playedArr[occ.idx] };
@@ -4155,7 +4747,7 @@ app.registerExtension({
                 if (st.role === "bridge" && impliesLoop(st)) {
                     return { start: totalFrames, frames: kept, gapIdx: -1 };
                 }
-                const occ = tlOccupant(es, st.source, "after", linkedMeta);
+                const occ = tlOccupant(es, k, "after", linkedMeta);
                 if (occ) {
                     return { start: endOf(k), gapIdx: -1,
                              frames: kept ?? playedArr[occ.idx] };
@@ -4217,6 +4809,8 @@ app.registerExtension({
             }
 
             let lastEntries = [];
+            // why the pin row shows no pin, when a pin was just cleared
+            let pinGoneNote = "", pinGoneTip = "";
             // the clips on the strip at the previous render; null until
             // the first one, so a loaded graph is not read as "added"
             let seenClips = null;
@@ -4316,16 +4910,24 @@ app.registerExtension({
                 display: "flex", gap: "6px", alignItems: "center",
                 height: "22px", boxSizing: "border-box",
             });
-            const cutBtn = (label, side, title) => {
+            // ONE box for every button on the row. The cut labels carry
+            // ⟨ ⟩, which come from a fallback font; a fallback glyph can
+            // grow a line box past its line-height, so the row's height
+            // is pinned here rather than left to whatever text it holds.
+            const CUT_ROW_BTN = {
+                height: "20px", boxSizing: "border-box",
+                borderRadius: "4px", padding: "1px 9px",
+                font: "11px/16px sans-serif", whiteSpace: "nowrap",
+                flexShrink: "0",
+            };
+            // The row's action buttons (cut left / split / cut right):
+            // one look, painted by paintRowBtn as usable or not.
+            const rowBtn = (label, title, onClick) => {
                 const b = document.createElement("button");
                 b.textContent = label;
                 b.title = title;
-                Object.assign(b.style, {
-                    borderRadius: "4px", padding: "1px 9px",
-                    font: "11px/16px sans-serif", whiteSpace: "nowrap",
-                    flexShrink: "0",
-                });
-                b.addEventListener("click", () => applyPlayheadCut(side));
+                Object.assign(b.style, CUT_ROW_BTN);
+                b.addEventListener("click", onClick);
                 b.addEventListener("mouseenter", () => {
                     if (b.dataset.on === "1") {
                         b.style.background = TL_ROLE.extend.hover;
@@ -4338,6 +4940,16 @@ app.registerExtension({
                 });
                 return b;
             };
+            function paintRowBtn(b, ok, P) {
+                b.dataset.on = ok ? "1" : "0";
+                b.style.background = ok ? TL_ROLE.extend.bg : "none";
+                b.style.border = "1px solid " + (ok ? "transparent" : P.edge);
+                b.style.color = ok ? "#fff" : P.text;
+                b.style.opacity = ok ? "1" : "0.5";
+                b.style.cursor = ok ? "pointer" : "not-allowed";
+            }
+            const cutBtn = (label, side, title) =>
+                rowBtn(label, title, () => applyPlayheadCut(side));
             const cutLeftBtn = cutBtn("⟨ cut left", "left",
                 "Cut the clip under the playhead from its LEFT edge to "
                 + "here. If nothing leads into that clip, the time it "
@@ -4349,33 +4961,38 @@ app.registerExtension({
             uncutBtn.textContent = "uncut";
             uncutBtn.title = "Remove the manual cut from the selected clip "
                 + "and let its seam be derived from the sidecars again";
-            Object.assign(uncutBtn.style, {
+            Object.assign(uncutBtn.style, CUT_ROW_BTN, {
                 background: "#2a2e36", color: "#e8eaee",
-                border: "1px solid #3a3f48", borderRadius: "4px",
-                padding: "1px 9px", cursor: "pointer",
-                font: "11px/16px sans-serif", whiteSpace: "nowrap",
+                border: "1px solid #3a3f48", cursor: "pointer",
             });
             uncutBtn.addEventListener("click", () => {
                 if (lastHighlight < 0) return;
                 setCut(lastHighlight, { enter: null, exit: null });
             });
+            // Split sits beside uncut: it acts on the clip under the
+            // playhead, not on either end, so it belongs in the middle.
+            const splitBtn = rowBtn("split", "", () => applyPlayheadSplit());
             function updateCutRow() {
                 const has = selectedHasCut();
                 uncutBtn.style.display = has ? "block" : "none";
                 // themePalette() rather than PAL: this can run before
                 // PAL's declaration is reached (temporal dead zone)
                 const P = themePalette();
+                // shown while the playhead is on a clip; dimmed, with the
+                // reason as its tooltip, while it sits on an edge
+                const sp = playheadSplit();
+                splitBtn.style.display = sp ? "block" : "none";
+                const spOK = !!sp && !sp.blocked;
+                paintRowBtn(splitBtn, spOK, P);
+                splitBtn.title = spOK
+                    ? `Split ${sp.name} in two at frame ${sp.at}. Both `
+                      + "halves play the same file -- nothing is "
+                      + "re-encoded -- and join back-to-back."
+                    : sp?.why ?? "";
                 for (const [b, side] of [[cutLeftBtn, "left"],
                                          [cutRightBtn, "right"]]) {
                     const t = playheadCut(side);
-                    const ok = !!t && !t.blocked;
-                    b.dataset.on = ok ? "1" : "0";
-                    b.style.background = ok ? TL_ROLE.extend.bg : "none";
-                    b.style.border = "1px solid "
-                        + (ok ? "transparent" : P.edge);
-                    b.style.color = ok ? "#fff" : P.text;
-                    b.style.opacity = ok ? "1" : "0.5";
-                    b.style.cursor = ok ? "pointer" : "not-allowed";
+                    paintRowBtn(b, !!t && !t.blocked, P);
                 }
             }
             // Two spacers rather than auto margins on `uncut`: hiding
@@ -4387,8 +5004,8 @@ app.registerExtension({
                 d.style.flex = "1";
                 return d;
             };
-            cutRow.append(cutLeftBtn, cutSpacer(), uncutBtn, cutSpacer(),
-                          cutRightBtn);
+            cutRow.append(cutLeftBtn, cutSpacer(), uncutBtn, splitBtn,
+                          cutSpacer(), cutRightBtn);
             const progress = tlProgressBar();
             const dropProgress = tlOnProgress(
                 () => String(widgetValue("preview_filename", "")
@@ -4403,6 +5020,7 @@ app.registerExtension({
             widget.serialize = false;
             widget.options.serialize = false;
             tlPanWithMiddleButton(container);
+            tlNoSelect(container);
             const minHeight = 320;
             widget.computeLayoutSize = () => ({ minHeight, minWidth: 340 });
             Object.defineProperty(widget, "width", {
@@ -4420,17 +5038,18 @@ app.registerExtension({
                 return String(seqWidget.value || "").split("\n");
             }
             function setSequence(text, opts) {
-                seqWidget.value = text;
-                const seqEl2 = seqWidget.element ?? seqWidget.inputEl;
-                if (seqEl2) seqEl2.value = text;
-                const idx = node.widgets?.indexOf(seqWidget);
-                if (idx >= 0 && Array.isArray(node.widgets_values)) {
-                    node.widgets_values[idx] = text;
-                }
-                try { seqWidget.callback?.(text); } catch { /* widget */ }
+                writeSequence(text);
                 if (!opts?.silentUndo) tlNoteEdit();
                 void refresh();
                 if (!opts?.skipPersist) queueTimelinePersist();
+            }
+            // The text alone, for an edit whose refresh and undo step
+            // come from the write that follows it (see pinAt).
+            function writeSequence(text) {
+                seqWidget.value = text;
+                const seqEl2 = seqWidget.element ?? seqWidget.inputEl;
+                if (seqEl2) seqEl2.value = text;
+                seqWidget.callback?.(text);
             }
             function entryLines() {
                 // indices of entry lines (not comments, not the loop
@@ -4541,6 +5160,51 @@ app.registerExtension({
             function removeEntry(i) {
                 const lines = currentLines();
                 lines.splice(entryLines()[i], 1);
+                setSequence(lines.join("\n"));
+            }
+            // The clip's ✕: take it out and leave its time as empty space,
+            // so nothing after it moves. Exactly its PLAYED length, merged
+            // with any empty space already beside it, and the neighbours
+            // keep playing the frames they played: a join the removed clip
+            // derived (a parent cut where the clip continued it, a child
+            // entered where it led in) is written down as a cut, because
+            // empty space breaks lineage and would otherwise hand those
+            // frames back and shift everything after.
+            // Plainly removed instead where a hole would be wrong: with no
+            // clip after it (nothing would move), or at either end of a
+            // looping cut (a ring cannot start or end on empty space).
+            function deleteClip(i) {
+                const es = tlParseSequence(seqWidget.value);
+                const e = es[i], r = lastEntries[i];
+                if (!e || e.gap != null) return;
+                const clipBefore = es.slice(0, i).some((x) => x.gap == null);
+                const clipAfter = es.slice(i + 1).some((x) => x.gap == null);
+                if (!clipAfter || (loopOn() && !clipBefore)
+                        || !r || r.clip !== e.clip) {
+                    removeEntry(i);
+                    return;
+                }
+                const played = Math.max(1, Math.round(
+                    (r.exit ?? r.frames) - (r.enter ?? 0)));
+                const lines = currentLines();
+                const map = entryLines();
+                const L = es[i - 1], R = es[i + 1];
+                const rl = lastEntries[i - 1], rr = lastEntries[i + 1];
+                if (L && L.gap == null && L.exitOverride == null
+                        && rl?.exit != null) {
+                    L.exitOverride = rl.exit;
+                    lines[map[i - 1]] = tlFormatLine(L);
+                }
+                if (R && R.gap == null && R.enterOverride == null && rr?.enter) {
+                    R.enterOverride = rr.enter;
+                    lines[map[i + 1]] = tlFormatLine(R);
+                }
+                let gap = played;
+                const drop = [];
+                if (L?.gap != null) { gap += L.gap; drop.push(map[i - 1]); }
+                if (R?.gap != null) { gap += R.gap; drop.push(map[i + 1]); }
+                lines[map[i]] = `~ ${gap}`;
+                for (const k of drop.sort((a, b) => b - a)) lines.splice(k, 1);
                 setSequence(lines.join("\n"));
             }
             function reorderEntry(from, to) {
@@ -4952,6 +5616,26 @@ app.registerExtension({
             // the playhead is driven by the clock until the gap is spent.
             let gapTimer = null;
             let gapRaf = 0;
+            // a gap is PLAYING while its clock runs -- both videos are
+            // paused then, so "is it playing?" has to ask this too
+            let gapRunning = false;
+            let gapAt = 0;              // the frame the gap clock is on
+            function stopGapClock() {
+                clearTimeout(gapTimer);
+                cancelAnimationFrame(gapRaf);
+                if (gapRunning) {
+                    gapRunning = false;
+                    updateButtons();
+                }
+            }
+            // pause INSIDE a gap: keep the frame it had reached, so play
+            // (and the ruler) carries on from there
+            function pauseGap() {
+                stopGapClock();
+                seekTargetF = gapAt;
+                heldFrame = gapAt;
+                setPlayhead(gapAt);
+            }
             function playGap(i, offset = 0, autoplay = true) {
                 const item = playlist[i];
                 const total = Math.max(0, (item.gap ?? 0) - offset);
@@ -4961,7 +5645,8 @@ app.registerExtension({
                 }
                 highlight(i);
                 seekTargetF = null;
-                setPlayhead(cumStarts[i] + offset);
+                gapAt = cumStarts[i] + offset;
+                setPlayhead(gapAt);
                 // Load the clip on the far side WHILE the blank runs.
                 // Without this the gap ends onto an empty <video>, which
                 // has to start loading from scratch -- playback stalls
@@ -4973,12 +5658,16 @@ app.registerExtension({
                 const t0 = performance.now();
                 const tick = () => {
                     const done = (performance.now() - t0) / 1000 * TL_FPS;
-                    setPlayhead(cumStarts[i] + offset + Math.min(done, total));
+                    gapAt = cumStarts[i] + offset + Math.min(done, total);
+                    setPlayhead(gapAt);
                     if (done < total) gapRaf = requestAnimationFrame(tick);
                 };
                 gapRaf = requestAnimationFrame(tick);
+                gapRunning = true;
+                updateButtons();
                 gapTimer = setTimeout(() => {
                     cancelAnimationFrame(gapRaf);
+                    gapRunning = false;
                     for (const v of vids) v.style.visibility = "";
                     playAt(i + 1);
                 }, (total / TL_FPS) * 1000);
@@ -5116,15 +5805,14 @@ app.registerExtension({
                     // ignored in quick play even though the model had it.
                     playIdx = -1;
                     cancelAnimationFrame(rafId);
-                    clearTimeout(gapTimer);
+                    stopGapClock();
                     for (const v of vids) v.pause();
                     clearLevelFilter();
                     return;
                 }
                 usingSingle = false;
                 playIdx = i;
-                clearTimeout(gapTimer);
-                cancelAnimationFrame(gapRaf);
+                stopGapClock();
                 for (const v of vids) v.style.visibility = "";
                 if (playlist[i].gap != null) {
                     playGap(i, offset, autoplay);
@@ -6110,8 +6798,11 @@ app.registerExtension({
                 const quickInUse = !usingSingle && playIdx >= 0;
                 quickBtn.style.display = single && !quickInUse ? "none" : "";
             }
+            function isPlaying() {
+                return gapRunning || (activeStarted() && !vids[act].paused);
+            }
             function updateButtons() {
-                const playing = activeStarted() && !vids[act].paused;
+                const playing = isPlaying();
                 quickBtn.textContent =
                     !usingSingle && playing ? "⏸ quick" : "▶ quick";
                 if (!fullBtn.disabled) {
@@ -6124,9 +6815,16 @@ app.registerExtension({
                 v.addEventListener("play", updateButtons);
                 v.addEventListener("pause", updateButtons);
             }
-            quickBtn.addEventListener("click", () => {
+            function toggleQuick() {
                 const v = vids[act];
-                if (!usingSingle && playIdx >= 0) {
+                // inside empty space both videos are paused and a clock
+                // runs: pause that, and resume from where it stopped
+                if (gapRunning) {
+                    pauseGap();
+                    return;
+                }
+                if (!usingSingle && playIdx >= 0
+                        && playlist[playIdx]?.gap == null) {
                     if (v.paused) tryPlay(v);
                     else v.pause();
                     return;
@@ -6135,7 +6833,30 @@ app.registerExtension({
                 const f = resumeFrame();
                 const k = clipAt(f);
                 playAt(k, f - cumStarts[k]);
-            });
+            }
+            quickBtn.addEventListener("click", toggleQuick);
+            // Spacebar (see TL_SPACE): pause whatever is playing; else
+            // play from the playhead -- the full build when there is a
+            // current one (never started by Space: a build takes a while
+            // and is ▶ full's to ask for), quick otherwise.
+            //
+            // "Playing" is asked of the PLAYERS themselves, not of the
+            // mode bookkeeping (usingSingle / act / playIdx): when those
+            // disagreed with a player that was running, a press "played"
+            // what was already playing -- nothing happened, and only the
+            // next press paused. Pausing stops every player and the gap
+            // clock, whichever of them was running.
+            function spaceToggle() {
+                if (gapRunning || vids.some((v) => !v.paused)) {
+                    if (gapRunning) pauseGap();
+                    for (const v of vids) v.pause();
+                    updateButtons();
+                    return;
+                }
+                if (single) fullBtn.click();
+                else toggleQuick();
+            }
+            TL_SPACE.set(node, { node, el: container, toggle: spaceToggle });
             fullBtn.addEventListener("click", () => {
                 const v = vids[act];
                 if (usingSingle && single && v._single === single.url) {
@@ -6270,15 +6991,13 @@ app.registerExtension({
                 const pstD = shownPin();
                 const pinGaps = new Set();
                 if (pstD) {
-                    const k = entries.findIndex(
-                        (en) => en.clip === pstD.source);
+                    const k = pinIdx(pstD, false, entries);
                     if (k >= 0) {
                         pinGaps.add(pstD.role === "prepend"
                             ? k : k + 1);
                     }
                     if (pstD.role === "bridge") {
-                        const k2 = entries.findIndex(
-                            (en) => en.clip === pstD.source2);
+                        const k2 = pinIdx(pstD, true, entries);
                         if (k2 >= 0) pinGaps.add(k2);
                     }
                 }
@@ -6332,8 +7051,7 @@ app.registerExtension({
                     // the preview flickered between the clip, the cut
                     // and nothing at all.
                     cancelAnimationFrame(rafId);
-                    clearTimeout(gapTimer);
-                    cancelAnimationFrame(gapRaf);
+                    stopGapClock();
                     for (const vv of vids) vv.pause();
                     const played = Math.max(1, (e.exit ?? e.frames) - e.enter);
                     // The SCALE, not the block's measured width.
@@ -6460,7 +7178,7 @@ app.registerExtension({
                         tag.textContent = space == null
                             ? `${latest}f · ${(latest / TL_FPS).toFixed(2)}s`
                             : `${latest}f · `
-                              + `${(space / TL_FPS).toFixed(1)}s space`;
+                              + `${(space / TL_FPS).toFixed(2)}s space`;
                         // it is centred on the guide, so keep half of it
                         // clear of either end of the scrollable content
                         const half = (tag.offsetWidth || 60) / 2;
@@ -6569,7 +7287,8 @@ app.registerExtension({
                         // ink on a light page, light on a dark one --
                         // so it reads on both.
                         background: atPin ? TL_ROLE.extend.bg
-                            : hasLink ? TL_COLORS[seam.kind] : PAL.sub,
+                            : hasLink && !seam.jump ? TL_COLORS[seam.kind]
+                            : PAL.sub,
                         boxShadow: "0 0 0 2px rgba(0,0,0,0.35)",
                         transition: "height 0.1s",
                         pointerEvents: "none",
@@ -6726,9 +7445,10 @@ app.registerExtension({
                 const n = entries.length;
                 const wrap = loopOn() && n > 0 && (i === 0 || i === n)
                     && entries[0].gap == null && entries[n - 1].gap == null;
-                const L = i > 0 ? entries[i - 1]
-                    : wrap ? entries[n - 1] : null;
-                const R = i < n ? entries[i] : wrap ? entries[0] : null;
+                const Li = i > 0 ? i - 1 : wrap ? n - 1 : -1;
+                const Ri = i < n ? i : wrap ? 0 : -1;
+                const L = Li >= 0 ? entries[Li] : null;
+                const R = Ri >= 0 ? entries[Ri] : null;
                 const pop = document.createElement("div");
                 seamPopup = pop;
                 const stripTop = timelineWrap.offsetTop +
@@ -6809,8 +7529,8 @@ app.registerExtension({
                         // ALREADY active the item wears the pin purple
                         // and clicking it again clears the pin
                         const cur = pinState();
-                        const genActive = pinHasRole(
-                            side.gen.clip, cur, side.gen.role);
+                        const genActive = pinHasRoleAt(
+                            side.gen.idx, cur, side.gen.role, entries);
                         const g = item(parent,
                             side.gen.role === "extend"
                                 ? "+ extend new" : "+ prepend new",
@@ -6824,7 +7544,7 @@ app.registerExtension({
                             + (side.gen.pixel
                                 ? " (no mctx sidecar: VAE-encoded from "
                                   + "pixels, soft continuity)" : ""),
-                            () => togglePinFor(side.gen.clip,
+                            () => togglePinAt(side.gen.idx,
                                               side.gen.role));
                         g.style.color = genActive
                             ? (PAL.light ? "#5e3a9e"
@@ -6841,7 +7561,7 @@ app.registerExtension({
                     }
                     // ... and a section left empty by that must say so,
                     // or it renders as a bare heading
-                    if (!side.items.length
+                    if (!side.items.length && !side.elsewhere?.length
                             && !(side.gen && !upscaleMode())) {
                         const n = document.createElement("div");
                         n.textContent = "none found";
@@ -6853,6 +7573,57 @@ app.registerExtension({
                         item(parent, c.clip, c.clip,
                              () => side.act(c.clip));
                     }
+                    // Takes of the same file that join somewhere ELSE in
+                    // it -- another part's edge, or a point this part's
+                    // cut no longer reaches. Still offered (the choice is
+                    // yours), but apart and dimmed, saying where they
+                    // join: put here, the join jumps and plays as a cut.
+                    if (side.elsewhere?.length) {
+                        const h2 = document.createElement("div");
+                        h2.textContent = "joins elsewhere";
+                        Object.assign(h2.style, {
+                            color: PAL.sub, margin: "4px 0 2px",
+                            fontSize: "10px", letterSpacing: "0.05em",
+                        });
+                        parent.appendChild(h2);
+                        for (const c of side.elsewhere) {
+                            const it = item(parent,
+                                `${c.clip.split("/").pop()} (at ${c.at})`,
+                                `${c.clip}\ncontinues from frame ${c.at} of `
+                                + `${side.edgeName}, which ${side.edgeWord} `
+                                + `at ${side.edgeAt} here -- put here, `
+                                + "the join plays as a cut",
+                                () => side.act(c.clip));
+                            it.style.opacity = "0.55";
+                        }
+                    }
+                };
+                // Split a side's lineage candidates into the ones that
+                // join on the seam's own edge and the ones that join
+                // elsewhere in the same file. `e` is the seam's clip on
+                // that side, `side` "after" when the candidates follow
+                // it (they extend it), "before" when they lead into it.
+                // Only that relation has a frame to check: the other
+                // (e extends / prepends into the candidate) puts the
+                // candidate on the far side of e's own recorded join.
+                const splitFits = (list, e, side) => {
+                    const fit = [], elsewhere = [];
+                    for (const c of list) {
+                        const link = side === "after"
+                            ? tlExtendParent(c.meta) : tlPrependChild(c.meta);
+                        if (!e?.meta || link?.id !== e.meta.self_id
+                                || tlJoinFits(e, c.meta, side)) {
+                            fit.push(c);
+                            continue;
+                        }
+                        elsewhere.push({ ...c, at: link.join
+                            - (Number(e.meta.pinned_head_frames) || 0) });
+                    }
+                    return { items: fit, elsewhere,
+                             edgeName: e ? partLabel(entries.indexOf(e)) : "",
+                             edgeWord: side === "after" ? "ends" : "starts",
+                             edgeAt: side === "after"
+                                 ? (e?.exit ?? e?.frames) : (e?.enter ?? 0) };
                 };
 
                 pop.textContent = "";
@@ -6868,7 +7639,7 @@ app.registerExtension({
                 if (atEnd && !upscaleMode() && tlPinGrade(endL)
                         && tlPinGrade(endR)) {
                     const cur = pinState();
-                    const active = impliesLoop(cur);
+                    const active = impliesLoop(cur, entries);
                     const same = endL.clip === endR.clip;
                     const g = item(pop,
                         active ? "✓ loop take armed" : "+ loop new",
@@ -6882,8 +7653,9 @@ app.registerExtension({
                                  : " and makes the sequence loop"),
                         () => {
                             if (active) { setPinState(null); return; }
-                            setBridge({ role: "bridge", source: endL.clip,
-                                        source2: endR.clip,
+                            setBridge({ role: "bridge",
+                                        ...pinAt(n - 1, false, entries),
+                                        ...pinAt(0, true, entries),
                                         window: cur?.window ?? "22" });
                         });
                     g.style.fontWeight = "600";
@@ -6920,20 +7692,20 @@ app.registerExtension({
                 if (hasLink) {
                     sides.push({
                         title: "replace left side",
-                        items: cand.filter((c) => c.clip !== L.clip &&
-                            linkedMeta(c.meta, R.meta)),
+                        ...splitFits(cand.filter((c) => c.clip !== L.clip &&
+                            linkedMeta(c.meta, R.meta)), R, "before"),
                         act: (clip) => replaceAt(wrap ? n - 1 : i - 1, clip),
                         gen: tlPinGrade(R)
-                            ? { clip: R.clip, role: "prepend",
+                            ? { clip: R.clip, idx: Ri, role: "prepend",
                                 pixel: tlPinGrade(R) === "pixel" } : null,
                     });
                     sides.push({
                         title: "replace right side",
-                        items: cand.filter((c) => c.clip !== R.clip &&
-                            linkedMeta(L.meta, c.meta)),
+                        ...splitFits(cand.filter((c) => c.clip !== R.clip &&
+                            linkedMeta(L.meta, c.meta)), L, "after"),
                         act: (clip) => replaceAt(wrap ? 0 : i, clip),
                         gen: tlPinGrade(L)
-                            ? { clip: L.clip, role: "extend",
+                            ? { clip: L.clip, idx: Li, role: "extend",
                                 pixel: tlPinGrade(L) === "pixel" } : null,
                     });
                 } else {
@@ -6948,20 +7720,20 @@ app.registerExtension({
                     if (tlPinGrade(R)) {
                         sides.push({
                             title: "insert before",
-                            items: R.meta ? cand.filter((c) =>
-                                linkedMeta(c.meta, R.meta)) : [],
+                            ...splitFits(R.meta ? cand.filter((c) =>
+                                linkedMeta(c.meta, R.meta)) : [], R, "before"),
                             act: (clip) => insertAtGap(clip, wrap ? 0 : i),
-                            gen: { clip: R.clip, role: "prepend",
+                            gen: { clip: R.clip, idx: Ri, role: "prepend",
                                    pixel: tlPinGrade(R) === "pixel" },
                         });
                     }
                     if (tlPinGrade(L)) {
                         sides.push({
                             title: "insert after",
-                            items: L.meta ? cand.filter((c) =>
-                                linkedMeta(L.meta, c.meta)) : [],
+                            ...splitFits(L.meta ? cand.filter((c) =>
+                                linkedMeta(L.meta, c.meta)) : [], L, "after"),
                             act: (clip) => insertAtGap(clip, wrap ? n : i),
-                            gen: { clip: L.clip, role: "extend",
+                            gen: { clip: L.clip, idx: Li, role: "extend",
                                    pixel: tlPinGrade(L) === "pixel" },
                         });
                     }
@@ -7149,6 +7921,103 @@ app.registerExtension({
                               : Math.max(lo, Math.min(e.frames, snapped)));
             }
 
+            // ---- split at the playhead --------------------------------
+            // One line becomes two lines of the SAME file, the left one
+            // exiting and the right one entering at the playhead's frame.
+            // Nothing is re-encoded, so a split costs nothing and the
+            // halves can then be moved, cut or deleted on their own. The
+            // join between them is back-to-back (a file never extends
+            // itself), which plays straight on because the frames are
+            // consecutive.
+            // null when the playhead is not on a clip; {blocked, why}
+            // when it is but no split point lies strictly inside it.
+            function playheadSplit() {
+                const f = displayFrame();
+                if (f == null || !cumStarts.length) return null;
+                const g = Math.max(0, Math.round(f));
+                const i = clipAt(g);
+                const e = lastEntries?.[i];
+                if (!e || e.gap != null) return null;
+                const name = e.clip.split("/").pop();
+                const lo = e.enter, hi = e.exit ?? e.frames;
+                const within = g - cumStarts[i] + lo;
+                if (within <= lo || within >= hi) {
+                    return { idx: i, blocked: true, name,
+                             why: "Move the playhead off the clip's edge "
+                                  + "to split it" };
+                }
+                // With snap cuts on, on the grid a TAIL cut uses: the
+                // left half's end is the one a pin continues from
+                // ("extend clip" on it regenerates what follows).
+                const at = splitPoint(within, e, lo, hi);
+                if (at == null) {
+                    return { idx: i, blocked: true, name,
+                             why: "No snap point inside this clip -- turn "
+                                  + "snap cuts off to split it here" };
+                }
+                return { idx: i, blocked: false, at, name };
+            }
+            function splitPoint(within, e, lo, hi) {
+                if (!snapOn()) return within;
+                let best = null;
+                for (const s of tlCutStops(e.meta, e.frames, true, "exit")) {
+                    if (s <= lo || s >= hi) continue;
+                    if (best == null
+                            || Math.abs(s - within) < Math.abs(best - within)) {
+                        best = s;
+                    }
+                }
+                return best;
+            }
+            function applyPlayheadSplit() {
+                const t = playheadSplit();
+                if (!t || t.blocked) return;
+                splitEntry(t.idx, t.at);
+            }
+            // The left half keeps the join in front of the clip (its
+            // enter, and the per-seam settings, which live on the clip
+            // to the right of a join); the right half keeps the clip's
+            // exit. Either may be a derived one: an override that was
+            // not there is not invented.
+            // Both halves get part ids -- the left keeps the line's own
+            // -- so pins and takes can tell them apart. A pin on the
+            // split clip follows the EDGE it continues from: an extend
+            // leaves from the clip's end, which is now the right half's;
+            // a prepend arrives at its start, which stays the left's.
+            function splitEntry(i, at) {
+                const es = tlParseSequence(seqWidget.value);
+                const e = es[i];
+                if (!e || e.gap != null) return;
+                const lines = currentLines();
+                const map = entryLines();
+                if (map[i] == null) return;
+                const taken = new Set(es.map((p) => p.part).filter(Boolean));
+                const leftId = e.part ?? tlNewPart(taken);
+                taken.add(leftId);
+                const rightId = tlNewPart(taken);
+                const left = { ...e, exitOverride: at, part: leftId };
+                const right = { ...e, enterOverride: at, seamOpts: {},
+                                part: rightId };
+                const cur = pinState();
+                if (cur) {
+                    const next = { ...cur };
+                    // `second` = the bridge's arriving side (source2)
+                    for (const second of [false, true]) {
+                        if (pinIdx(cur, second, es) !== i) continue;
+                        const leaves = second ? false
+                            : cur.role === "extend" || cur.role === "bridge";
+                        next[second ? "part2" : "part"] =
+                            leaves ? rightId : leftId;
+                    }
+                    // written directly: the sequence write below
+                    // refreshes, and the two are one edit
+                    if (psWidget) psWidget.value = JSON.stringify(next);
+                }
+                lines.splice(map[i], 1, tlFormatLine(left),
+                             tlFormatLine(right));
+                setSequence(lines.join("\n"));
+            }
+
             // The pin continues from the CUT, not from the clip's own
             // edge -- so pin_state has to carry it. Derived from the
             // sequence on every refresh rather than written once at
@@ -7158,9 +8027,10 @@ app.registerExtension({
             function syncPinCut(entries) {
                 const st = pinState();
                 if (!st || !psWidget) return;
-                const cutOf = (clip, side) => {
-                    const e = entries.find(
-                        (x) => x.gap == null && x.clip === clip);
+                // the pinned OCCURRENCE's cut: each half of a split clip
+                // has its own
+                const cutOf = (second, side) => {
+                    const e = entries[pinIdx(st, second, entries)];
                     if (!e) return null;
                     const v = side === "exit" ? e.exitOverride
                                               : e.enterOverride;
@@ -7172,12 +8042,12 @@ app.registerExtension({
                 if (st.role === "bridge") {
                     // the extend side leaves `source`, the prepend side
                     // arrives at `source2`
-                    const a = cutOf(st.source, "exit");
-                    const b = cutOf(st.source2, "enter");
+                    const a = cutOf(false, "exit");
+                    const b = cutOf(true, "enter");
                     if (a != null) next.cut = a;
                     if (b != null) next.cut2 = b;
                 } else {
-                    const a = cutOf(st.source,
+                    const a = cutOf(false,
                                     st.role === "prepend" ? "enter" : "exit");
                     if (a != null) next.cut = a;
                 }
@@ -7259,12 +8129,50 @@ app.registerExtension({
             // one edit: the size of the hole in front of it. Setting it to
             // zero removes the hole rather than leaving a `~ 0` line the
             // parser would have to tolerate.
-            function setGapBefore(i, frames) {
+            //
+            // `entries` is the rendered list (seams derived) and is only
+            // needed when the move separates or rejoins a linked pair.
+            // A gap breaks the chain, so both clips would fall back to
+            // their own ends: at a trim-point join the parent would play
+            // past the frames its child replaces and the child would
+            // replay them, and the clip would jump on drop. Separating
+            // therefore writes the derived play range down as manual
+            // cuts, in the same edit; rejoining clears the ones that
+            // equal what the seam derives again, so the round trip
+            // leaves the text as it was.
+            function setGapBefore(i, frames, entries) {
                 const es = tlParseSequence(seqWidget.value);
                 const lines = currentLines();
                 const map = entryLines();
                 const n = Math.max(0, Math.round(Number(frames) || 0));
-                if (i > 0 && es[i - 1]?.gap != null) {
+                const hadGap = i > 0 && es[i - 1]?.gap != null;
+                const li = hadGap ? i - 2 : i - 1;   // the clip on the left
+                const L = entries?.[li], R = entries?.[i];
+                const separating = !hadGap && n > 0;
+                const rejoining = hadGap && n <= 0;
+                if ((separating || rejoining) && L && R && L.gap == null
+                        && linkedMeta(L.meta, R.meta)) {
+                    if (separating) {
+                        if (es[li].exitOverride === null && L.exit !== null) {
+                            es[li].exitOverride = L.exit;
+                        }
+                        if (es[i].enterOverride === null && R.enter) {
+                            es[i].enterOverride = R.enter;
+                        }
+                    } else {
+                        const s = tlDeriveSeam(L.meta, R.meta);
+                        if (s.exitL !== null
+                                && es[li].exitOverride === s.exitL) {
+                            es[li].exitOverride = null;
+                        }
+                        if (s.enterR && es[i].enterOverride === s.enterR) {
+                            es[i].enterOverride = null;
+                        }
+                    }
+                    lines[map[li]] = tlFormatLine(es[li]);
+                    lines[map[i]] = tlFormatLine(es[i]);
+                }
+                if (hadGap) {
                     if (n <= 0) lines.splice(map[i - 1], 1);
                     else lines[map[i - 1]] = `~ ${n}`;
                 } else {
@@ -7342,13 +8250,14 @@ app.registerExtension({
                 }
                 return { move, hide };
             }
-            // A clip that something leads INTO cannot be slid away from
-            // it: the hole would break the seam. Same rule that stops you
-            // cutting an interior head, for the same reason.
+            // Any clip can slide, including one its left neighbour leads
+            // INTO: pulling it away is how you separate a linked pair.
+            // The hole breaks the chain the same way resolve_sequence
+            // treats every gap -- both clips keep their own ends -- and
+            // dragging it back flush rejoins them.
             function canMoveInTime(entries, i) {
                 const e = entries[i];
-                if (!e || e.gap != null) return false;
-                return !linkedMeta(entries[i - 1]?.meta, e.meta);
+                return !!e && e.gap == null;
             }
 
             // "uncut" is offered only when the selected clip actually
@@ -7392,11 +8301,11 @@ app.registerExtension({
                     background: "none",
                 });
                 block.title = `empty space, ${played} frames `
-                    + `(${(played / TL_FPS).toFixed(1)}s)\n`
+                    + `(${(played / TL_FPS).toFixed(2)}s)\n`
                     + "black in the preview and the export -- generate a "
                     + "bridge to fill it. Hover for its controls.";
                 const cap = document.createElement("div");
-                cap.textContent = `${(played / TL_FPS).toFixed(1)}s`;
+                cap.textContent = `${(played / TL_FPS).toFixed(2)}s`;
                 Object.assign(cap.style, {
                     font: "10px sans-serif", opacity: "0.8",
                     whiteSpace: "nowrap",
@@ -7462,8 +8371,8 @@ app.registerExtension({
                     && !upscaleMode();
                 const cur0 = shownPin();
                 const isThis = canBridge && cur0?.role === "bridge"
-                    && cur0.source === left.clip
-                    && cur0.source2 === right.clip;
+                    && pinIdx(cur0, false, entries) === i - 1
+                    && pinIdx(cur0, true, entries) === i + 1;
                 const bridge = gapBtn("+", canBridge
                     ? TL_ROLE.extend.bg : "rgba(127,127,127,0.35)", "13px");
                 // a little air between the two, or they read as one
@@ -7505,8 +8414,9 @@ app.registerExtension({
                         ev.stopPropagation();
                         const cur = pinState();
                         setPinState(isThis ? null : {
-                            role: "bridge", source: left.clip,
-                            source2: right.clip,
+                            role: "bridge",
+                            ...pinAt(i - 1, false, entries),
+                            ...pinAt(i + 1, true, entries),
                             window: cur?.window ?? "22",
                         });
                     });
@@ -7591,6 +8501,41 @@ app.registerExtension({
                     if (e.enterOverride !== null) e.enter = e.enterOverride;
                     if (e.exitOverride !== null) e.exit = e.exitOverride;
                 }
+                // ...and a manual cut that disagrees with a lineage link
+                // makes the join JUMP: the left side stops somewhere
+                // other than where the right side continues from. The
+                // pill says so, exactly as the upscale decides it
+                // (nodes_joint.segment_breaks): a hand cut on either side
+                // that is not the natural join frame.
+                const jumpNote = (L, R, s) => {
+                    if (!s || s.kind !== "seamless" || !L?.meta) return s;
+                    const natural = s.exitL
+                        ?? (Number(L.meta.delivered_frames) || 0);
+                    const exitJump = L.exitOverride !== null
+                        && L.exitOverride !== natural;
+                    const enterJump = R.enterOverride !== null
+                        && R.enterOverride !== (s.enterR || 0);
+                    if (!exitJump && !enterJump) return s;
+                    return { ...s, jump: true,
+                             note: (exitJump
+                                 ? `cut at ${L.exitOverride}, but the next `
+                                   + `clip continues from ${natural}`
+                                 : `cut to start at ${R.enterOverride}, but `
+                                   + `it continues from ${s.enterR || 0}`)
+                                 + ": plays (and upscales) as a cut" };
+                };
+                for (let i = 1; i < entries.length; i++) {
+                    if (entries[i].seam) {
+                        entries[i].seam = jumpNote(entries[i - 1],
+                                                   entries[i],
+                                                   entries[i].seam);
+                    }
+                }
+                if (entries[0]?.wrapSeam) {
+                    entries[0].wrapSeam = jumpNote(
+                        entries[entries.length - 1], entries[0],
+                        entries[0].wrapSeam);
+                }
                 syncPinCut(entries);
 
                 playlist = entries.map((e) => ({
@@ -7603,10 +8548,15 @@ app.registerExtension({
                 // playlist -- without this, resuming after an edit plays
                 // the stale chain until a seek forces a reload.
                 const playlistSig = JSON.stringify(playlist);
+                // an EDIT (not the first render): the picture must follow
+                // it, see the end of refresh
+                const edited = lastPlaylistSig != null
+                    && playlistSig !== lastPlaylistSig;
                 if (playlistSig !== lastPlaylistSig) {
                     lastPlaylistSig = playlistSig;
                     single = null;
                     usingSingle = false;
+                    stopGapClock();
                     for (const v of vids) {
                         v.pause();
                         v._item = null;
@@ -7696,7 +8646,7 @@ app.registerExtension({
                     sub.style.opacity = "0.65";
                     sub.style.font = "10px sans-serif";
                     sub.textContent = played > 0
-                        ? `${(played / TL_FPS).toFixed(1)}s` : "?";
+                        ? `${(played / TL_FPS).toFixed(2)}s` : "?";
                     const mini = (label, title, fn, active) => {
                         const b = document.createElement("button");
                         b.textContent = label;
@@ -7769,22 +8719,21 @@ app.registerExtension({
                     // pin itself is toggled from the selected-clip bar
                     // or the seam popups.
                     const pst = shownPin();
-                    const pinnedRole = pinRoleFor(e.clip, pst);
+                    // by ENTRY: of a clip split in two, only the half the
+                    // pin names wears the badge
+                    const pinnedRole = pinRoleAt(i, pst, entries);
                     // the clip occupying the GAP(s) the pin regenerates
                     // gets replaced on add -- fade it as a preview.
                     // Gap-based, either lineage direction: prepending
                     // into S also displaces S's extend-PARENT (both are
                     // lead-ins for the same boundary). A bridge checks
                     // both of its sides.
-                    const exClip = pst && pst.role !== "prepend"
-                        ? pst.source : null;
-                    const prClip = !pst ? null
-                        : pst.role === "bridge" ? pst.source2
-                        : pst.role === "prepend" ? pst.source : null;
-                    const exMeta = exClip ? entries.find((en) =>
-                        en.clip === exClip)?.meta : null;
-                    const prMeta = prClip ? entries.find((en) =>
-                        en.clip === prClip)?.meta : null;
+                    const exIdx = pst && pst.role !== "prepend"
+                        ? pinIdx(pst, false, entries) : -1;
+                    const prIdx = !pst ? -1
+                        : pst.role === "bridge" ? pinIdx(pst, true, entries)
+                        : pst.role === "prepend" ? pinIdx(pst, false, entries)
+                        : -1;
                     // Lineage alone is NOT enough: a clip keeps its
                     // lineage wherever you drag it, so a bare
                     // linkedMeta() check left it faded after it had been
@@ -7793,9 +8742,9 @@ app.registerExtension({
                     // -- i.e. it is the immediate neighbour on that side
                     // right now, with the link live.
                     const willReplace =
-                        tlOccupant(entries, exClip, "after",
+                        tlOccupant(entries, exIdx, "after",
                                    linkedMeta)?.entry === e ||
-                        tlOccupant(entries, prClip, "before",
+                        tlOccupant(entries, prIdx, "before",
                                    linkedMeta)?.entry === e;
                     if (willReplace) {
                         block.style.opacity = "0.45";
@@ -7830,15 +8779,15 @@ app.registerExtension({
                         // per SIDE, not per role: a clip bridged onto
                         // itself carries both
                         mkBar("left",
-                            pinHasRole(e.clip, pst, "prepend")
+                            pinHasRoleAt(i, pst, "prepend", entries)
                                 ? TL_ROLE.prepend.bg
-                                : seamL?.kind === "seamless"
+                                : seamL?.kind === "seamless" && !seamL.jump
                                     ? TL_COLORS.seamless
                                     : TL_COLORS.butt),
                         mkBar("right",
-                            pinHasRole(e.clip, pst, "extend")
+                            pinHasRoleAt(i, pst, "extend", entries)
                                 ? TL_ROLE.extend.bg
-                                : seamR?.kind === "seamless"
+                                : seamR?.kind === "seamless" && !seamR.jump
                                     ? TL_COLORS.seamless
                                     : TL_COLORS.butt));
                     const pinSlot = document.createElement("span");
@@ -7859,8 +8808,7 @@ app.registerExtension({
                         });
                         // the take that closes a loop wears its own
                         // word on both clips it touches (or the one)
-                        const looping = impliesLoop(pst) &&
-                            (pst.source === e.clip || pst.source2 === e.clip);
+                        const looping = impliesLoop(pst, entries);
                         pb.textContent = looping ? "looping"
                             : pinnedRole === "extend"
                                 ? "extending" : "prepending";
@@ -7883,8 +8831,9 @@ app.registerExtension({
                     });
                     name.style.flex = "1";
                     const closeBtn = mini("✕",
-                        "Remove from the sequence",
-                        () => removeEntry(i));
+                        "Remove from the sequence, leaving its time as "
+                        + "empty space (nothing after it moves)",
+                        () => deleteClip(i));
                     closeBtn.style.font = "9px/13px sans-serif";
                     closeBtn.style.marginRight = "2px";
                     closeBtn.style.marginTop = "-1px";
@@ -8061,12 +9010,13 @@ app.registerExtension({
                             // On the clip's own START, not at the
                             // pointer: that edge IS the thing being
                             // moved, and it is where the cut drag puts
-                            // its readout too. Seconds to one decimal,
-                            // the way the empty block labels itself, so
-                            // the two numbers can be compared.
+                            // its readout too. Seconds to two decimals,
+                            // the way the empty block labels itself (and
+                            // the total below the strip), so the numbers
+                            // can be compared.
                             dragTag.textContent = frames
                                 ? `${frames}f · `
-                                  + `${(frames / TL_FPS).toFixed(1)}s space`
+                                  + `${(frames / TL_FPS).toFixed(2)}s space`
                                 : "no space";
                             const gx = block.offsetLeft + shift;
                             const half = (dragTag.offsetWidth || 60) / 2;
@@ -8097,7 +9047,9 @@ app.registerExtension({
                             // the pending click is swallowed by the guard
                             // in the click handler; clear it if none comes
                             setTimeout(() => { dragMoved = false; }, 0);
-                            if (frames !== base) setGapBefore(i, frames);
+                            if (frames !== base) {
+                                setGapBefore(i, frames, entries);
+                            }
                         };
                         document.addEventListener(
                             "pointermove", onMove, true);
@@ -8112,13 +9064,30 @@ app.registerExtension({
                 // a pin whose clip left the sequence is stale: clear it
                 // directly (setPinState would recurse into refresh)
                 const pst2 = pinState();
-                const inSeq = (c) =>
-                    entries.some((en) => en.clip === c);
-                if (pst2 && (!inSeq(pst2.source) ||
+                if (pst2 && (pinIdx(pst2, false, entries) < 0 ||
                         (pst2.role === "bridge" &&
-                         !inSeq(pst2.source2)))) {
+                         pinIdx(pst2, true, entries) < 0))) {
                     if (psWidget) psWidget.value = "";
+                    // said in the pin row until the next pin, because a
+                    // pin that vanishes is otherwise easy to miss
+                    // name the side that is gone (a bridge has two)
+                    const second = pinIdx(pst2, false, entries) >= 0;
+                    const part = second ? pst2.part2 : pst2.part;
+                    const file = String(second ? pst2.source2 : pst2.source)
+                        .split("/").pop();
+                    pinGoneNote = `the pinned ${part ? "part of " : ""}`
+                        + `${file} left the cut`;
+                    pinGoneTip = part
+                        ? "The pin named a part of this clip that is no "
+                          + "longer in the cut, so it was cleared rather "
+                          + "than moved onto another part. Pin the part "
+                          + "you want again."
+                        : "The pinned clip is no longer in the cut, so the "
+                          + "pin was cleared. Pin a clip again to extend or "
+                          + "prepend from it.";
                     tldbg("pin cleared: its clip left the sequence");
+                } else if (pst2) {
+                    pinGoneNote = "";
                 }
                 // repainted on every strip render, not only on a click:
                 // "load settings" writes widget values straight in, and
@@ -8178,6 +9147,14 @@ app.registerExtension({
                     : Math.max(0, Math.min(keepFrame,
                                            Math.max(0, totalFrames - 1)));
                 setPlayhead(heldFrame);
+                // The edit unloaded the players, but they still showed
+                // the OLD cut's picture until the ruler was touched.
+                // Show the new cut's frame under the playhead now
+                // (paused, as the edit left it); no playhead yet: its
+                // first frame. Not mid-drag -- the drag shows its own.
+                if (edited && totalFrames && cutPin == null) {
+                    seekGlobal(heldFrame ?? 0);
+                }
                 updateCutRow();
                 requestAnimationFrame(() => {
                     strip.scrollLeft = keepScroll;   // after layout settles
@@ -8192,78 +9169,82 @@ app.registerExtension({
             // Shared pin toggle: the ONLY writers of pin_state are this
             // (via the info-bar toggles and the seam popups' "generate
             // new" items) -- the strip blocks just wear a status badge.
-            function togglePinFor(clip, role) {
+            // Everything here is by ENTRY index into the rendered list:
+            // the pin records which part of its file it means.
+            function togglePinAt(i, role) {
+                const es = lastEntries;
+                const e = es?.[i];
+                if (!e || e.gap != null) return;
+                const clip = e.clip;
                 const cur = pinState();
                 const w = cur?.window ?? "22";
-                if (pinHasRole(clip, cur, role)) {
+                // one of the current pin's sides, re-keyed for the slot
+                // it takes in the new state (`second` = source2/part2)
+                const side = (src, part, second) => ({
+                    [second ? "source2" : "source"]: src,
+                    ...(part ? { [second ? "part2" : "part"]: part } : {}),
+                });
+                const curSrc = cur ? side(cur.source, cur.part, false) : {};
+                if (pinHasRoleAt(i, cur, role)) {
                     // toggling an ACTIVE side off: a bridge keeps its
                     // other side as a single pin, a single pin clears
                     if (cur.role === "bridge") {
                         setPinState(role === "extend"
-                            ? { source: cur.source2, role: "prepend",
-                                window: w }
-                            : { source: cur.source, role: "extend",
-                                window: w });
+                            ? { ...side(cur.source2, cur.part2, false),
+                                role: "prepend", window: w }
+                            : { ...curSrc, role: "extend", window: w });
                     } else {
                         setPinState(null);
                     }
                     return;
                 }
-                // opposite-side single pin already set on another clip
+                // opposite-side single pin already set on another entry
                 // -> combine into a bridge (extend side = source,
                 // prepend side = source2)
-                // ...or on the SAME clip when it is the only one on the
+                // ...or on the SAME entry when it is the only one on the
                 // strip: extending its tail and prepending its head in
                 // one run is the take that loops it onto itself
-                const alone = lastEntries?.length === 1 &&
-                    lastEntries[0].clip === clip;
+                const alone = es.length === 1;
                 if (cur && cur.role !== "bridge" &&
-                        (clip !== cur.source || alone) && cur.role ===
+                        (i !== pinIdx(cur) || alone) && cur.role ===
                         (role === "extend" ? "prepend" : "extend")) {
                     setBridge(role === "extend"
-                        ? { role: "bridge", source: clip,
-                            source2: cur.source, window: w }
-                        : { role: "bridge", source: cur.source,
-                            source2: clip, window: w });
+                        ? { role: "bridge", ...pinAt(i),
+                            ...side(cur.source, cur.part, true), window: w }
+                        : { role: "bridge", ...curSrc, ...pinAt(i, true),
+                            window: w });
                     return;
                 }
                 // fresh pin. If it would REPLACE a clip that is linked
                 // on BOTH sides (regenerating the middle of a chain),
                 // auto-upgrade to a bridge so the new take binds to
-                // both neighbors.
-                const meta = lastEntries?.find(
-                    (en) => en.clip === clip)?.meta;
-                if (meta && lastEntries) {
-                    if (role === "extend") {
-                        const occ = lastEntries.find((en) =>
-                            en.clip !== clip && en.meta &&
-                            linkedMeta(meta, en.meta));
-                        const far = occ && lastEntries.find((en) =>
-                            en !== occ && en.clip !== clip &&
-                            en.meta && linkedMeta(occ.meta, en.meta));
-                        if (far) {
-                            setPinState({ role: "bridge",
-                                          source: clip,
-                                          source2: far.clip,
-                                          window: w });
-                            return;
-                        }
-                    } else {
-                        const occ = lastEntries.find((en) =>
-                            en.clip !== clip && en.meta &&
-                            linkedMeta(en.meta, meta));
-                        const far = occ && lastEntries.find((en) =>
-                            en !== occ && en.clip !== clip &&
-                            en.meta && linkedMeta(en.meta, occ.meta));
-                        if (far) {
-                            setPinState({ role: "bridge",
-                                          source: far.clip,
-                                          source2: clip, window: w });
-                            return;
-                        }
+                // both neighbors. Positional, like the faded preview of
+                // what the run replaces: the clip it would replace is
+                // the live neighbour on that side, and the far clip is
+                // the one that neighbour leads into right there. (Read
+                // by lineage anywhere in the cut, the first part of a
+                // split clip heading a chain bridged into the chain's
+                // far end, although its neighbour is its own other part.)
+                const o = tlOccupant(es, i,
+                    role === "extend" ? "after" : "before", linkedMeta);
+                if (o) {
+                    const f = role === "extend" ? o.idx + 1 : o.idx - 1;
+                    const far = es[f];
+                    const binds = far && far.gap == null && far.meta
+                        && far.clip !== clip
+                        && (role === "extend"
+                            ? linkedMeta(o.entry.meta, far.meta)
+                            : linkedMeta(far.meta, o.entry.meta));
+                    if (binds) {
+                        setPinState(role === "extend"
+                            ? { role: "bridge", ...pinAt(i),
+                                ...pinAt(f, true), window: w }
+                            : { role: "bridge", ...pinAt(f),
+                                ...pinAt(i, true), window: w });
+                        return;
                     }
                 }
-                setPinState({ source: clip, role, window: w });
+                setPinState({ ...pinAt(i), role, window: w });
             }
 
             const smallBtn = (label, title) => {
@@ -8396,7 +9377,9 @@ app.registerExtension({
                     // no pin: the same surface as the clip-info box, so
                     // "nothing special is happening" looks like the
                     // resting chrome rather than an announcement
-                    value.textContent = "root generation (no pin)";
+                    value.textContent = "root generation (no pin)"
+                        + (pinGoneNote ? ` -- ${pinGoneNote}` : "");
+                    value.title = pinGoneNote ? pinGoneTip : "";
                     value.style.color = PAL.sub;
                     value.style.background = PAL.rest;
                     value.style.borderColor = PAL.edge;
@@ -8406,15 +9389,16 @@ app.registerExtension({
                     frame.append(value, durWrap);
                     return;
                 }
-                const shortName = st.source.split("/").pop();
+                // names say WHICH part when the file is in the cut more
+                // than once (a split clip)
+                const shortName = pinName(st);
                 value.textContent = st.role === "bridge"
                     ? (impliesLoop(st)
-                        ? (st.source === st.source2
+                        ? (lastEntries?.length === 1
                             ? `loops ${shortName} onto itself`
                             : `loops: bridges ${shortName} → `
-                              + st.source2.split("/").pop())
-                        : `bridges ${shortName} → `
-                          + st.source2.split("/").pop())
+                              + pinName(st, true))
+                        : `bridges ${shortName} → ` + pinName(st, true))
                     : st.role === "extend"
                         ? `extends ${shortName}`
                         : `prepends into ${shortName}`;
@@ -8544,7 +9528,8 @@ app.registerExtension({
             // last click sits on) -- no separate selection state.
             function renderClipInfo() {
                 infoIdx = lastHighlight;
-                const e = lastEntries?.[lastHighlight];
+                const idx = lastHighlight;
+                const e = lastEntries?.[idx];
                 infoRow.replaceChildren();
                 // the clip-surfaced box holds the text; the toggles sit
                 // OUTSIDE it, to its right
@@ -8558,11 +9543,15 @@ app.registerExtension({
                     border: "1px solid " + PAL.edge,
                 });
                 infoRow.appendChild(frame);
-                if (!e) {
+                // Empty space is selected too, whenever quick play runs
+                // into it -- and it has no clip to describe. Reading one
+                // threw here, which aborted the gap before its clock
+                // started: quick play stopped dead at every gap.
+                if (!e || e.gap != null) {
                     // no caption when empty -- one line in the SAME
                     // style as the "selected clip" caption
                     const d = document.createElement("span");
-                    d.textContent = "no clip selected";
+                    d.textContent = e ? "empty space" : "no clip selected";
                     Object.assign(d.style, {
                         color: PAL.sub, fontSize: "10px",
                         letterSpacing: "0.05em",
@@ -8603,7 +9592,7 @@ app.registerExtension({
                 // active, not framed buttons -- they read as part of
                 // the bar itself
                 const mkToggle = (role, label, title) => {
-                    const active = pinHasRole(e.clip, pst, role);
+                    const active = pinHasRoleAt(idx, pst, role);
                     const b = document.createElement("button");
                     b.textContent = label;
                     b.title = pixel
@@ -8642,7 +9631,7 @@ app.registerExtension({
                     });
                     b.addEventListener("click", (ev) => {
                         ev.stopPropagation();
-                        togglePinFor(e.clip, role);
+                        togglePinAt(idx, role);
                     });
                     return b;
                 };
@@ -8871,6 +9860,10 @@ app.registerExtension({
                 rulerRO.disconnect();
                 themeMO.disconnect();
                 TL_REGISTRY.delete(node.id);
+                TL_SPACE.delete(node);
+                window.removeEventListener("wheel", onTimelineWheel,
+                                           { capture: true });
+                stopGapClock();
                 dropProgress();
                 for (const v of vids) {
                     v.pause();
@@ -8932,21 +9925,23 @@ app.registerExtension({
                 // multi-pin aware: a bridge take aims after its
                 // extend-parent (its prepend-side neighbor is then the
                 // gap occupant placeClip resolves against)
+                // Of a parent split into parts, the part the take was
+                // pinned to (or whose cut the take joins at).
                 const m = p.meta;
-                const ex = tlExtendParent(m);
-                const pr = tlPrependChild(m);
-                let k = ex ? lastEntries.findIndex((e) =>
-                    e.meta && e.meta.self_id === ex.id) : -1;
+                const st = pinState();
+                let k = tlParentIdx(lastEntries, m, "after",
+                    st && st.role !== "prepend" ? pinIdx(st) : -1);
                 if (k >= 0) {
                     return { at: k + 1, parentIdx: k, side: "after",
-                             label: "after " + clipBase(lastEntries[k].clip),
+                             label: "after " + partLabel(k),
                              tail: k === lastEntries.length - 1 };
                 }
-                k = pr ? lastEntries.findIndex((e) =>
-                    e.meta && e.meta.self_id === pr.id) : -1;
+                k = tlParentIdx(lastEntries, m, "before",
+                    !st ? -1 : st.role === "prepend" ? pinIdx(st)
+                        : st.role === "bridge" ? pinIdx(st, true) : -1);
                 if (k >= 0) {
                     return { at: k, parentIdx: k, side: "before",
-                             label: "before " + clipBase(lastEntries[k].clip),
+                             label: "before " + partLabel(k),
                              tail: false };
                 }
                 return { at: lastEntries.length, parentIdx: -1,
@@ -8980,25 +9975,115 @@ app.registerExtension({
             // Only the PIN's own cut is rewritten. An unrelated manual
             // cut on the same clip is a decision about something else
             // and has to survive being extended from.
-            function reconcileParentCut(meta) {
-                const ex = tlExtendParent(meta);
-                if (!ex) return null;
-                const i = lastEntries.findIndex(
-                    (e) => e.meta && e.meta.self_id === ex.id);
+            //
+            // A take made from a part-id'd line knows its part and the
+            // cut it was QUEUED at (tlTakePart), so "is this the pin's
+            // cut?" is answered exactly:
+            //   - its part is gone: no cut is touched, and the note says
+            //     where the take went instead;
+            //   - the part's cut is still the queued one: only the grid
+            //     moved it (or nothing did) -- the old rewrite, quietly;
+            //   - the cut was changed while the take generated: that was
+            //     a decision, so it is ASKED about, never overwritten.
+            // An older take has none of this and keeps the old proof.
+            //
+            // Both sides: a take that PREPENDS (a prepend, or a bridge's
+            // tail) hands over to its child at a frame the grid and a
+            // soft hold decide, just as an extend leaves its parent at
+            // one, and the child's start cut has to move there the same
+            // way -- left alone it replays the frames between (the right
+            // half of a split always has such a cut).
+            async function reconcileParentCut(meta) {
+                const notes = [await reconcileCut(meta, "after"),
+                               await reconcileCut(meta, "before")]
+                    .filter(Boolean);
+                return notes.length ? notes.join("; ") : null;
+            }
+            // side "after" = the clip the take extends (its exit cut),
+            // "before" = the clip it prepends into (its enter cut)
+            async function reconcileCut(meta, side) {
+                const tail = side === "after";
+                const link = tail ? tlExtendParent(meta)
+                                  : tlPrependChild(meta);
+                if (!link) return null;
+                const st = pinState();
+                const rec = tlTakePart(meta, side);
+                // which pin named this side: an extend's (or a bridge's
+                // first) source, a prepend's source, a bridge's source2
+                const pinned = !st ? -1
+                    : tail ? (st.role !== "prepend" ? pinIdx(st) : -1)
+                    : st.role === "prepend" ? pinIdx(st)
+                    : st.role === "bridge" ? pinIdx(st, true) : -1;
+                const pinCut = !st ? null
+                    : !tail && st.role === "bridge" ? st.cut2 : st.cut;
+                const i = tlParentIdx(lastEntries, meta, side, pinned);
                 const e = i >= 0 ? lastEntries[i] : null;
-                if (!e || e.exitOverride == null) return null;
+                if (!e) return null;
                 // delivered coordinates, exactly as tlDeriveSeam maps
-                // them: the parent's own pinned head offsets the join
-                const exitF = ex.join
+                // them: the clip's own pinned head offsets the join
+                const joinF = link.join
                     - (Number(e.meta.pinned_head_frames) || 0);
                 const delivered = Number(e.meta.delivered_frames) || 0;
-                const was = e.exitOverride;
-                if (was === exitF) return null;
+                const was = tail ? e.exitOverride : e.enterOverride;
+                // a join at the clip's own edge needs no cut at all
+                const wanted = joinF === (tail ? delivered : 0) ? null : joinF;
+                const patch = (v) => (tail ? { exit: v } : { enter: v });
+                const ends = tail ? "ends" : "starts";
+                const edge = tail ? "its end" : "its start";
+                const verb = tail ? "continues from" : "hands over at";
+                const where = tail ? "where this take continues from"
+                                   : "where this take hands over";
+                if (rec && e.part !== rec.part) {
+                    if (tlJoinFits(e, meta, side)) return null;
+                    return `the part of ${clipBase(e.clip)} this take `
+                        + (tail ? "continued" : "leads into")
+                        + ` is no longer in the cut; it goes `
+                        + `${tail ? "after" : "before"} ${partLabel(i)}, `
+                        + `which ${ends} elsewhere, so that join plays as a cut`;
+                }
+                if (rec) {
+                    if ((was ?? null) === (rec.cut ?? null)) {
+                        if (was == null || was === joinF) return null;
+                        setCut(i, patch(wanted));
+                        return `${partLabel(i)} now ${ends} at ${joinF}`
+                            + ` instead of ${was}, ${where}`
+                            + (tail ? " (the 17-frame grid moved the take's"
+                                      + " start)" : "");
+                    }
+                    if ((was ?? null) === wanted) return null;
+                    const from = rec.cut == null ? edge : `frame ${rec.cut}`;
+                    const now = was == null ? edge : `frame ${was}`;
+                    const back = wanted == null ? edge : `frame ${joinF}`;
+                    if (await tlAskChoice({
+                            title: `${partLabel(i)} was cut again`,
+                            message: `It was cut at ${from} when this take `
+                                + `was queued, and is cut at ${now} now. The `
+                                + `take ${verb} ${back}.\n\n`
+                                + `Cut it at ${back} again and the join is `
+                                + "seamless. Keep your cut and the join plays "
+                                + "as a cut.",
+                            yes: `Cut at ${back} again`,
+                            no: "Keep my cut",
+                        })) {
+                        setCut(i, patch(wanted));
+                        return `${partLabel(i)} cut at ${back} again, ${where}`;
+                    }
+                    return `kept your cut on ${partLabel(i)}; this take `
+                        + `${verb} ${back}, so that join plays as a cut`;
+                }
+                if (was == null || was === joinF) return null;
                 // Two ways to be sure this cut is the one the take was
                 // asked to continue from -- it only takes one.
-                const st = pinState();
-                const thePinsCut = !!st && st.source === e.clip
-                    && Number(st.cut) === was;
+                const thePinsCut = pinned === i && Number(pinCut) === was;
+                if (!tail) {
+                    // a prepend's older take: only the pin proves it (the
+                    // grid arithmetic below is the extend's)
+                    if (!thePinsCut) return null;
+                    setCut(i, patch(wanted));
+                    return `${partLabel(i)} now starts at ${joinF}`
+                        + ` instead of ${was}, where this take hands over`;
+                }
+                const exitF = joinF;
                 // The pin is gone after a reload, but the arithmetic
                 // still proves it: the take's join is exactly where the
                 // 17-frame grid would have moved THIS cut -- on the
@@ -9012,15 +10097,22 @@ app.registerExtension({
                 if (!thePinsCut && !gridMoved) {
                     return null;               // somebody else's cut
                 }
-                // a join at the clip's own end needs no cut at all
-                setCut(i, { exit: exitF === delivered ? null : exitF });
-                return `${clipBase(e.clip)} now ends at ${exitF}`
-                    + ` instead of ${was}: the 17-frame grid moved the`
-                    + " take's start";
+                setCut(i, { exit: wanted });
+                return `${partLabel(i)} now ends at ${exitF}`
+                    + ` instead of ${was}, where this take continues from`;
+            }
+            // A clip's name for a message, saying which part it is when
+            // the file stands in the cut more than once.
+            function partLabel(i) {
+                const e = lastEntries[i];
+                if (!e?.clip) return "";
+                const n = lastEntries.filter((x) => x.clip === e.clip).length;
+                return clipBase(e.clip) + (n < 2 ? ""
+                    : ` (part ${tlOccOf(lastEntries, i) + 1}/${n})`);
             }
 
-            function placeClip(clip, meta) {
-                const moved = reconcileParentCut(meta);
+            async function placeClip(clip, meta) {
+                const moved = await reconcileParentCut(meta);
                 const note = (msg) => (moved ? msg + " -- " + moved : msg);
                 const aim = aimFor({ clip, meta });
                 if (aim.parentIdx >= 0) {
@@ -9031,7 +10123,7 @@ app.registerExtension({
                     // elsewhere is a different position in the cut now,
                     // and must not be silently removed.
                     const held = tlOccupant(
-                        lastEntries, lastEntries[aim.parentIdx]?.clip,
+                        lastEntries, aim.parentIdx,
                         aim.side === "after" ? "after" : "before",
                         linkedMeta);
                     if (held && held.entry.clip !== clip) {
@@ -9054,6 +10146,29 @@ app.registerExtension({
             // was generated to lead into.
             // One sequence write for both edits, so the undo step and the
             // refresh see a single change.
+            // Frames the take moves its parent's edge beside the hole by:
+            // a prepend that enters the parent at frame 13 takes 13 off
+            // its start, an extend that leaves it early takes some off
+            // its end. The hole gets them back, so the parent's frames
+            // stay where they were on the timeline, and everything after
+            // it with them. Measured as the parent's played edge now
+            // against once the take is in (a manual cut, as reconcileCut
+            // just left it, beats the derived seam -- the same rule
+            // refresh() plays by).
+            function parentShift(aim, meta) {
+                const p = lastEntries[aim.parentIdx];
+                if (!p || p.gap != null || !p.meta) return 0;
+                const now = tlParseSequence(seqWidget.value)[aim.parentIdx];
+                if (aim.side === "before") {
+                    const will = now?.enterOverride
+                        ?? tlDeriveSeam(meta, p.meta).enterR ?? 0;
+                    return will - (p.enter ?? 0);
+                }
+                const end = Number(p.frames) || 0;
+                const will = now?.exitOverride
+                    ?? tlDeriveSeam(p.meta, meta).exitL ?? end;
+                return (p.exit ?? end) - will;
+            }
             function insertFilling(aim, clip, meta) {
                 const es = lastEntries;
                 const ls = currentLines();
@@ -9069,10 +10184,11 @@ app.registerExtension({
                     const bridged = aim.side === "after" && !!child
                         && es[gi + 1]?.meta?.self_id === child.id;
                     const left = bridged ? 0
-                        : Math.max(0, Math.round(Number(hole.gap) || 0) - took);
+                        : Math.max(0, Math.round(Number(hole.gap) || 0)
+                            + parentShift(aim, meta) - took);
                     if (left > 0) {
                         ls[map[gi]] = `~ ${left}`;
-                        filled = `, ${(left / TL_FPS).toFixed(1)}s of empty `
+                        filled = `, ${(left / TL_FPS).toFixed(2)}s of empty `
                             + "space left";
                     } else {
                         ls.splice(map[gi], 1);
@@ -9093,6 +10209,19 @@ app.registerExtension({
                 fixOpts: () => fixOpts(),
                 crf: () => crfValue(),
                 has: (clip) => lastEntries.some((e) => e.clip === clip),
+                // What this cut plays of a clip: the part `part` names,
+                // or the clip when it stands in the cut once; null when
+                // that is not one entry. The Result Preview shows a
+                // take's neighbours to these edges (rpFarCuts).
+                partSpan: (clip, part) => {
+                    const es = lastEntries.filter((e) => e.gap == null
+                        && e.clip === clip);
+                    const e = part ? es.find((x) => x.part === part)
+                        : es.length === 1 ? es[0] : null;
+                    return e ? { enter: Number(e.enter) || 0,
+                                 exit: e.exit == null ? null : Number(e.exit) }
+                        : null;
+                },
                 // Where the SAME join sits here: those two clips, in
                 // that order, next to each other. -1 when they are not,
                 // which is the only safe answer -- a join is a PAIR,
@@ -9123,7 +10252,7 @@ app.registerExtension({
                         return "already in the timeline";
                     }
                     const meta = await tlClipMeta(clip);
-                    const msg = placeClip(clip, meta);
+                    const msg = await placeClip(clip, meta);
                     const n = applySeamOptsMap(seamOpts);
                     return n
                         ? `${msg}, with ${n === 1 ? "its own seam settings"
@@ -9150,12 +10279,88 @@ app.registerExtension({
 // A run finishes -> the Python node returns {clip, parent, relation,
 // sequence} -> this widget shows the pair as two blocks with the seam
 // pill between them and plays the sequence as ONE server-built smart
-// cut (the same /obvpm/h3/preview_cut the Timeline uses, its own
-// preview file). The payload rides node.properties so it survives a
-// workflow save/reload.
+// cut (the same /obvpm/h3/preview_cut the Timeline uses, into
+// RP_PREVIEW_NAME). A rendered cut is played as it is: see rpPlaysAsIs.
+// Nothing of it is kept in the workflow: see RP_STORE_KEY for where the
+// result and the rest come from instead.
 const RP_NODE = "H3ResultPreview";
 const RP_PREVIEW_NAME = "obvpm_h3_result";
+// A rendered cut (H3 Joint VAE Decode and Save) is the finished file and
+// has no neighbours, so "building its preview" only re-encoded a copy of
+// it -- a second generation of the very pixels being judged, seconds of
+// work and a second file of the same size. The browser plays it directly.
+// That also leaves the take previews as the only builders of
+// RP_PREVIEW_NAME, so one shared name is enough (the build lock in
+// preview_route keeps two builds of it from colliding).
+const rpPlaysAsIs = (d) => d?.render === "joint" && !String(d.sequence ?? "").includes("\n");
 
+// ---- nothing in the workflow ----------------------------------------------
+// A Result Preview keeps NOTHING in the workflow. It used to keep its
+// last result, the add/dismiss decision and its seam tuning on
+// node.properties -- which made every finished run an
+// undo step (and an undo on an unrelated edit brought an older result
+// back), changed the workflow file on every run, and shipped the author's
+// last result inside every workflow they shared.
+//   - the result: this session's own (RP_RESULTS), or else the newest take
+//     its Save node writes, asked of the server when the workflow opens
+//     (/obvpm/h3/latest_result);
+//   - the decision, the seam tuning: this browser's storage, keyed by
+//     the take.
+// Workflows saved before this still carry those properties; they are read
+// once into storage and otherwise ignored -- never deleted from the node,
+// because deleting them would itself be an edit (an undo step, and the
+// unsaved mark on every old workflow opened).
+const RP_STORE_KEY = "obvpm.h3.result_preview";
+const RP_STORE_MAX = 300;          // takes remembered per map, oldest dropped
+// decided[clip]: 1 = added (or a decision stored before dismissals were
+// told apart), RP_DISMISSED = dismissed -- not shown again on open
+const RP_DISMISSED = "dismissed";
+const rpDismissed = (clip) => rpStore().decided[clip] === RP_DISMISSED;
+function rpStore() {
+    try {
+        const s = JSON.parse(localStorage.getItem(RP_STORE_KEY) || "{}");
+        const map = (k) => (s && typeof s[k] === "object" && s[k]) || {};
+        // (a "live" map -- a per-folder switch for the live picture -- is
+        // no longer read, and is dropped at the next write)
+        return { decided: map("decided"), seam: map("seam"),
+                 cleared: map("cleared") };
+    } catch (err) {
+        return { decided: {}, seam: {}, cleared: {} };
+    }
+}
+function rpStoreWrite(s) {
+    // insertion order is age: re-set keys move to the end, the oldest go
+    const trim = (m) => {
+        const keys = Object.keys(m);
+        for (const k of keys.slice(0, Math.max(0, keys.length - RP_STORE_MAX))) {
+            delete m[k];
+        }
+        return m;
+    };
+    try {
+        localStorage.setItem(RP_STORE_KEY, JSON.stringify({
+            decided: trim(s.decided), seam: trim(s.seam),
+            cleared: trim(s.cleared ?? {}),
+        }));
+    } catch (err) { /* private mode, quota: forget quietly */ }
+}
+// cleared[scope] = the server file time (mtime_ms) of the take a preview
+// was cleared of, by delete or dismiss. On open the preview shows a take
+// only when it is newer: after deleting the newest take, the one before it
+// is not what the preview was showing, and turning up on a refresh it
+// reads as a result nobody asked for. A run's own result always shows.
+function rpClearedHides(scope, d) {
+    if (!scope || d?.mtime_ms == null) return false;
+    const at = rpStore().cleared[scope];
+    return at != null && Number(d.mtime_ms) <= Number(at);
+}
+function rpMarkCleared(scope, d) {
+    if (!scope || d?.mtime_ms == null) return;
+    const s = rpStore();
+    delete s.cleared[scope];
+    s.cleared[scope] = Number(d.mtime_ms);
+    rpStoreWrite(s);
+}
 // ---- whose run was that? -------------------------------------------
 // ComfyUI delivers `executed` by NODE ID into whichever workflow is open
 // (app.ts: getNodeByExecutionId(rootGraph, ...)) and wipes stored outputs
@@ -9554,24 +10759,108 @@ function rpPromptValue(prompt, v, hops) {
         ? rpPromptValue(prompt, inputs[keys[0]], hops - 1) : null;
 }
 
+function rpNodeWrites(prompt, n, scope) {
+    if (n?.inputs?.filename_prefix === undefined) return false;
+    const p = rpPromptValue(prompt, n.inputs.filename_prefix, RP_HOPS);
+    if (p == null) return false;
+    // ABSENT and UNREADABLE are different: a save node with no
+    // base_folder really does write at the root, but one whose folder
+    // can't be resolved must not be judged as if it were empty -- that
+    // makes "folder/clip" look like a match for scope "clip".
+    let f = "";
+    if (n.inputs.base_folder !== undefined) {
+        f = rpPromptValue(prompt, n.inputs.base_folder, RP_HOPS);
+        if (f == null) return false;
+    }
+    return rpJoinPrefix(f, p) === scope;
+}
+
 function rpPromptWrites(prompt, scope) {
     if (!prompt || typeof prompt !== "object") return false;
-    for (const n of Object.values(prompt)) {
-        if (n?.inputs?.filename_prefix === undefined) continue;
-        const p = rpPromptValue(prompt, n.inputs.filename_prefix, RP_HOPS);
-        if (p == null) continue;
-        // ABSENT and UNREADABLE are different: a save node with no
-        // base_folder really does write at the root, but one whose folder
-        // can't be resolved must not be judged as if it were empty -- that
-        // makes "folder/clip" look like a match for scope "clip".
-        let f = "";
-        if (n.inputs.base_folder !== undefined) {
-            f = rpPromptValue(prompt, n.inputs.base_folder, RP_HOPS);
-            if (f == null) continue;
+    return Object.values(prompt).some((n) => rpNodeWrites(prompt, n, scope));
+}
+
+// The API prompt of each queued job this page has looked at, so a live
+// frame can be judged without asking the server again (frames arrive
+// every step). Kept small: only the last few jobs matter.
+const RP_RUN_PROMPTS = new Map();
+function rpRememberPrompts(jobs) {
+    for (const j of jobs) {
+        if (j?.[1] && j?.[2] && typeof j[2] === "object") {
+            RP_RUN_PROMPTS.set(j[1], j[2]);
         }
-        if (rpJoinPrefix(f, p) === scope) return true;
     }
-    return false;
+    while (RP_RUN_PROMPTS.size > 16) {
+        RP_RUN_PROMPTS.delete(RP_RUN_PROMPTS.keys().next().value);
+    }
+}
+
+// What the server is executing right now: `executing` names the node (its
+// flat API id -- subgraphs are already expanded) as it starts, and a
+// sampler's live frames arrive while it runs.
+const RP_EXEC = { promptId: null, node: null };
+if (!globalThis.__obvpmRpExec) {
+    globalThis.__obvpmRpExec = true;
+    api.addEventListener("execution_start", (e) => {
+        RP_EXEC.promptId = e?.detail?.prompt_id ?? null;
+        RP_EXEC.node = null;
+    });
+    api.addEventListener("executing", (e) => {
+        const d = e?.detail;
+        RP_EXEC.node = d && typeof d === "object"
+            ? (d.display_node ?? d.node ?? null) : (d ?? null);
+    });
+}
+
+// Does node `from` feed a save that writes to `scope`? "yes" | "no" |
+// "unknown". A whole prompt is the wrong question for a LIVE frame: the
+// generation and the upscale branch sit in one prompt, and the branch
+// that is not running is switched off by a gate at run time (Mute If),
+// not left out of the prompt -- so by the prompt alone the upscale
+// preview owned every generation run and showed its sampler's frames.
+// The node actually sampling only reaches the save of its own branch.
+const RP_USERS = new WeakMap();
+function rpFeedsScope(prompt, from, scope) {
+    if (scope === null) return "unknown";
+    const saves = rpSavesFed(prompt, from);
+    if (!saves?.length) return "unknown";
+    return saves.some((n) => rpNodeWrites(prompt, n, scope)) ? "yes" : "no";
+}
+// The save nodes (a `filename_prefix` input) downstream of `from`,
+// itself included; null when the prompt or the node is unknown.
+function rpSavesFed(prompt, from) {
+    if (!prompt || typeof prompt !== "object" || from == null) return null;
+    let users = RP_USERS.get(prompt);
+    if (!users) {
+        users = new Map();
+        for (const [id, n] of Object.entries(prompt)) {
+            for (const v of Object.values(n?.inputs ?? {})) {
+                if (!Array.isArray(v) || v.length !== 2) continue;
+                const src = String(v[0]);
+                if (!prompt[src]) continue;
+                if (!users.has(src)) users.set(src, []);
+                users.get(src).push(id);
+            }
+        }
+        RP_USERS.set(prompt, users);
+    }
+    const start = String(from);
+    if (!prompt[start]) return null;
+    const seen = new Set([start]);
+    const todo = [start];
+    const saves = [];
+    while (todo.length) {
+        const id = todo.pop();
+        const n = prompt[id];
+        if (n?.inputs?.filename_prefix !== undefined) saves.push(n);
+        for (const u of users.get(id) ?? []) {
+            if (!seen.has(u)) {
+                seen.add(u);
+                todo.push(u);
+            }
+        }
+    }
+    return saves;
 }
 
 // "yes" | "no" | "unknown" — unknown whenever the answer can't be
@@ -9587,6 +10876,7 @@ async function rpQueueOwns(scope, promptId) {
     }
     if (!q) return "unknown";
     const jobs = [...(q.queue_running ?? []), ...(q.queue_pending ?? [])];
+    rpRememberPrompts(jobs);
     if (promptId == null) {
         return jobs.some((j) => rpPromptWrites(j?.[2], scope)) ? "yes" : "no";
     }
@@ -9720,7 +11010,6 @@ function buildResultPreview(node) {
     });
 
     const video = document.createElement("video");
-    video.controls = true;
     video.playsInline = true;
     Object.assign(video.style, {
         width: "100%", flex: "1", minHeight: "0",
@@ -9728,72 +11017,50 @@ function buildResultPreview(node) {
         background: "#000",
     });
 
-    // The LIVE picture while a run this preview owns is sampling: KJ's
-    // Model Preview Override pushes each step's preview over the
-    // websocket as a `kj_preview_override` event (a JPEG, an animated
-    // WebP, or an MP4 when NVENC is available), tagged with ITS node id
-    // and painted on that node by its own script. Listening here as
-    // well puts the same picture in the box the result will take over,
-    // so the two previews read as one panel and the KJ node can be
-    // collapsed. No KJ node in the graph -> no events -> nothing here
-    // changes. An <img> plays an animated WebP by itself; MP4 needs
-    // the <video>.
-    const liveImg = document.createElement("img");
-    const liveVideo = document.createElement("video");
-    liveVideo.muted = true;
-    liveVideo.loop = true;
-    liveVideo.autoplay = true;
-    liveVideo.playsInline = true;
-    for (const el of [liveImg, liveVideo]) {
-        Object.assign(el.style, {
-            width: "100%", flex: "1", minHeight: "0",
-            objectFit: "contain", borderRadius: "4px", display: "none",
-            background: "#000",
-        });
-    }
-    let liveUrl = null;          // the object URL on screen, if any
+    // The LIVE picture while a run this preview owns is sampling. H3 Live
+    // Preview sends each step as a short clip on the take's own timeline
+    // (`obvpm.h3.live`); KJNodes' Model Preview Override sends its own
+    // picture (`kj_preview_override`: a JPEG, an animated WebP, or an MP4
+    // when NVENC is available), tagged with ITS node id and painted on
+    // that node by its own script. Listening here as well puts the
+    // picture in the box the result will take over, so the two read as
+    // one panel. Neither node in the graph -> no events -> nothing here
+    // changes. Each step's clip replaces the last WITHOUT starting it
+    // over (LiveClip keeps its place), and the bar drives it like a take.
+    const liveClip = new LiveClip();
+    const liveBox = document.createElement("div");
+    Object.assign(liveBox.style, {
+        width: "100%", flex: "1", minHeight: "0", display: "none",
+        borderRadius: "4px", overflow: "hidden", background: "#000",
+    });
+    let liveOn = false;          // the live picture fills the preview
     let liveStep = null;         // {step, total} of the last frame
     function liveClear() {
-        liveImg.style.display = "none";
-        liveVideo.style.display = "none";
-        liveVideo.pause();
-        liveImg.removeAttribute("src");
-        liveVideo.removeAttribute("src");
-        if (liveUrl) URL.revokeObjectURL(liveUrl);
-        liveUrl = null;
+        liveClip.clear();
+        liveClip.el.remove();
+        liveBox.style.display = "none";
+        liveOn = false;
         liveStep = null;
+        setBarMembers();
     }
     function liveShow(data) {
-        const mime = typeof data.mime === "string" ? data.mime : "image/jpeg";
-        let blob;
-        try {
-            const bin = atob(data.image);
-            const bytes = new Uint8Array(bin.length);
-            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-            blob = new Blob([bytes], { type: mime });
-        } catch (err) {
-            return;
-        }
-        const url = URL.createObjectURL(blob);
-        const old = liveUrl;
-        liveUrl = url;
         // the result of the previous run gives way to the live picture,
         // its clip strip and buttons with it; stopClock() brings them
         // back if this run leaves no result
+        video.pause();
         video.style.display = "none";
         strip.style.display = "none";
         btnRow.style.display = "none";
-        if (mime === "video/mp4") {
-            liveImg.style.display = "none";
-            liveVideo.src = url;
-            liveVideo.style.display = "block";
-            void liveVideo.play?.().catch?.(() => {});
-        } else {
-            liveVideo.style.display = "none";
-            liveImg.src = url;
-            liveImg.style.display = "block";
-        }
-        if (old) URL.revokeObjectURL(old);
+        if (liveClip.el.parentElement !== liveBox) liveBox.appendChild(liveClip.el);
+        liveBox.style.display = "block";
+        const first = !liveOn;
+        liveOn = true;
+        void liveClip.update(data).then(() => {
+            if (first && liveOn) {
+                setBarMembers();
+                bar.play();
+            }
+        });
     }
 
     const strip = document.createElement("div");
@@ -9802,6 +11069,7 @@ function buildResultPreview(node) {
     });
 
     const status = document.createElement("div");
+    tlSelectable(status);
     Object.assign(status.style, {
         font: "11px sans-serif", color: PAL.sub,
         whiteSpace: "nowrap", overflow: "hidden",
@@ -9836,7 +11104,8 @@ function buildResultPreview(node) {
         borderColor: "#1f5c38",
     });
     const dismissBtn = rpBtn("dismiss",
-        "Hide these buttons (the preview and the take stay)");
+        "Clear this result from the preview (the take stays on disk) "
+        + "-- it will not come back when the workflow is opened again");
     const delBtn = rpBtn("✕ delete",
         "Delete this take (MP4 + sidecar) -- for rejected seeds");
     // destructive action wears red; dismiss stays neutral
@@ -9848,12 +11117,44 @@ function buildResultPreview(node) {
 
     const rpProgress = tlProgressBar();
     const dropRpProgress = tlOnProgress(() => RP_PREVIEW_NAME, rpProgress);
-    container.append(liveImg, liveVideo, video, strip, rpProgress.el, btnRow, status);
+    const stage = document.createElement("div");
+    Object.assign(stage.style, {
+        display: "flex", flexDirection: "column", gap: "3px", flex: "1",
+        minHeight: "0", background: "transparent",
+    });
+    // One bar under the picture, whatever it is: the take, or the live
+    // picture while a run samples -- play / pause, frame steps, seek,
+    // sound, loop and fullscreen, instead of the browser's controls drawn
+    // over the bottom of the frame.
+    const bar = tlPlayerBar({
+        pal: () => PAL, loopKey: "result-preview", loop: true,
+        fullscreen: () => stage,
+    });
+    stage.append(liveBox, video, bar.el);
+    bar.attach(video);
+    bar.attach(liveBox);
+    stage.addEventListener("fullscreenchange", () => {
+        stage.style.background = document.fullscreenElement === stage
+            ? "#000" : "transparent";
+    });
+    // what the bar drives: the picture on screen
+    function setBarMembers() {
+        let list = [];
+        if (liveOn) list = [liveClip];
+        else if (current && video.getAttribute("src")) list = [video];
+        bar.setMembers(list);
+        bar.el.style.display = list.length ? "flex" : "none";
+    }
+    bar.el.style.display = "none";
+    container.append(stage, strip, rpProgress.el, btnRow, status);
+    TL_SPACE.set(node, { node, el: container, hoverOnly: true,
+                         toggle: () => bar.toggle() });
     const widget = node.addDOMWidget("mctx_result", "div", container,
                                      { hideOnZoom: false });
     widget.serialize = false;
     widget.options.serialize = false;
     tlPanWithMiddleButton(container);
+    tlNoSelect(container);
     tlWheelToCanvas(container);
     widget.computeLayoutSize = () => ({ minHeight: 220, minWidth: 240 });
     Object.defineProperty(widget, "width", {
@@ -9913,8 +11214,8 @@ function buildResultPreview(node) {
         b.append(nm, s);
         b.addEventListener("click", () => {
             if (video.src && starts[k] !== undefined) {
-                video.currentTime = starts[k] / TL_FPS;
-                void video.play().catch(() => {});
+                bar.seek(starts[k] / TL_FPS);
+                bar.play();
             }
         });
         return b;
@@ -9930,41 +11231,33 @@ function buildResultPreview(node) {
     //
     // Keyed by the clip to the RIGHT of the join, exactly as the
     // sequence line keys them, so handing them over is a lookup and not
-    // a translation. On node.properties so a workflow save keeps them
-    // alongside the h3_result payload they describe.
+    // a translation. In this browser's storage, not the workflow (see
+    // RP_STORE_KEY); the map handed over is the part of it for the clips
+    // on screen.
     function rpAllSeamOpts() {
-        const o = node.properties?.h3_seam_opts;
-        return (o && typeof o === "object") ? o : {};
+        const seam = rpStore().seam;
+        const out = {};
+        const clips = String(current?.sequence || current?.clip || "")
+            .split("\n").map((c) => c.trim()).filter(Boolean);
+        for (const c of clips) {
+            if (seam[c] && typeof seam[c] === "object") out[c] = seam[c];
+        }
+        return out;
     }
     function rpSeamOptsFor(clip) {
-        return rpAllSeamOpts()[clip] || {};
+        return rpStore().seam[clip] || {};
     }
     function rpWriteSeamOpts(clip, own) {
-        const all = { ...rpAllSeamOpts() };
-        if (own && Object.keys(own).length) all[clip] = own;
-        else delete all[clip];
-        node.properties.h3_seam_opts = all;
+        const s = rpStore();
+        delete s.seam[clip];
+        if (own && Object.keys(own).length) s.seam[clip] = own;
+        rpStoreWrite(s);
     }
     function rpSetSeamOpt(clip, key, value) {
         const own = { ...rpSeamOptsFor(clip) };
         if (value === undefined || value === null) delete own[key];
         else own[key] = value;
         rpWriteSeamOpts(clip, own);
-    }
-    // A new take is a new question; settings named for clips that are no
-    // longer on screen would otherwise accumulate in the workflow file
-    // forever. Keys still in the sequence survive, so flipping back and
-    // forth between takes does not lose them.
-    function rpPruneSeamOpts(clips) {
-        const keep = new Set(clips);
-        const all = rpAllSeamOpts();
-        const next = {};
-        for (const [k, v] of Object.entries(all)) {
-            if (keep.has(k)) next[k] = v;
-        }
-        if (Object.keys(next).length !== Object.keys(all).length) {
-            node.properties.h3_seam_opts = next;
-        }
     }
     // Once a join exists in a Timeline too, THAT is where its settings
     // live -- editing a private copy here would show a repaired picture
@@ -10000,11 +11293,52 @@ function buildResultPreview(node) {
     // (preview_route._seam_plan), so this needs nothing new server-side
     // -- and it means the Result Preview and the export go through one
     // format, not two.
-    function rpSequenceText(d) {
+    // `far` (rpFarCuts) adds a neighbour's far edge to its line.
+    function rpSequenceText(d, far) {
         const clips = d.sequence.split("\n");
-        return clips.map((c, k) => c +
+        return clips.map((c, k) => c + (far?.[k] ?? "") +
             (k > 0 ? tlFormatSeamOpts(rpJoinOpts(clips, k)) : ""))
             .join("\n");
+    }
+    // The far edges of a take's neighbours, as the timeline plays them.
+    // The take's record says where it JOINS each neighbour (the server
+    // derives that side from it) but nothing about the rest of the cut, so
+    // a neighbour used to play out to its file's far end -- the right half
+    // of a 30 s clip split into short parts previewed as 25 s of context.
+    // The owning timeline's other edge of that part is written into the
+    // line instead: the part the take recorded, or the clip when it stands
+    // in the cut once. No timeline holding it: the whole clip, as before.
+    function rpFarCuts(d, clips, metas) {
+        const far = clips.map(() => "");
+        const ti = clips.indexOf(d.clip);
+        const meta = ti >= 0 ? metas[ti] : null;
+        if (!meta) return far;
+        const span = (clip, side) => {
+            const part = tlTakePart(meta, side)?.part ?? null;
+            for (const t of tlMatchesFor(clip)) {
+                const s = t.partSpan?.(clip, part);
+                if (s) return s;
+            }
+            return null;
+        };
+        const ph = (k) => Number(metas[k]?.pinned_head_frames) || 0;
+        // the parent it extends: that part's START (its end is the join)
+        const ex = tlExtendParent(meta);
+        if (ex && ti > 0 && metas[ti - 1]?.self_id === ex.id) {
+            const s = span(clips[ti - 1], "after");
+            if (s && s.enter > 0 && s.enter < ex.join - ph(ti - 1)) {
+                far[ti - 1] = ` @ ${s.enter}`;
+            }
+        }
+        // the clip it prepends into: that part's END (its start is the join)
+        const pr = tlPrependChild(meta);
+        if (pr && ti + 1 < clips.length && metas[ti + 1]?.self_id === pr.id) {
+            const s = span(clips[ti + 1], "before");
+            if (s && s.exit != null && s.exit > pr.join - ph(ti + 1)) {
+                far[ti + 1] = ` @ ..${s.exit}`;
+            }
+        }
+        return far;
     }
     // What this join inherits when it says nothing of its own: the
     // owning Timeline's setting, or the shared default when no Timeline
@@ -10093,8 +11427,13 @@ function buildResultPreview(node) {
         if (current) void render(current, { keep: true });
     }
 
+    // `opts.play`: false when the take is only being RESTORED (the
+    // workflow was opened or refreshed) -- shown paused at its start. A
+    // take a Run just made starts playing by itself; a rebuild of the
+    // take on screen (`keep`) plays on only if it was playing.
     async function render(d, opts) {
         PAL = themePalette();
+        const play = opts?.play ?? (opts?.keep ? bar.wanted : true);
         current = d;
         const seq = ++reqSeq;
         blockEls = [];
@@ -10117,7 +11456,6 @@ function buildResultPreview(node) {
         const clips = d.sequence.split("\n");
         const metas = await Promise.all(clips.map((c) => tlClipMeta(c)));
         if (seq !== reqSeq) return;
-        rpPruneSeamOpts(clips);
         clips.forEach((c, k) => {
             if (k > 0) {
                 // pill = the RELATION; under it the MEASURED verdict
@@ -10243,29 +11581,49 @@ function buildResultPreview(node) {
             strip.appendChild(bEl);
         });
 
-        rpProgress.arm("preparing…");
+        const viewUrl = (filename, subfolder, type, v) => api.apiURL(
+            `/view?filename=${encodeURIComponent(filename)}` +
+            `&subfolder=${encodeURIComponent(subfolder)}` +
+            `&type=${encodeURIComponent(type ?? "output")}` +
+            `&v=${encodeURIComponent(v ?? "")}`);
         try {
-            const resp = await api.fetchApi("/obvpm/h3/preview_cut", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    sequence: rpSequenceText(d), crf: rpCrf(d.clip),
-                    base_folder: d.clip.includes("/")
-                        ? d.clip.slice(0, d.clip.lastIndexOf("/")) : "",
-                    preview_filename: RP_PREVIEW_NAME,
-                    ...rpFixOpts(d.clip),
-                }),
-            });
-            if (!resp.ok) throw new Error(await resp.text());
-            const r = await resp.json();
-            if (seq !== reqSeq) return;
-            starts = r.starts;
-            video.src = api.apiURL(
-                `/view?filename=${encodeURIComponent(r.filename)}` +
-                `&subfolder=${encodeURIComponent(r.subfolder)}` +
-                `&type=${encodeURIComponent(r.type ?? "output")}` +
-                `&v=${encodeURIComponent(r.v ?? "")}`);
+            let src;
+            if (rpPlaysAsIs(d)) {
+                // the finished file itself; its size is the cache buster,
+                // since a deleted take's name is reused by the next save
+                const size = await serverFileSize(d.clip).catch(() => null);
+                if (seq !== reqSeq) return;
+                if (size === null) throw new Error(d.clip + " not found");
+                const at = d.clip.lastIndexOf("/");
+                src = viewUrl(d.clip.slice(at + 1),
+                              at >= 0 ? d.clip.slice(0, at) : "", "output", size);
+                starts = [0];
+            } else {
+                rpProgress.arm("preparing…");
+                const resp = await api.fetchApi("/obvpm/h3/preview_cut", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        sequence: rpSequenceText(d, rpFarCuts(d, clips, metas)),
+                        crf: rpCrf(d.clip),
+                        base_folder: d.clip.includes("/")
+                            ? d.clip.slice(0, d.clip.lastIndexOf("/")) : "",
+                        preview_filename: RP_PREVIEW_NAME,
+                        ...rpFixOpts(d.clip),
+                    }),
+                });
+                if (!resp.ok) throw new Error(await resp.text());
+                const r = await resp.json();
+                if (seq !== reqSeq) return;
+                starts = r.starts;
+                src = viewUrl(r.filename, r.subfolder, r.type, r.v);
+            }
+            video.src = src;
             video.style.display = "block";
+            setBarMembers();
+            bar.seek(0);
+            if (play) bar.play();
+            else bar.pause();
             // The strip already says who relates to whom and how well, so
             // the status line normally stays quiet. It does have to
             // resolve one apparent contradiction though: the seam pill
@@ -10316,7 +11674,7 @@ function buildResultPreview(node) {
             if (JSON.stringify(next) === JSON.stringify(PAL)) return;
             PAL = next;
             applyRpChrome();
-            if (current) void render(current);
+            if (current) void render(current, { play: bar.wanted });
         }, 150);
     });
     for (const t of [document.documentElement, document.body]) {
@@ -10354,13 +11712,17 @@ function buildResultPreview(node) {
     }
     // a live frame is shown only for the run being timed: the event is
     // global, and another workflow's sampling must not paint here
-    // Per node, saved in the workflow: a preview on the refine branch
-    // shares the one event stream with the generation branch's, and
-    // its owner may not want the sampler's frames there at all.
-    const liveWanted = () => node.properties?.h3_live_preview !== false;
     const onLivePreview = (e) => {
         const data = e?.detail;
-        if (!data || runStartedAt === null || !liveWanted()) return;
+        if (!data || runStartedAt === null) return;
+        // only frames from the sampler of THIS preview's branch: a preview
+        // on the refine branch shares the one event stream with the
+        // generation branch's
+        const prompt = RP_RUN_PROMPTS.get(runPromptId ?? RP_EXEC.promptId);
+        if (rpFeedsScope(prompt, RP_EXEC.node,
+                         rpScopeFolder(node)) === "no") {
+            return;
+        }
         if (typeof data.step === "number" && typeof data.total === "number") {
             liveStep = { step: data.step, total: data.total };
             runTick();
@@ -10408,7 +11770,7 @@ function buildResultPreview(node) {
         }
         // the live picture goes with the run; the previous result comes
         // back until (and unless) a new one renders over it
-        if (liveUrl) {
+        if (liveOn || liveClip.mode) {
             liveClear();
             if (video.getAttribute("src")) video.style.display = "block";
             if (current) strip.style.display = "flex";
@@ -10441,6 +11803,7 @@ function buildResultPreview(node) {
     api.addEventListener("execution_interrupted", onRunEnd);
     api.addEventListener("status", onQueueStatus);
     api.addEventListener("kj_preview_override", onLivePreview);
+    api.addEventListener("obvpm.h3.live", onLivePreview);
 
     // The Result Preview plays the take with the SAME seam repair the
     // export will apply, taken from the Timeline that owns this folder.
@@ -10493,33 +11856,52 @@ function buildResultPreview(node) {
         });
     }
     // The decision taken on a take (added, or dismissed) is kept BY CLIP
-    // in the node's properties, so it survives a reload, a workflow
-    // switch and the restore of the same result: the same take never
-    // asks twice. A new take is a new decision; a deleted one is gone.
-    const decided = () => !!current &&
-        node.properties?.h3_decided === current.clip;
-    function decide() {
-        node.properties = node.properties || {};
-        node.properties.h3_decided = current?.clip ?? null;
+    // in this browser's storage (see RP_STORE_KEY), so it survives a
+    // reload, a workflow switch and the restore of the same result: the
+    // same take never asks twice. A new take is a new decision. A dismissal
+    // is recorded as such (RP_DISMISSED): a dismissed take is not shown
+    // again when the workflow opens, an added one is.
+    const decided = () => !!current && !!rpStore().decided[current.clip];
+    function decide(how = 1) {
+        if (!current?.clip) return;
+        const s = rpStore();
+        delete s.decided[current.clip];
+        s.decided[current.clip] = how;
+        rpStoreWrite(s);
+    }
+    // an empty preview, saying why: after a delete or a dismiss
+    function clearView(text) {
+        current = null;
+        ++reqSeq; // a build still in flight must not bring it back
+        video.pause();
+        video.removeAttribute("src");
+        video.load();
+        video.style.display = "none";
+        setBarMembers();
+        strip.replaceChildren();
+        strip.style.display = "none";
+        btnRow.style.display = "none";
+        rpCloseSeamDialog(false);
+        status.style.color = PAL.sub;
+        status.textContent = text;
     }
     function updateActionBtns() {
-        if (decided()) {
-            btnRow.style.display = "none";
-            return;
-        }
-        // a take that already sits in a timeline is neither addable
-        // nor safe to delete from here; a rendered cut is the final
-        // product, not a take for a timeline
-        const inTl = current && [...TL_REGISTRY.values()]
+        // a decided take asks nothing more; a take that already sits in
+        // a timeline is neither addable nor safe to delete from here; a
+        // rendered cut is the final product, not a take for a timeline
+        const open = !!current && !decided();
+        const inTl = open && [...TL_REGISTRY.values()]
             .some((t) => t.has?.(current.clip));
-        const canAdd = !!(current && !inTl && current.render !== "joint" &&
-            tlMatchesFor(current.clip).length);
-        const canDel = !!(current && !inTl);
+        const canAdd = open && !inTl && current.render !== "joint" &&
+            tlMatchesFor(current.clip).length > 0;
+        const canDel = open && !inTl;
         addTlBtn.style.display = canAdd ? "" : "none";
         delBtn.style.display = canDel ? "" : "none";
-        // with nothing to accept or reject the row would hold only
-        // dismiss -- nothing worth dismissing, so hide the whole row
-        btnRow.style.display = canAdd || canDel ? "flex" : "none";
+        // dismiss clears whatever is on screen, decided or not -- an
+        // added take (or one decided before dismissals were told apart)
+        // would otherwise come back on every open with no way to clear it.
+        // Not over the live picture: that result is not on screen
+        btnRow.style.display = current && !liveOn ? "flex" : "none";
     }
     // timelines register/unregister (and their sequences change) as
     // the user works; re-check on hover so the row is honest at the
@@ -10543,18 +11925,20 @@ function buildResultPreview(node) {
         // the timeline's own refresh is async, so has() still answers
         // with the OLD sequence here -- but the offer just succeeded,
         // so the take is in a timeline now: hide directly, and remember
-        // the decision so the row stays down for this take
+        // the decision so they stay down for this take (dismiss stays)
         decide();
         addTlBtn.style.display = "none";
         delBtn.style.display = "none";
-        btnRow.style.display = "none"; // dismiss alone is no row
     });
     dismissBtn.addEventListener("click", () => {
-        // just tuck the buttons away; the preview itself stays. Sticky
-        // for this take (hover re-checks and reloads must not resurrect
-        // an explicitly dismissed row)
-        decide();
-        btnRow.style.display = "none";
+        // clear the result, not just the buttons: a take left on screen
+        // turns up again on every reopen with nothing saying which run it
+        // was. Sticky for this take (see RP_DISMISSED); the file stays.
+        if (!current?.clip) return;
+        const gone = current.clip;
+        decide(RP_DISMISSED);
+        rpMarkCleared(rpScopeFolder(node), current);
+        clearView("dismissed " + gone.split("/").pop());
     });
     delBtn.addEventListener("click", async () => {
         if (!current) return;
@@ -10572,17 +11956,9 @@ function buildResultPreview(node) {
             tlMetaCache.delete(gone);
             tlFramesCache.delete(gone);
             for (const t of TL_REGISTRY.values()) t.forget(gone);
-            current = null;
-            node.properties.h3_result = null;
-            video.pause();
-            video.removeAttribute("src");
-            video.load();
-            video.style.display = "none";
-            strip.replaceChildren();
-            strip.style.display = "none";
-            btnRow.style.display = "none";
-            status.style.color = PAL.sub;
-            status.textContent = "deleted " + gone;
+            // a refresh must not bring the take before it up instead
+            rpMarkCleared(rpScopeFolder(node), current);
+            clearView("deleted " + gone);
         } catch (err) {
             status.style.color = "#de5b5b";
             status.textContent = "delete failed: " +
@@ -10592,7 +11968,8 @@ function buildResultPreview(node) {
 
     let lastShownKey = null;
     let lastShownAt = 0;
-    node._h3ShowResult = (d) => {
+    // opts.play === false: restored on open, shown paused (see render)
+    node._h3ShowResult = (d, opts = {}) => {
         // Both delivery paths can land the same payload in the same tick;
         // re-rendering would restart the preview build and the video for
         // nothing. Only collapse near-simultaneous repeats: an identical
@@ -10603,35 +11980,31 @@ function buildResultPreview(node) {
         if (key === lastShownKey && now - lastShownAt < 2000) return;
         lastShownKey = key;
         lastShownAt = now;
-        node.properties = node.properties || {};
-        node.properties.h3_result = d;
-        void render(d);
+        void render(d, opts);
     };
 
     // Pick up a run that finished while this workflow was in the
     // background: its `executed` event never reached this node (the node
     // wasn't in the open graph) and ComfyUI's own output store was wiped
     // by the workflow switch, so RP_RESULTS is the only surviving copy.
-    // Restoring a payload from an earlier session means its clips may be
-    // gone -- deleting a rejected take is routine, and the preview build
-    // would fail with a "clip not found" error for something the user did
-    // on purpose. Check first and say it plainly instead.
+    // A cached payload may name clips deleted since -- deleting a rejected
+    // take is routine, and the preview build would fail with a "clip not
+    // found" error for something the user did on purpose. Check first and
+    // say it plainly instead.
     async function restoreResult(d) {
-        if (!d?.clip) return;
+        if (!d?.clip || rpDismissed(d.clip)
+                || rpClearedHides(rpScopeFolder(node), d)) return;
         const clips = String(d.sequence || d.clip)
             .split("\n").map((c) => c.trim()).filter(Boolean);
         const sizes = await Promise.all(
             clips.map((c) => serverFileSize(c).catch(() => null)));
         const missing = clips.filter((c, i) => sizes[i] === null);
         if (!missing.length) {
-            node._h3ShowResult(d);
+            node._h3ShowResult(d, { play: false });
             return;
         }
-        node.properties = node.properties || {};
         if (missing.includes(d.clip)) {
-            // the take itself is gone: nothing left to show, and keeping
-            // the payload would resurrect this every time it loads
-            node.properties.h3_result = null;
+            // the take itself is gone: nothing left to show
             status.style.color = PAL.sub;
             status.textContent =
                 d.clip.split("/").pop() + " was deleted";
@@ -10643,38 +12016,71 @@ function buildResultPreview(node) {
         node._h3ShowResult({
             ...d, parent: null, parent2: null, relation: "",
             sequence: d.clip, seam: null, seam2: null,
-        });
+        }, { play: false });
     }
 
+    // true when this session holds a result for this preview
     function adoptCachedResult() {
-        if (rpScopeFolder(node) === null) return; // can't tell whose result
+        if (rpScopeFolder(node) === null) return false; // can't tell whose
         // newest first, matched by the same rule that gates live events
         for (let i = RP_RESULTS.length - 1; i >= 0; i--) {
             if (rpAccepts(node, RP_RESULTS[i])) {
                 void restoreResult(RP_RESULTS[i]);
-                return;
+                return true;
             }
         }
+        return false;
     }
-    const prevMenu = node.getExtraMenuOptions;
-    node.getExtraMenuOptions = function (canvas, options) {
-        const r = prevMenu?.apply(this, arguments);
-        options.push({
-            content: (liveWanted() ? "✓ " : "") + "Live preview while sampling",
-            callback: () => {
-                this.properties ??= {};
-                this.properties.h3_live_preview = !liveWanted();
-                if (!liveWanted()) {
-                    liveClear();
-                    if (video.getAttribute("src")) video.style.display = "block";
-                    if (current) strip.style.display = "flex";
-                    updateActionBtns();
+    // Nothing from this session: the newest take this preview's Save
+    // node writes, judged by the server exactly as a run would have
+    // judged it (nodes_result.latest_result). Nothing is stored, so
+    // opening the workflow again asks again.
+    async function adoptLatestResult() {
+        const scope = rpScopeFolder(node);
+        if (!scope) return;
+        let d = null;
+        try {
+            const resp = await api.fetchApi("/obvpm/h3/latest_result", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ prefix: scope }),
+            });
+            if (resp.ok) d = (await resp.json())?.result ?? null;
+        } catch (err) {
+            tldbg("result preview: latest result unavailable:", err);
+        }
+        // a run may have delivered its own result while this was asked.
+        // The newest take dismissed, or no newer than what this preview
+        // was last cleared of (rpClearedHides): show nothing, never an
+        // older take
+        if (!d?.clip || current || !node.graph || rpDismissed(d.clip)
+                || rpClearedHides(scope, d)) return;
+        node._h3ShowResult(d, { play: false });
+    }
+    // Workflows saved before the preview stopped keeping anything in them
+    // carry the decision and the seam tuning as node properties: carried
+    // into storage once, never removed from the node (see RP_STORE_KEY).
+    // What storage already has wins. (Their old `h3_live_preview` is
+    // ignored: the live picture has no switch.)
+    function adoptOldProperties(p) {
+        if (!p) return;
+        const s = rpStore();
+        let changed = false;
+        if (typeof p.h3_decided === "string" && p.h3_decided
+                && !s.decided[p.h3_decided]) {
+            s.decided[p.h3_decided] = 1;
+            changed = true;
+        }
+        if (p.h3_seam_opts && typeof p.h3_seam_opts === "object") {
+            for (const [c, o] of Object.entries(p.h3_seam_opts)) {
+                if (!s.seam[c] && o && typeof o === "object") {
+                    s.seam[c] = o;
+                    changed = true;
                 }
-                this.setDirtyCanvas?.(true, true);
-            },
-        });
-        return r;
-    };
+            }
+        }
+        if (changed) rpStoreWrite(s);
+    }
 
     const live = {
         alive: () => !!node.graph,
@@ -10692,18 +12098,11 @@ function buildResultPreview(node) {
         // Deferred as a whole: links aren't wired up yet during configure,
         // so the scope can't be read until the graph settles.
         setTimeout(() => {
-            const saved = this.properties?.h3_result;
-            if (saved && !rpAccepts(this, saved)) {
-                // The payload is saved INTO the workflow file, so a result
-                // captured from another workflow before scope checking
-                // existed comes back on every load. Drop it for good.
-                tldbg("result preview: dropping saved result", saved.clip,
-                      "— this node watches", rpScopeFolder(this));
-                this.properties.h3_result = null;
-            } else if (saved) {
-                void restoreResult(saved);
-            }
-            adoptCachedResult();
+            // An `h3_result` a workflow saved before is NOT shown: it is
+            // whatever that file last showed, possibly on another machine.
+            // This session's own result wins, else the newest take on disk.
+            adoptOldProperties(this.properties);
+            if (!adoptCachedResult()) void adoptLatestResult();
             // Joining a run that is already in flight: the start event
             // fired before this node existed, so ask the queue instead.
             void rpQueueOwns(rpScopeFolder(this), null).then((owns) => {
@@ -10725,7 +12124,10 @@ function buildResultPreview(node) {
         api.removeEventListener("execution_interrupted", onRunEnd);
         api.removeEventListener("status", onQueueStatus);
         api.removeEventListener("kj_preview_override", onLivePreview);
+        api.removeEventListener("obvpm.h3.live", onLivePreview);
         liveClear();
+        bar.destroy();
+        if (TL_SPACE.get(node)?.hoverOnly) TL_SPACE.delete(node);
         dropRpProgress();
         video.pause();
         video.removeAttribute("src");

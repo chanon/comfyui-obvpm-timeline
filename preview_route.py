@@ -38,6 +38,7 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 
 import folder_paths
 
@@ -47,9 +48,11 @@ from . import frames as fr
 from . import levellock
 from . import mctx
 from . import nodes_assemble as na
+from . import nodes_pins
 from . import yuv
 from . import timeline_store
-from .nodes_save import H3SaveVideoWithMCtx, folder_text
+from .nodes_save import (COLOUR_BT709, H3SaveVideoWithMCtx, folder_text,
+                         source_colour)
 
 _LOG = logging.getLogger("obvpm.h3")
 
@@ -61,7 +64,7 @@ DEFAULT_PREVIEW_NAME = "obvpm_h3_preview"
 # an older version is served as current -- and a fix looks like it did
 # nothing. Raise it with any change to how frames are decoded, corrected
 # or encoded.
-BUILD_VERSION = 10
+BUILD_VERSION = 12
 
 
 def _decode_audio(path):
@@ -94,6 +97,16 @@ def _decode_audio(path):
 def _decode_images(path):
     from comfy_api.input_impl import VideoFromFile
     return VideoFromFile(path).get_components().images
+
+
+def _neighbour_colour(entries, i):
+    """The colour handling of the real clip nearest entry i (the one
+    before it, else the one after): empty space is written to splice with
+    the clips around it (see nodes_save.source_colour)."""
+    for j in list(range(i - 1, -1, -1)) + list(range(i + 1, len(entries))):
+        if not entries[j].get("gap") and entries[j].get("path"):
+            return source_colour(entries[j]["path"])
+    return COLOUR_BT709
 
 
 def _gap_size(entries):
@@ -774,12 +787,61 @@ class _Progress:
             _LOG.debug("obvpm.h3: progress sink failed", exc_info=True)
 
 
+# ONE build of a given preview file at a time. Each request runs in its
+# own worker thread, and two builds of one file used to interleave: the
+# video of one could land with the other's cache key in the meta beside
+# it (so a later request was served the wrong cut as "cached"), and the
+# same expensive build ran once per overlapping request. Under the lock
+# the cache is checked again, so a request that waited for an identical
+# build just gets its result.
+#
+# The lock lives in this process only: a crash or restart takes it with
+# it, and `with`/finally releases it on any error. A build that never
+# finishes (a hung encoder) is the one way to hold it forever, so waiting
+# is bounded -- past BUILD_LOCK_WAIT a request builds anyway, on its own
+# temp file, and says so.
+BUILD_LOCK_WAIT = 300.0
+_BUILD_LOCKS = {}
+_BUILD_LOCKS_GUARD = threading.Lock()
+
+
+def _build_lock(path):
+    key = os.path.normcase(os.path.abspath(path))
+    with _BUILD_LOCKS_GUARD:
+        return _BUILD_LOCKS.setdefault(key, threading.Lock())
+
+
 def build_preview(sequence, crf, probe=False, base_folder="",
-                  preview_filename=None, level_lock=True,
-                  level_lock_frames=levellock.FRAMES,
-                  level_lock_flicker=True, crossfade=True,
-                  crossfade_frames=0, audio_declick=True,
-                  on_progress=None, level_lock_local=True):
+                  preview_filename=None, **opts):
+    """Returns (filename, subfolder, starts, total, cached, key).
+
+    See _build_preview. Serialised per output file (see _build_lock);
+    a probe only reads, so it never waits.
+    """
+    if probe:
+        return _build_preview(sequence, crf, True, base_folder,
+                              preview_filename, **opts)
+    out_path = _preview_paths(base_folder, preview_filename)[0]
+    lock = _build_lock(out_path)
+    got = lock.acquire(timeout=BUILD_LOCK_WAIT)
+    if not got:
+        _LOG.warning("obvpm.h3: %s has been building for over %ds; "
+                     "building this request alongside it",
+                     os.path.basename(out_path), int(BUILD_LOCK_WAIT))
+    try:
+        return _build_preview(sequence, crf, False, base_folder,
+                              preview_filename, **opts)
+    finally:
+        if got:
+            lock.release()
+
+
+def _build_preview(sequence, crf, probe=False, base_folder="",
+                   preview_filename=None, level_lock=True,
+                   level_lock_frames=levellock.FRAMES,
+                   level_lock_flicker=True, crossfade=True,
+                   crossfade_frames=0, audio_declick=True,
+                   on_progress=None, level_lock_local=True):
     """Returns (filename, subfolder, starts, total, cached, key).
 
     One file per node at output/<base_folder>/<preview_filename>.mp4,
@@ -880,7 +942,17 @@ def build_preview(sequence, crf, probe=False, base_folder="",
         lo_s = round(e["enter"] / fr.FPS * sample_rate)
         hi_s = round(hi / fr.FPS * sample_rate)
         wav = a["waveform"]
-        part = wav[..., lo_s:min(hi_s, wav.shape[-1])]
+        # A take saved before its sound was cut on its own frames still
+        # plays it a third of a step off them (its pin window started
+        # between two audio steps): cut it here instead, from its recipe.
+        # Newer files are synced already (nodes_pins: audio phase).
+        header = e.get("header")
+        shift = (0 if nodes_pins.header_audio_synced(header)
+                 else nodes_pins.phase_samples(
+                     nodes_pins.header_audio_phase(header), sample_rate))
+        part = (nodes_pins.shifted_samples(
+                    wav, lo_s - shift, min(hi_s, wav.shape[-1]) - shift)
+                if shift else wav[..., lo_s:min(hi_s, wav.shape[-1])])
         # sound gets the same handover the picture does: the fade runs
         # over the same span, so a level change and a timbre change
         # arrive together instead of a frame apart
@@ -946,7 +1018,18 @@ def build_preview(sequence, crf, probe=False, base_folder="",
         audio = {"waveform": torch.cat(filled, dim=-1),
                  "sample_rate": sample_rate}
 
-    tmp = out_path + ".tmp.mp4"
+    # A temp name of this build's OWN. It used to be out_path + ".tmp.mp4",
+    # shared by every build of the same preview: two of them running at
+    # once (the Result Preview's take and upscale previews once wrote the
+    # same file, and a repeat request can overlap its predecessor) wrote
+    # one temp file, the first renamed it away, and the second's rename
+    # failed with FileNotFoundError. build_preview also serialises builds
+    # of one file now; the unique name keeps a build that outwaited that
+    # lock from colliding anyway.
+    fd, tmp = tempfile.mkstemp(
+        prefix=os.path.basename(out_path) + ".", suffix=".tmp.mp4",
+        dir=os.path.dirname(out_path))
+    os.close(fd)
     try:
         with tempfile.TemporaryDirectory() as btd:
             pieces = []
@@ -976,7 +1059,7 @@ def build_preview(sequence, crf, probe=False, base_folder="",
                     bp = os.path.join(btd, "gap_%d.mp4" % i)
                     H3SaveVideoWithMCtx._encode_mp4(
                         bp, torch.zeros(int(e["gap"]), gap_h, gap_w, 3),
-                        None, crf)
+                        None, crf, colour=_neighbour_colour(entries, i))
                     pieces.append({"path": bp, "from": 0,
                                    "to": int(e["gap"])})
                     prog.step(prog.WORK, "building empty space")
@@ -1059,15 +1142,20 @@ def build_preview(sequence, crf, probe=False, base_folder="",
                     # _mux_pieces refuses the whole splice. See
                     # nodes_assemble.source_crf.
                     bcrf = na.source_crf(e["path"], crf)
+                    # ...and the clip's colour handling, for the same
+                    # reason: the tags are extradata too
+                    bcol = source_colour(e["path"])
                     if planes is not None:
                         # straight from planes to the encoder: nothing to
                         # compensate, because nothing was converted
-                        yuv.encode(bp, yuv.slice_planes(planes, a, b), bcrf)
+                        yuv.encode(bp, yuv.slice_planes(planes, a, b), bcrf,
+                                   colour=bcol)
                     else:
                         if imgs is None:  # decode only clips that bridge
                             imgs = _decode_images(e["path"])
                         H3SaveVideoWithMCtx._encode_mp4(
-                            bp, compensate(imgs[a:b]), None, bcrf)
+                            bp, compensate(imgs[a:b]), None, bcrf,
+                            colour=bcol)
                     pieces.append({"path": bp, "from": 0, "to": b - a})
                 prog.step(prog.WORK, work % _short(e))
             prog.emit("assembling")
@@ -1110,6 +1198,14 @@ def build_preview(sequence, crf, probe=False, base_folder="",
         H3SaveVideoWithMCtx._encode_mp4(
             out_path, torch.cat(frames, dim=0), audio, crf)
         prog.step(1.0, "assembling")
+    finally:
+        # a build that failed part-way leaves its own temp file behind
+        # otherwise; a finished one has already renamed it into place
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump({"key": key, "starts": starts, "total": total}, f)
     return name, sub, starts, total, True, key
@@ -1151,19 +1247,28 @@ def export_cut(sequence, crf, base_folder, preview_filename,
     land in base_folder under export_filename_prefix with the usual
     counter.
     """
-    name, sub, _, _, cached, _ = build_preview(
-        sequence, crf, probe=False, base_folder=base_folder,
-        preview_filename=preview_filename, **fixes)
-    src = os.path.join(folder_paths.get_output_directory(), sub, name)
-    prefix = str(export_filename_prefix or "full").strip().strip("/")
-    folder = folder_text(base_folder)
-    if folder:
-        prefix = "%s/%s" % (folder, prefix)
-    full_folder, base, counter, subfolder, _ = folder_paths.get_save_image_path(
-        prefix, folder_paths.get_output_directory())
-    out_name = "%s_%05d.mp4" % (base, counter)
-    out_path = os.path.join(full_folder, out_name)
-    shutil.copy2(src, out_path)
+    # Built AND copied under the preview's build lock: released in
+    # between, another request could replace the file mid-copy.
+    lock = _build_lock(_preview_paths(base_folder, preview_filename)[0])
+    got = lock.acquire(timeout=BUILD_LOCK_WAIT)
+    try:
+        name, sub, _, _, cached, _ = _build_preview(
+            sequence, crf, probe=False, base_folder=base_folder,
+            preview_filename=preview_filename, **fixes)
+        src = os.path.join(folder_paths.get_output_directory(), sub, name)
+        prefix = str(export_filename_prefix or "full").strip().strip("/")
+        folder = folder_text(base_folder)
+        if folder:
+            prefix = "%s/%s" % (folder, prefix)
+        full_folder, base, counter, subfolder, _ = \
+            folder_paths.get_save_image_path(
+                prefix, folder_paths.get_output_directory())
+        out_name = "%s_%05d.mp4" % (base, counter)
+        out_path = os.path.join(full_folder, out_name)
+        shutil.copy2(src, out_path)
+    finally:
+        if got:
+            lock.release()
     rel = os.path.join(subfolder, out_name).replace(os.sep, "/").lstrip("/")
     _LOG.info("obvpm.h3: exported %s (%s)", rel,
               "promoted cached preview" if cached else "built fresh")
@@ -1404,6 +1509,21 @@ def register():
             _LOG.info("obvpm.h3: clip_meta failed: %s", exc)
             return web.json_response({"error": str(exc)}, status=400)
 
+    # A Result Preview opening with nothing from this session: the newest
+    # take its Save node writes (nodes_result.latest_result).
+    @PromptServer.instance.routes.post("/obvpm/h3/latest_result")
+    async def _latest_result(request):
+        import asyncio
+        from .nodes_result import latest_result
+        try:
+            data = await request.json()
+            found = await asyncio.to_thread(
+                latest_result, str(data.get("prefix", "")))
+            return web.json_response({"result": found})
+        except Exception as exc:
+            _LOG.info("obvpm.h3: latest_result failed: %s", exc)
+            return web.json_response({"error": str(exc)}, status=400)
+
     @PromptServer.instance.routes.post("/obvpm/h3/delete_take")
     async def _delete_take(request):
         import asyncio
@@ -1483,7 +1603,8 @@ def register():
 
     _LOG.info("obvpm.h3: preview/export/delete/workflow routes registered "
               "(/obvpm/h3/preview_cut, /obvpm/h3/export, "
-              "/obvpm/h3/delete_take, /obvpm/h3/video_workflow, "
+              "/obvpm/h3/delete_take, /obvpm/h3/latest_result, "
+              "/obvpm/h3/video_workflow, "
               "/obvpm/h3/seam_levels, /obvpm/h3/clip_meta, "
               "/obvpm/h3/list_folders, /obvpm/h3/ensure_folder, "
               "/obvpm/h3/timeline_state)")

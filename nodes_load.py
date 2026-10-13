@@ -34,10 +34,24 @@ def resolve_clip_path(clip):
 
     The Timeline's source arrives as serialized widget text, so traversal
     is guarded HERE, once, rather than at each caller.
+
+    Confined by the path AS WRITTEN, like core ComfyUI's /view and the
+    rest of this pack (saving, the result preview, the hunt): `..`,
+    absolute and drive paths cannot leave the output folder, but a
+    symlink or Windows junction INSIDE it is followed wherever it points.
+    Only someone with the machine's files can put one there, and a
+    project folder linked to another drive is exactly what it is for.
+    (This used to resolve links first, so takes saved into such a folder
+    -- saving checked the path as written -- were listed and then
+    refused as "escaping" when extended, loaded or upscaled.)
     """
-    root = os.path.realpath(folder_paths.get_output_directory())
-    path = os.path.realpath(os.path.join(root, clip))
-    if os.path.commonprefix([path, root + os.sep]) != root + os.sep:
+    root = os.path.abspath(folder_paths.get_output_directory())
+    path = os.path.abspath(os.path.join(root, str(clip)))
+    try:
+        inside = path != root and os.path.commonpath([root, path]) == root
+    except ValueError:              # another drive
+        inside = False
+    if not inside:
         raise ValueError(
             "obvpm.h3: %s escapes the output folder; clips are "
             "output-relative paths only." % clip)
@@ -153,6 +167,7 @@ def _create_pins(bundle, clip, create_pins, pin_window, at_frame=None,
             "(encoded, so pixel-grade rather than exact)."
             % (create_pins, clip))
     take_from, place = mode
+    prepend = take_from == "head"
 
     # Continuation clips have off-grid edges: a pinned head pushes the
     # delivered content 5 past a group boundary (prepend case), a pinned
@@ -164,6 +179,7 @@ def _create_pins(bundle, clip, create_pins, pin_window, at_frame=None,
     # extra bookkeeping.
     meta = bundle["meta"]
     ph = int(meta.get("pinned_head_frames", 0) or 0)
+    pt = int(meta.get("pinned_tail_frames", 0) or 0)
     delivered = int(meta.get("delivered_frames", 0) or 0)
     w = int(pin_window)
     if at_frame is None:
@@ -173,14 +189,25 @@ def _create_pins(bundle, clip, create_pins, pin_window, at_frame=None,
         end = cut + w if take_from == "head" else cut
     off = (ph + end - w) % fr.FRAMES_PER_GROUP
     take_from_frame = 0
+    # The room is the take's whole stored latent, not only what it
+    # delivered: a take made by extending another one keeps the frames it
+    # held from that clip (its pinned head), a take made by prepending
+    # keeps the ones it led into (its pinned tail). A window may reach
+    # into them -- a very short take, or a cut close to its start, can
+    # still be continued -- and the join does not move: the new take
+    # still starts at the cut. (A window that needs no shifting is left
+    # to Apply Pins, which may snap it down to what there is.)
     if off:
         if take_from == "head":
             end += fr.FRAMES_PER_GROUP - off
-            if end > delivered:
+            if end > delivered + pt:
                 raise ValueError(
                     "create_pins: %s is too short to prepend to -- the "
                     "first latent-grade window ends at frame %d but only "
-                    "%d frames were delivered." % (clip, end, delivered))
+                    "%d frames were delivered%s." % (
+                        clip, end, delivered,
+                        " (+%d held from the clip it leads into)" % pt
+                        if pt else ""))
             skip = end - w
             _LOG.info(
                 "obvpm.h3: %s: head sits off the latent grid (continuation "
@@ -189,11 +216,13 @@ def _create_pins(bundle, clip, create_pins, pin_window, at_frame=None,
                 "new + this[%d:].", clip, end, skip, skip)
         else:
             end -= off
-            if end < w:
+            if ph + end < w:
                 raise ValueError(
                     "create_pins: %s is too short to extend -- no "
-                    "latent-grade %d-frame window fits before frame %d."
-                    % (clip, w, delivered))
+                    "latent-grade %d-frame window fits before frame %d%s."
+                    % (clip, w, delivered,
+                       " (even reaching %d frames back into the clip it "
+                       "continues)" % ph if ph else ""))
             _LOG.info(
                 "obvpm.h3: %s: tail sits off the latent grid (pinned-tail "
                 "clip); extend window shifted to end at frame %d, skipping "
@@ -201,6 +230,17 @@ def _create_pins(bundle, clip, create_pins, pin_window, at_frame=None,
                 "frame %d -- assemble as this[:%d] + new.",
                 clip, end, off, end, end)
         take_from, take_from_frame = "at_frame", end
+    if prepend and end > delivered:
+        _LOG.info(
+            "obvpm.h3: %s: the %d-frame prepend window reaches %d frames "
+            "into the clip this one leads into (its held tail).",
+            clip, w, end - delivered)
+    if not prepend and 0 <= end < w <= ph + end:
+        _LOG.info(
+            "obvpm.h3: %s: the %d-frame extend window reaches %d frames "
+            "back into the clip this one continues (its held head); the "
+            "new take still continues from frame %d.",
+            clip, w, w - end, end)
 
     # An explicit cut must be honoured whether or not it needed shifting.
     # This used to sit inside the `if off:` branch, so a cut that was
@@ -216,6 +256,78 @@ def _create_pins(bundle, clip, create_pins, pin_window, at_frame=None,
         take_from_frame=take_from_frame, place=place, place_at_frame=0,
         audio_window=0, mode=pin_mode, mask_ramp_frames=ramp,
         mask_ramp_edge=edge, mask_hold=hold)
+    return specs
+
+
+def prepend_end(meta, pin_window, at_frame=None):
+    """Where a prepend's window ENDS in the clip's delivered frames: `w`
+    on from the cut (or the clip's head), after the shift onto the
+    latent grid _create_pins applies. Past the frames the clip holds
+    (delivered + pinned tail), the clip alone cannot supply it."""
+    ph = int(meta.get("pinned_head_frames", 0) or 0)
+    w = int(pin_window)
+    end = (0 if at_frame is None else int(at_frame)) + w
+    off = (ph + end - w) % fr.FRAMES_PER_GROUP
+    return end + (fr.FRAMES_PER_GROUP - off if off else 0)
+
+
+def prepend_through(bundle, next_bundle, next_clip, create_pins,
+                    pin_window, at_frame=None, pin_mode="masked",
+                    mask_shape=None):
+    """A prepend whose window runs past the end of `bundle`'s clip, taken
+    from the take that continues it -- or None when `next_bundle` is no
+    such take or does not hold the window.
+
+    The take after a clip on the timeline, when it extends that clip,
+    stores the clip's frames it continued from (its held head) and then
+    its own: one continuous latent, identical to the clip's own over the
+    held part. So a prepend at a cut close to the clip's end slices the
+    window from there -- the clip's frames up to the take's join, then
+    the take's -- which is exactly what the timeline plays after the
+    cut. The specs are the take's, marked `via` the clip: Apply slices
+    the take and records the pin as the clip's (nodes_pins._seen_from),
+    so the new take leads into the clip at the cut, as asked, and every
+    reader of its recipe finds the clip it visibly leads into.
+    """
+    meta, nmeta = bundle["meta"], next_bundle["meta"]
+    befores = [s for s in mctx.parse_pins(nmeta)
+               if s.get("place") == "before"
+               and s.get("source_kind") == "clip"
+               and s.get("source_id") == bundle.get("self_id")]
+    if len(befores) != 1:
+        return None
+    p = befores[0]
+    s = int(p.get("source_start", 0) or 0)
+    ph, nph = (int(m.get("pinned_head_frames", 0) or 0)
+               for m in (meta, nmeta))
+    # the take's raw frame r is the clip's raw frame s + r
+    cut_raw = (0 if at_frame is None else int(at_frame)) + ph
+    if cut_raw < s:
+        return None             # starts before what the take holds
+    try:
+        specs = _create_pins(next_bundle, next_clip, create_pins, pin_window,
+                             at_frame=cut_raw - s - nph, pin_mode=pin_mode,
+                             mask_shape=mask_shape)
+    except ValueError:
+        return None
+    a0 = p.get("audio_start_step")
+    via = {"source_id": bundle.get("self_id", ""),
+           # the take's raw frames -> the clip's raw frames
+           "raw_offset": s,
+           # the take's FILE frames -> the clip's (a pixel pin reads the
+           # file): its delivered frame 0 is its raw nph
+           "file_offset": s + nph - ph,
+           # the take's audio steps -> the clip's (its held sound starts
+           # on the clip's step a0); unknown for an older take
+           "audio_offset": None if a0 is None else int(a0),
+           "source_path": (str(bundle["clip"]).replace("\\", "/")
+                           if bundle.get("clip") else "")}
+    for spec in specs:
+        spec["via"] = via
+    _LOG.info("obvpm.h3: the prepend window runs past the end of %s; it "
+              "is taken from %s, which continues it (the clip's frames up "
+              "to their join, then its own)",
+              bundle.get("clip") or bundle.get("self_id", "")[:12], next_clip)
     return specs
 
 
@@ -294,20 +406,49 @@ _HASH_CACHE = {}
 
 
 def _list_clips():
-    """Video files under the output folder, relative paths, depth-limited."""
+    """Video files under the output folder, relative paths, depth-limited.
+
+    Linked folders (symlinks, Windows junctions) are walked like real
+    ones -- see resolve_clip_path -- unless the real folder they lead to
+    was already walked, so a link pointing back up the tree neither
+    loops nor lists the same clips again. Real folders are always walked:
+    a link never takes a folder's place in the list.
+    """
     root = folder_paths.get_output_directory()
     out = []
-    for dirpath, dirnames, filenames in os.walk(root):
+    seen = {os.path.normcase(os.path.realpath(root))}
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
         rel = os.path.relpath(dirpath, root)
         depth = 0 if rel == "." else rel.count(os.sep) + 1
         if depth >= _SCAN_DEPTH:
             dirnames[:] = []
+        dirnames[:] = _walkable(seen, dirpath, dirnames)
         for f in filenames:
             if f.lower().endswith(_VIDEO_EXTS):
                 p = f if rel == "." else os.path.join(rel, f)
                 out.append(p.replace(os.sep, "/"))
     out.sort()
     return out
+
+
+def _walkable(seen, dirpath, names):
+    """The subfolders of `dirpath` a walk should enter: every real one
+    (marked in `seen`), then each link whose real folder is not marked
+    yet. `seen` holds normcased real paths."""
+    here = os.path.realpath(dirpath)
+    plain, links = [], []
+    for name in names:
+        real = os.path.normcase(os.path.realpath(os.path.join(dirpath, name)))
+        if real == os.path.normcase(os.path.join(here, name)):
+            plain.append(name)
+            seen.add(real)
+        else:
+            links.append((name, real))
+    for name, real in links:
+        if real not in seen:
+            seen.add(real)
+            plain.append(name)
+    return plain
 
 
 def _cached_hash(path):

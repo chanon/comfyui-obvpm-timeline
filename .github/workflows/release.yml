@@ -18,7 +18,7 @@ on:
         description: "Existing tag to release, e.g. v0.2.1 (runs this workflow from the chosen branch, for tags that predate it)"
         required: true
       allow_missing_notes:
-        description: "Release even if README.md has no section for this version"
+        description: "Release even if CHANGELOG.md has no section for this version"
         type: boolean
         default: false
 

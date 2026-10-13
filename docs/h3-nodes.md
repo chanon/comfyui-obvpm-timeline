@@ -15,6 +15,7 @@ Pinning · [H3 MCtx Pin Spec](#h3-mctx-pin-spec) ·
 [H3 MCtx Trim Pinned](#h3-mctx-trim-pinned)
 Composing · [H3 MCtx Timeline](#h3-mctx-timeline) ·
 [H3 MCtx Result Preview](#h3-mctx-result-preview) ·
+[H3 Live Preview](#h3-live-preview) ·
 [H3 MCtx Assemble](#h3-mctx-assemble)
 Refining · [The joint refine](#the-joint-refine) ·
 [H3 Join Latents](#h3-join-latents) ·
@@ -201,6 +202,29 @@ H3 keyframe anchors.
 Outputs: `conditioning` (feed the guider/sampler), `pins` (the resolved
 slices — feed Trim / Save so they record what actually happened).
 
+**Audio phase.** Audio steps (40 Hz) and frames (24 fps) meet only every
+third frame, so a pin window that starts between two steps -- from a
+clip whose length is not a multiple of 3 (124, 362, ... frames), or a
+cut that is not -- is sliced from an audio step, and the take's sound
+sits up to half a step (by a third: 8.3 ms) off its own frames: its
+*audio phase*. The step is the one nearest the window's first frame in
+true time, the source's own phase included, so a phase never grows
+along a chain however many such windows it goes through. The latents
+keep it: the take's sound stays on its parent's audio grid, and the
+joint upscale lays a pinned clip's sound by that lineage -- the parent's
+first step plus the step the slice took (recorded as
+`audio_start_step`) -- so every junction in the upscale continues the
+parent's sound exactly. Where sound meets
+frames it is made up instead: H3 Trim Pinned cuts the delivered sound
+that much earlier or later (the log says so), the crossfade overlap
+likewise, and the sidecar records `audio_phase` and `audio_synced`, so
+the MP4 plays in sync and every preview and export built from MP4s
+joins without the 8.3 ms skip. Takes saved before this are corrected
+the same way when a preview or export is built, from their recipe.
+Measured on a real extend of a
+124-frame clip: the join as the preview plays it moved from 267 samples
+(8.3 ms) off to 0; the upscale's join was and stays at 0.
+
 Accepts at most **one pin per side**: one `before`, one `after`, or one
 of each (bridging). Refuses when the pinned frames leave no room for
 generated content, when a source's resolution differs from the
@@ -210,6 +234,33 @@ continuation mechanisms cannot coexist in one session).
 Pins are **appended** to any keyframe anchors already on the
 conditioning, so combinations like extend-toward-image (a before-pin
 plus a stock last-frame keyframe) are legal.
+
+**Very short takes.** A window is taken from the source's whole stored
+latent, not only from what it delivered. A take made by extending
+another clip keeps the frames it held from that clip ahead of its own
+(its pinned head: 35 + 33 = 68 raw frames for a 33-frame take), so a
+39-frame window ending at its end reaches 18 frames back into them and
+still fits; a take made by prepending likewise keeps the frames it led
+into (its pinned tail), which a prepend's window may run on into. They
+are the take's own latents, identical to the clip it continues there,
+so nothing about the join changes: the new take still starts at the
+cut. A root (no held frames) shorter than the window is refused as
+before. A pin from the take's pixels (`clip_pixels`, VAE-encoded from
+its file) has only the take's file, which holds just the delivered
+frames; there the frames before them are read from the file of the
+clip it continues, and a prepend's frames after them from the file of
+the clip it leads into (each found as the Result Preview finds it),
+and the window is refused if that file is gone.
+
+**A prepend close to a clip's end.** A prepend's window starts at the
+cut and runs on; from a cut close to the clip's end it runs past it.
+When the next line on the timeline is a take that extends this clip,
+the Timeline takes the window from that take instead: it stores this
+clip's frames up to their join (its held head, the very same latents)
+and then its own, which is exactly what plays after the cut. The pin is
+still recorded as this clip's -- the new take leads into it at the cut
+-- with its window simply running on past the clip's end. Without such
+a take the Timeline refuses, saying how many frames are left.
 
 **Pins from clips with no sidecar.** When a spec names a file instead of
 carrying latents (`source_kind: clip_pixels` — what the Timeline emits
@@ -273,9 +324,32 @@ export). The node itself:
 
 Outputs: `pin_specs`, `length`, `sequence`, `upscaling`.
 
+**Decode edges.** H3's video decoder draws the first 5 and last 4 frames
+of a file with nothing before or after them, so they come out slightly
+different from the same moment decoded mid-file. A masked window holds
+the older clip's latents verbatim, so the newer take decoded exactly those
+moments in the middle of its own file. Its pins therefore record
+`handover_edge`: a window held hard up to the join hands over one latent
+step inside it -- the extend delivers the last 4 frames of its window and
+the parent exits 4 frames short of its end; a hard-held arrival delivers
+the first 5 and the target enters at frame 5. Held frames decode
+identically everywhere else, so this changes nothing but those edge frames.
+Older takes (no flag) keep their join, and the joint render lays out the
+same latent line either way.
+
 **Switching branches.** A workflow that can both generate a take and
 refine the timeline holds two branches that must never run together.
-Put a **Mute If** gate (comfyui-obvpm) on the last wire before each
+Put each branch in its own group with a **Mute Group If** node
+(comfyui-obvpm) inside it, its `mute` wired from `upscaling`: `invert`
+off in the generation groups (muted while upscaling), on in the refine
+group (muted while generating). The muted half is left out of the Run
+entirely -- its loaders, image composes and samplers never start -- and
+shows greyed; shared work (model loading, settings, the inputs, the
+previews) belongs outside those groups. The `upscaling` output is known
+before a Run, which is what Mute Group If needs.
+
+The gates below still work, alone or as a safety net beside the
+groups. Put a **Mute If** gate (comfyui-obvpm) on the last wire before each
 branch's own work begins and drive both from `upscaling`: the
 generation branch's gate on `length` → MiniMax H3 Reference to Video,
 muted when `upscaling` is true; the refine branch's gate on `sequence`
@@ -363,7 +437,9 @@ Load.
 ## H3 MCtx Result Preview
 
 Mini timeline of a just-saved take in its lineage context. Wire a Save
-node's `path` output to the `path` input; after each run the widget
+node's `path` output to the `path` input (optional: while the Save node
+is muted for a Run, nothing arrives and the preview keeps what it
+shows); after each run the widget
 shows the take beside its parent (extend), its target (prepend), or
 between both (bridge), playable as one seamless preview.
 
@@ -373,20 +449,61 @@ the join computed from the take's own latents, rated `seamless` /
 timeline is involved. Buttons: **+ add to timeline** (shown when a
 Timeline node matching the clip's folder exists; inserts at the
 lineage-derived position), **✕ delete** (removes the take's MP4 and
-sidecar from disk, after confirmation), **dismiss** (hides the
-buttons). A decision sticks to its take: once added or dismissed, that
-take never asks again, through reloads and workflow switches. A cut
+sidecar from disk, after confirmation), **dismiss** (clears the result
+from the preview; the take stays on disk; offered for any result on
+screen, added or not). A decision sticks to its take: once added,
+that take never asks again, and once dismissed it is not shown again,
+through reloads and workflow switches. A cut
 from H3 Joint VAE Decode and Save is the finished product, so the
 preview offers delete and dismiss for it but not add to timeline.
 
-**Live preview while sampling.** With KJNodes' Model Preview Override
-on the sampler's model, the frames it pushes each step are shown in
-this panel too, in the box the result takes over when the take lands,
-with the step count on the status line. That node can then be
-collapsed: it stays the place where the preview's frame count and
-resolution are set, but nothing needs to be looked at there. Only the
-run this preview owns is shown, and without the KJ node the panel
-behaves exactly as before.
+**The player bar.** The take plays with a bar of its own below the
+picture, not the browser's controls over the bottom of the frame: play /
+pause, frame step, seek, time, sound with a volume slider, loop and
+fullscreen. Click the picture to play or pause, double click for
+fullscreen (the bar then lies over the picture and slides away while the
+mouse rests), and scroll sideways over the picture or the bar to step
+along it. Space plays or pauses the preview under the mouse, or the
+selected one. A take a Run just made starts playing by itself; a take
+shown again when the workflow opens is shown paused at its start. Sound,
+volume and loop are remembered in this browser.
+
+**Live preview while sampling.** With [H3 Live Preview](#h3-live-preview)
+(or KJNodes' Model Preview Override) on the sampler's model, the clip it
+sends each step is shown in this panel, in the box the result takes over
+when the take lands, with the step count on the status line. Each step
+replaces the last without starting it over, and the same bar plays it:
+the whole clip can be watched, paused, seeked and looped while the Run
+samples. Only the sampler of this preview's own branch is shown -- an
+upscale branch in the same workflow is not its run. To go without the
+live picture, take that node off the model; without it the panel behaves
+exactly as before.
+
+## H3 Live Preview
+
+The sampler's picture while it samples, in the Result Preview. Put it on
+the model the sampler uses (model in, model out); every sampling pass of
+that model sends each step as a short clip.
+
+The clip is on the **take's own timeline**: each latent step's picture is
+held for exactly the frames that step covers (H3 codes 17 frames in 5
+steps), so a 5 s take's preview is 5 s at 24 fps -- there is no frame rate
+to set. It shows the **whole latent**, the pinned frames at the ends
+included: the parent's frames at the head of an extend, the target's at
+the tail of a prepend. That is where a seam is made, so a bad join can be
+seen while it is being made. How many frames are pinned comes from the
+pins H3 MCtx Apply Pins prepared -- nothing to wire.
+
+| Input | Type | Notes |
+|---|---|---|
+| `model` | MODEL | the model the sampler uses |
+| `tiny_vae` | combo | the decoder, from `models/vae_approx`: a tiny VAE for H3 (`taeh3`) -- [madebyollin's temporal one](https://github.com/madebyollin/taehv/tree/main/safetensors) shows every frame and is both closer to the take and quicker; [Kijai's 2D one](https://huggingface.co/Kijai/MiniMax-H3-TAE) shows a picture per latent step, held for the frames it covers. Both are published as `taeh3.safetensors`: which one a file is comes from its layers, so the name does not matter. Or the latent's own colours (coarse, no file needed) |
+| `max_size` | INT | the preview's long side in pixels (640). Smaller is quicker to encode and send |
+
+Encoded as H.264 on the CPU, on a thread of its own: sampling never waits
+for it, and a step that arrives while the last one is still encoding
+replaces it. It takes the place of KJNodes' Model Preview Override, which
+the Result Preview still shows when that is what is in the graph.
 
 ## H3 MCtx Assemble
 
@@ -474,8 +591,36 @@ in the child's sidecar, the child from it on. A held head therefore
 stays the parent's rows and a cut-away tail never enters the joint.
 Every clip's copy of rows it does not own is compared and logged; a
 masked hard hold must match to the bit, and a difference there is
-warned about as a placement error. A timeline with a gap between
-clips is refused.
+warned about as a placement error.
+
+**Segments.** A joint latent is one continuous piece of film, which is
+right for clips joined by a seamless (green) seam and wrong across a
+hard cut. So the cut is split into **segments** at every join that is
+not a lineage link as the cut plays it: two unrelated clips (a gray
+seam), empty space (`~ N`), and a green seam whose frame was moved by a
+hand cut (that is a jump cut; before, the take was placed by its pin
+and the hand cut was silently ignored). Each segment becomes its own
+latent: the outputs are **lists**, one entry per segment, and ComfyUI
+runs every node after this one — the upscaler, the sampler and
+everything between — once per segment. The upscaler therefore never
+sees two scenes at once, and no sampling window spans a cut. A cut with
+no hard cuts is a list of one.
+
+**Cropped to the cut.** Each segment is cropped to the frames the cut
+shows of it — its first clip's enter to its last clip's exit — plus at
+least one 17-frame cycle of context each side. The crop starts on a
+51-frame boundary (51 frames are exactly 85 audio ticks, so every tick
+stays a whole number) and is clip-shaped (5k+2 latent steps). A take
+trimmed to a few seconds is no longer upscaled and refined whole, and
+the render keeps exactly the shown frames, the last clip's cut
+included. A clip's span may start before the crop or end after it; the
+rows outside are simply not in the latent.
+
+A **looping** cut in one piece keeps the whole joint (the loop take's
+tail is context for the wrap tie, see [H3 Context
+Windowing](#h3-context-windowing)) and the render crops to the wrap. A
+looping cut that also has hard cuts or empty space renders its wrap as
+a cut, untied, and says so.
 
 Measured 2026-09-07 (joint_all2): placing clips by the cut alone put
 clip 7 34 frames after its pin (held head rel diff 1.25) and let clip
@@ -486,9 +631,11 @@ first seam and four seconds of the wrong clip under the right audio.
 |---|---|---|
 | `sequence` | STRING | the timeline text — the Timeline's `sequence` output through the upscale gate |
 
-Outputs: `latent` (the joint raw AV latent, for the upscaler), `layout`
-(where each clip sits, for Joint Conditioning and Joint VAE Decode and Save). The
-layout is logged when the node runs.
+Outputs, one entry per segment: `latent` (the segment's joint raw AV
+latent, for the upscaler), `layout` (where each clip sits on it, the
+frames the render keeps, and any empty space before or after the
+segment, for Joint Conditioning and Joint VAE Decode and Save). Each
+segment's layout is logged when the node runs.
 
 ## H3 Joint Conditioning
 
@@ -530,6 +677,12 @@ re-renders sound that is already finished.
 | `audio_denoise` | FLOAT | `0` keeps the audio exactly. `~0.5` re-samples it alongside the picture (the model re-derives lip sync from it); render the **source** audio then — wire H3 Join Latents' `latent` to H3 Joint VAE Decode and Save's `source_audio` |
 
 Wire the sampler's `latent_image` from here.
+
+It also refuses the Run, before the refine samples anything, when the
+latent upscaler feeding it (MinimaxH3LatentUpscaler3D) has
+`enable_temporal_chunking` off: upscaling without it was seen inventing
+details the clip never had, which the refine then keeps. Turn it on in
+the upscaler and run again.
 
 ## H3 Context Windowing
 
@@ -640,6 +793,23 @@ under. The rendered cut is therefore a take: put it on a timeline by
 itself and the same upscale branch refines it again (4x from the
 sources), with H3 Joint Conditioning splicing its stored table back in.
 
+The node takes the **whole list** of segments in one call
+(`INPUT_IS_LIST`). Only the frames the cut shows are kept (the layout's
+`keep_frames`; the sidecar records the rest as head and tail, so raw and
+delivered frames keep their usual relation). A cut in one segment is
+written exactly as before, as `<prefix>_NNNNN.mp4`. A cut in several
+segments, or with empty space around it, is written as one take per
+segment — `<prefix>_NNNNN_s01.mp4`, `_s02`, …, each with its own
+sidecar and `.cond`, each refinable again on its own — and then
+**joined** into `<prefix>_NNNNN.mp4`: the picture is copied packet for
+packet (every segment comes from the same encoder settings), empty space
+is black, and the sound is encoded once for the whole cut, with each
+hard cut tapered on both sides like the timeline export's audio
+de-click (a `[audio_declick=off]` on the line after the cut turns that
+off). The joined file is a plain video with no sidecar — its segments
+are the takes. If the pieces will not splice, the joined cut is decoded
+and encoded again instead, and the log says so.
+
 | Input | Type | Notes |
 |---|---|---|
 | `samples` | LATENT | the sampler's output |
@@ -652,8 +822,9 @@ sources), with H3 Joint Conditioning splicing its stored table back in.
 | `layout` | JOINT (optional) | from Join Latents: the source clips and sequence lines are recorded in the sidecar, and a latent that is not that timeline is refused |
 | `source_audio` | LATENT (optional) | an AV latent whose **audio** is rendered instead of the sampled one — wire Join Latents' `latent` here when Audio Mask re-sampled the sound for lip sync. The sidecar stores the audio that was rendered |
 
-Output: `path`, the written MP4. Wire it to H3 MCtx Result Preview to
-watch the cut when the pass ends.
+Output: `path`, the finished MP4 (the joined file for a cut in several
+segments). Wire it to H3 MCtx Result Preview to watch the cut when the
+pass ends.
 
 **Decoded in windows, streamed to the encoder.** A timeline is long —
 1400 frames at 1920×1088 are 35 GB of float pixels — so the frames

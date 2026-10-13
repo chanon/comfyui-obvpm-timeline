@@ -164,8 +164,23 @@ def mask_profile(covered, steps, place, ramp_frames=0, edge=0.0, deep=0.0,
     return torch.tensor(vals, device=device, dtype=dtype)
 
 
-def handover_frames(covered, place, ramp_frames=0, edge=0.0, deep=0.0):
+def handover_frames(covered, place, ramp_frames=0, edge=0.0, deep=0.0,
+                    decode_edge=False):
     """Where responsibility for the pinned window changes hands.
+
+    `decode_edge` (a recipe's `handover_edge`, set on every latent-grade
+    masked/both pin since 2026-10-01): a window held HARD up to the join
+    hands over one step inside it instead of at its edge -- the last
+    latent step of a before-window (4 frames), the first two of an
+    after-window (5 frames). H3's video VAE draws a file's last step
+    with nothing after it and its first two with nothing before them,
+    so the older clip's frames there are its decode EDGE, while the take
+    decoded the very same latents mid-file. Every other held frame
+    decodes identically in both, so handing over earlier is invisible
+    except where it replaces those edge frames. Measured on a 1376x768
+    extend: two decodes of the window bit-identical except the parent's
+    last 4 frames (detail coherence 0.99 -> 0.84) and the child's first
+    5. Recorded per pin, so older takes keep the edge they were cut at.
 
     A ramped window is only PART scaffolding. The rows the ramp
     loosened were re-drawn by this take, and they were re-drawn to meet
@@ -240,8 +255,12 @@ def handover_frames(covered, place, ramp_frames=0, edge=0.0, deep=0.0):
         return 0 if place == "after" else covered
     starts = fr.step_offsets(steps)
     if place == "after":
+        if decode_edge and held[:2] == [0, 1] and steps > 2:
+            return int(starts[2])
         return int(starts[held[0]])
     ends = list(starts[1:]) + [covered]
+    if decode_edge and held[-1] == steps - 1 and steps > 1:
+        return int(starts[steps - 1])
     return int(ends[held[-1]])
 
 
@@ -450,7 +469,8 @@ def apply_masked_pins(latent, masked_pins, audio_feather_ticks=8,
             # is not part of the test -- but it IS part of the delivered
             # length the message quotes, which is what the user trims to.
             delivered = frame_count - covered + handover_frames(
-                covered, "after", ramp_frames, edge, deep)
+                covered, "after", ramp_frames, edge, deep,
+                decode_edge=bool((pin.get("spec") or {}).get("handover_edge")))
             if fr.audio_total(frame_count) != frame_count * fr.FRAME_RESCALE:
                 _LOG.warning(
                     "obvpm.h3: masked prepend into a %d frame run: that "
@@ -469,12 +489,9 @@ def apply_masked_pins(latent, masked_pins, audio_feather_ticks=8,
                     "/".join(str(SHARED_AV_GRID_BASE + SHARED_AV_GRID_STEP * k)
                              for k in range(5)))
 
-        if float(pin.get("overhang", 0.0)) and place == "before":
-            _LOG.warning(
-                "obvpm.h3: masked prefix audio carries the source's "
-                "clip-end overhang (~%.1f ms); for a bit-exact prefix use "
-                "a parent whose delivered length is on the 39/90/141 grid",
-                float(pin["overhang"]) * 1000.0 / fr.AUDIO_LATENT_FPS)
+        # (a held window whose sound starts between audio steps keeps it
+        # there; the take's file is cut on its frames instead -- see
+        # nodes_pins: audio phase)
         _LOG.info(
             "obvpm.h3: masked %s-pin preserved %d frames = %d video steps "
             "/ %d audio ticks of a %d frame target (%s-grade)",

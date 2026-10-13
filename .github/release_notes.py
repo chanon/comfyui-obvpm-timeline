@@ -1,11 +1,11 @@
-"""Release notes for a version tag, cut from the README's Updates section.
+"""Release notes for a version tag, cut from the node pack's CHANGELOG.md.
 
 Usage: python3 .github/release_notes.py v0.2.2 [--allow-missing]
 
 Prints the notes to stdout and, on GitHub Actions, writes `latest=true|false`
 to $GITHUB_OUTPUT. Fails when the tag does not match the version in
-pyproject.toml AT THE TAGGED COMMIT, or when README.md (as checked out) has
-no `### <version>` section -- unless --allow-missing, which stands in a short
+pyproject.toml AT THE TAGGED COMMIT, or when CHANGELOG.md (as checked out)
+has no `## <version>` section -- unless --allow-missing, which stands in a short
 line for versions that predate the changelog.
 """
 import os
@@ -33,15 +33,15 @@ def version_at(tag):
     return match.group(1)
 
 
-def readme_section(version):
-    with open("README.md", encoding="utf-8") as f:
+def changelog_section(version):
+    with open("CHANGELOG.md", encoding="utf-8") as f:
         lines = f.read().splitlines()
-    head = re.compile(r"^###\s+%s(\s|$)" % re.escape(version))
+    head = re.compile(r"^##\s+%s(\s|$)" % re.escape(version))
     for i, line in enumerate(lines):
         if head.match(line):
             body = []
             for rest in lines[i + 1:]:
-                if re.match(r"^#{1,3}\s", rest):
+                if re.match(r"^#{1,2}\s", rest):
                     break
                 body.append(rest)
             dated = re.search(r"\(([^)]+)\)", line)
@@ -70,10 +70,10 @@ def main():
     if tag != "v" + version:
         fail("tag %s does not match pyproject.toml version %s at that commit" % (tag, version))
 
-    body, dated = readme_section(version)
+    body, dated = changelog_section(version)
     if body is None:
         if not allow_missing:
-            fail("README.md has no '### %s' section; write the changelog first" % version)
+            fail("CHANGELOG.md has no '## %s' section; write the changelog first" % version)
         body = "No changelog was written for this version."
 
     url = repo_url()

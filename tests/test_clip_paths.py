@@ -201,6 +201,13 @@ class ResultPreviewFindsAParentElsewhere(OutputFolder):
         self.assertEqual(got["sequence"],
                          "elsewhere/clip_00001.mp4\nV_Project/clip_00002.mp4")
 
+    def test_nothing_wired_shows_nothing_new(self):
+        # the Save node feeding it is muted for this Run: no path arrives,
+        # and an empty ui sends no `executed`, so the preview keeps its take
+        self.assertIn("path", nodes_result.H3ResultPreview.INPUT_TYPES()["optional"])
+        self.assertEqual(nodes_result.H3ResultPreview().show(), {"ui": {}})
+        self.assertTrue(nodes_result.H3ResultPreview.IS_CHANGED())
+
     def test_without_a_recorded_path_it_is_not(self):
         # an older take (saved before the path was recorded)
         got = self.take("elsewhere/clip_00001.mp4", recorded=False)
@@ -221,6 +228,12 @@ class ResultPreviewFindsAParentElsewhere(OutputFolder):
     def test_same_folder_parent_still_found_without_a_path(self):
         got = self.take("V_Project/clip_00001.mp4", recorded=False)
         self.assertEqual(got["parent"], "V_Project/clip_00001.mp4")
+
+    def test_the_payload_carries_the_takes_file_time(self):
+        # by the server's clock, in ms: a cleared preview compares it
+        got = self.take("V_Project/clip_00001.mp4", recorded=False)
+        st = os.stat(os.path.join(self.root, "V_Project", "clip_00002.mp4"))
+        self.assertEqual(got["mtime_ms"], st.st_mtime_ns // 1_000_000)
 
 
 class BackslashFolders(OutputFolder):
@@ -248,6 +261,82 @@ class BackslashFolders(OutputFolder):
     def test_escape_is_still_refused(self):
         with self.assertRaises(ValueError):
             nodes_save._save_prefix("..\\..\\elsewhere", "clip")
+
+
+def _link_folder(link, target):
+    """A folder link: a Windows junction (no admin rights needed) or a
+    symlink. False when this host can make neither."""
+    if os.name == "nt":
+        import subprocess
+        subprocess.run(["cmd", "/c", "mklink", "/J", link, target], capture_output=True)
+        if os.path.isdir(link):
+            return True
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return True
+    except OSError:
+        return False
+
+
+class LinkedFolders(OutputFolder):
+    """A project folder inside output that is a link to another drive:
+    takes saved there must load, extend and upscale like any other (they
+    used to be listed, then refused as "escaping the output folder")."""
+
+    def setUp(self):
+        super().setUp()
+        self.elsewhere = tempfile.mkdtemp(prefix="obvpm_tl_elsewhere_")
+        with open(os.path.join(self.elsewhere, "clip_00001.mp4"), "wb") as f:
+            f.write(b"frames")
+        self.links = []
+        for link, target in ((os.path.join(self.root, "proj"), self.elsewhere),
+                             (os.path.join(self.elsewhere, "back"), self.root)):
+            if not _link_folder(link, target):
+                self.skipTest("this host can make no folder links")
+            self.links.append(link)
+
+    def tearDown(self):
+        for link in self.links:       # the link itself, never what it points at
+            os.rmdir(link)
+        shutil.rmtree(self.elsewhere, ignore_errors=True)
+        super().tearDown()
+
+    def test_a_take_in_a_linked_folder_resolves(self):
+        path = nodes_load.resolve_clip_path("proj/clip_00001.mp4")
+        self.assertTrue(os.path.isfile(path))
+        self.assertEqual(os.path.normcase(path), os.path.normcase(
+            os.path.join(self.root, "proj", "clip_00001.mp4")))
+
+    def test_paths_written_to_leave_are_still_refused(self):
+        self.video("own.mp4")
+        outside = os.path.join(self.elsewhere, "clip_00001.mp4")
+        for clip in ("../" + os.path.basename(self.root) + "x/a.mp4",
+                     "proj/../../clip_00001.mp4", outside, "", "proj"):
+            with self.subTest(clip=clip), self.assertRaises(ValueError):
+                nodes_load.resolve_clip_path(clip)
+        self.assertTrue(os.path.isfile(nodes_load.resolve_clip_path("own.mp4")))
+
+    def test_the_listing_walks_links_once(self):
+        self.video("own.mp4")
+        clips = nodes_load._list_clips()
+        self.assertIn("proj/clip_00001.mp4", clips)
+        self.assertIn("own.mp4", clips)
+        # proj/back leads to the output folder again: walked once only
+        self.assertEqual(len(clips), len(set(clips)))
+        self.assertFalse([c for c in clips if c.startswith("proj/back/")])
+
+    def test_a_link_never_takes_a_real_folders_place(self):
+        # "a_alias" sorts before the real "z_takes" it points to: the real
+        # folder is listed, the alias adds nothing
+        self.video("z_takes/clip_00002.mp4")
+        alias = os.path.join(self.root, "a_alias")
+        self.assertTrue(_link_folder(alias, os.path.join(self.root, "z_takes")))
+        self.links.insert(0, alias)
+        clips = nodes_load._list_clips()
+        self.assertIn("z_takes/clip_00002.mp4", clips)
+        self.assertNotIn("a_alias/clip_00002.mp4", clips)
+        # and the alias still loads, if a workflow names it
+        self.assertTrue(os.path.isfile(nodes_load.resolve_clip_path("a_alias/clip_00002.mp4")))
 
 
 if __name__ == "__main__":

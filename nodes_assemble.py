@@ -113,6 +113,28 @@ SEAM_ORDER = ("level_lock", "level_lock_frames", "level_lock_flicker",
 _TRUE = ("1", "on", "true", "yes")
 _FALSE = ("0", "off", "false", "no")
 
+# A PART ID rides in the same brackets, first: `clip.mp4 @ 40..80 [id=k3x9]`.
+# It is not a seam setting -- it names this line, so a pin (and the take
+# made from it) can say WHICH part of a file it continues when the file
+# stands in the cut more than once (a split clip). The widget writes one
+# only where a pin or a split needs it. A reader that predates it drops
+# the token with the usual unknown-setting warning, and nothing else
+# changes: the cut and the settings parse as before.
+PART_KEY = "id"
+PART_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
+
+
+def line_part(line):
+    """The line's part id, or None."""
+    m = _OPTS_RE.match(str(line).strip())
+    if not m:
+        return None
+    for token in m.group("opts").split():
+        key, sep, raw = token.partition("=")
+        if key == PART_KEY and sep and PART_RE.match(raw):
+            return raw
+    return None
+
 
 def split_seam_opts(line):
     """(line without its [...] tail, {key: value}).
@@ -128,6 +150,8 @@ def split_seam_opts(line):
     out = {}
     for token in m.group("opts").split():
         key, sep, raw = token.partition("=")
+        if key == PART_KEY:
+            continue                    # the line's name, see line_part
         kind = SEAM_KEYS.get(key)
         if not sep or kind is None:
             _LOG.warning("obvpm.h3: ignoring unknown seam setting %r in "
@@ -150,12 +174,11 @@ def split_seam_opts(line):
     return m.group("head").strip(), out
 
 
-def format_seam_opts(opts):
-    """The bracket section for `opts`, or "" when there is nothing to say."""
-    if not opts:
-        return ""
-    parts = []
-    for key in SEAM_ORDER:
+def format_seam_opts(opts, part=None):
+    """The bracket section for `opts` (and the part id, first), or "" when
+    there is nothing to say."""
+    parts = ["%s=%s" % (PART_KEY, part)] if part else []
+    for key in SEAM_ORDER if opts else ():
         val = opts.get(key)
         if val is None:
             continue
@@ -201,6 +224,7 @@ def _parse_sequence(sequence):
                         "seam_opts": {}})
             continue
         # settings first, so the cut regex sees the line it always saw
+        part = line_part(line)
         line, seam = split_seam_opts(line)
         m = _LINE_RE.match(line)
         if m.group("enter") is None and m.group("exit") is None \
@@ -216,12 +240,12 @@ def _parse_sequence(sequence):
         out.append({"clip": m.group("path").strip(), "gap": None,
                     "enter_override": None if enter is None else int(enter),
                     "exit_override": None if exit_ is None else int(exit_),
-                    "seam_opts": seam})
+                    "seam_opts": seam, "part": part})
     return out
 
 
 def format_sequence_line(clip, enter=None, exit_=None, gap=None,
-                         seam=None):
+                         seam=None, part=None):
     """The inverse of _parse_sequence, so the UI and the parser agree.
 
     Kept here rather than in the widget: a round-trip that disagrees with
@@ -229,7 +253,7 @@ def format_sequence_line(clip, enter=None, exit_=None, gap=None,
     """
     if gap is not None:
         return "~ %d" % int(gap)
-    tail = format_seam_opts(seam)
+    tail = format_seam_opts(seam, part)
     if enter is None and exit_ is None:
         return "%s%s" % (clip, tail)
     if exit_ is None:
@@ -284,7 +308,8 @@ def _handover(spec, place):
         int(spec.get("source_frames", 0) or 0), place,
         int(spec.get("mask_ramp_frames", 0) or 0),
         float(spec.get("mask_ramp_edge", 0.0) or 0.0),
-        float(spec.get("mask_hold", 0.0) or 0.0))
+        float(spec.get("mask_hold", 0.0) or 0.0),
+        decode_edge=bool(spec.get("handover_edge")))
 
 
 def _extend_parent(header):
@@ -324,6 +349,20 @@ def _prepend_child(header):
     return None
 
 
+def _edge_handover_at_end(child_header, parent_id, parent_header, delivered):
+    """Did the child's window end at the parent's delivered end, with the
+    join moved a step inside it (handover_edge)? Then the parent's exit
+    short of its end is the join, not a cut -- for the notes only."""
+    ph = int(parent_header.get("pinned_head_frames", 0) or 0)
+    for s in mctx.parse_pins(child_header):
+        if (s.get("place") == "before" and s.get("source_id") == parent_id
+                and s.get("handover_edge")):
+            end = (int(s.get("source_start", 0) or 0)
+                   + int(s.get("source_frames", 0) or 0) - ph)
+            return end == int(delivered)
+    return False
+
+
 def _derive_seam(left, right):
     """(left_exit_delivered_frame_or_None, right_enter_frame, note).
 
@@ -346,6 +385,10 @@ def _derive_seam(left, right):
                 "disagree with themselves; re-check the takes."
                 % (right["clip"], left["clip"], join, delivered))
         note = ("extends: seamless" if exit_f == delivered else
+                "extends: seamless, %s hands over at frame %d (its last "
+                "%d frames are its decode edge)"
+                % (left["clip"], exit_f, delivered - exit_f)
+                if _edge_handover_at_end(rh, l_id, lh, delivered) else
                 "extends at a cut: %s exits at frame %d (%d frames held "
                 "back)" % (left["clip"], exit_f, delivered - exit_f))
         return (None if exit_f == delivered else exit_f), 0, note
@@ -410,6 +453,45 @@ def _shape_note(shape):
 def pin_mode_for(role):
     """The mode a pin of this role must ride in."""
     return PIN_MODE_FOR_ROLE.get(role, "masked")
+
+
+def next_on_timeline(sequence, part, clip, cut):
+    """The clip on the line right after the pinned one, or None.
+
+    The pinned line is the one named by its part id, or -- a pin from
+    before part ids -- the first line of that clip entering at that cut.
+    A gap or the sequence's end after it means nothing follows.
+    """
+    entries = _parse_sequence(sequence)
+    for i, e in enumerate(entries):
+        if not e["clip"]:
+            continue
+        if part:
+            if e.get("part") != part:
+                continue
+        elif e["clip"] != clip or e["enter_override"] != cut:
+            continue
+        nxt = entries[i + 1] if i + 1 < len(entries) else None
+        return nxt["clip"] if nxt and nxt["clip"] else None
+    return None
+
+
+def _stamp_part(specs, part, cut):
+    """Mark one side's specs with the timeline part they came from.
+
+    `tl_part` is the line's part id and `tl_cut` the cut the run was
+    queued from (None = the clip's own edge). Both end up in the take's
+    recipe (mctx.serialize_pins), so the timeline can put the take back
+    beside THAT part -- and tell whether its cut has moved since -- even
+    when the file is in the cut more than once, and even after a reload.
+    No part, nothing written: the recipe stays exactly as before.
+    """
+    if not part:
+        return specs
+    for spec in specs:
+        spec["tl_part"] = part
+        spec["tl_cut"] = None if cut is None else int(cut)
+    return specs
 
 
 def masked_continuation(lh, rh):
@@ -1282,6 +1364,19 @@ class H3Timeline:
                 raise ValueError(
                     "H3Timeline: pin_state %s %d is negative."
                     % (key, out[key]))
+        # WHICH part of the file each side continues (the line's
+        # [id=...]), recorded into the take so it can find its way back
+        # to that part -- see _stamp_part. Optional: a pin written before
+        # part ids, or on a line that has none, simply has no answer.
+        for key in ("part", "part2"):
+            part = state.get(key)
+            if part is None:
+                continue
+            if not PART_RE.match(str(part)):
+                raise ValueError(
+                    "H3Timeline: pin_state %s %r is not a part id."
+                    % (key, part))
+            out[key] = str(part)
         if role == "bridge":
             # bridge = extend `source` AND prepend into `source2` in one
             # run (regenerating the clip between two links)
@@ -1294,8 +1389,23 @@ class H3Timeline:
             out["source2"] = source2
         return out
 
+    def _prepend_through(self, bundle, role, window, at_frame, pin_mode,
+                         mask_shape, sequence, part, clip):
+        """A prepend's specs from the take after the pinned line, when
+        that take continues the clip (nodes_load.prepend_through); None
+        when there is none."""
+        nxt = next_on_timeline(sequence, part, clip, at_frame)
+        if not nxt:
+            return None
+        nbundle = nodes_load.verified_bundle_or_none(nxt)
+        if nbundle is None:
+            return None
+        return nodes_load.prepend_through(
+            bundle, nbundle, nxt, self._PIN_ROLES[role], window,
+            at_frame=at_frame, pin_mode=pin_mode, mask_shape=mask_shape)
+
     def _specs_for(self, clip, role, window, at_frame, pin_mode="guide",
-                   mask_shape=None):
+                   mask_shape=None, sequence="", part=None):
         """One side's pin specs, latent-grade if the clip allows it.
 
         The choice is made HERE rather than refused: the timeline lists
@@ -1307,6 +1417,30 @@ class H3Timeline:
         claiming a lineage the encode cannot support.
         """
         bundle = nodes_load.verified_bundle_or_none(clip)
+        if bundle is not None and role == "prepend":
+            meta = bundle["meta"]
+            end = nodes_load.prepend_end(meta, window, at_frame)
+            room = (int(meta.get("delivered_frames", 0) or 0)
+                    + int(meta.get("pinned_tail_frames", 0) or 0))
+            if end > room:
+                specs = self._prepend_through(
+                    bundle, role, window, at_frame, pin_mode, mask_shape,
+                    sequence, part, clip)
+                if specs is not None:
+                    return specs
+                start = end - int(window)
+                if at_frame is not None:
+                    raise ValueError(
+                        "H3Timeline: a prepend at frame %d of %s needs %s "
+                        "frames from there, but only %d are left before "
+                        "the clip ends%s, and the clip after it on the "
+                        "timeline does not continue it. Prepend at an "
+                        "earlier cut, use a smaller window, or put the "
+                        "take that continues this clip after it."
+                        % (start, clip, window, max(0, room - start),
+                           "" if start == at_frame else
+                           " (the cut moved onto the latent grid from "
+                           "frame %d)" % at_frame))
         if bundle is not None:
             return nodes_load._create_pins(
                 bundle, clip, self._PIN_ROLES[role], window,
@@ -1396,12 +1530,18 @@ class H3Timeline:
             # masked departing the left clip; the arriving side is
             # whatever mode2 says -- see PIN_MODE_FOR_ROLE
             arrive = state["mode2"]
-            specs = (self._specs_for(state["source"], "extend",
-                                     state["window"], state.get("cut"),
-                                     BRIDGE_MODES["extend"]) +
-                     self._specs_for(state["source2"], "prepend",
-                                     state["window"], state.get("cut2"),
-                                     arrive, mask_shape=shape))
+            specs = (_stamp_part(
+                        self._specs_for(state["source"], "extend",
+                                        state["window"], state.get("cut"),
+                                        BRIDGE_MODES["extend"]),
+                        state.get("part"), state.get("cut")) +
+                     _stamp_part(
+                        self._specs_for(state["source2"], "prepend",
+                                        state["window"], state.get("cut2"),
+                                        arrive, mask_shape=shape,
+                                        sequence=sequence,
+                                        part=state.get("part2")),
+                        state.get("part2"), state.get("cut2")))
             _LOG.info("obvpm.h3: timeline pins a BRIDGE: extends %s (%s) "
                       "+ prepends into %s (%s%s), window %s",
                       state["source"], BRIDGE_MODES["extend"],
@@ -1409,9 +1549,12 @@ class H3Timeline:
                       _shape_note(shape) if shaped else "",
                       state["window"])
             return (specs, length, sequence, upscaling)
-        specs = self._specs_for(state["source"], state["role"],
-                                state["window"], state.get("cut"),
-                                state["mode"], mask_shape=shape)
+        specs = _stamp_part(
+            self._specs_for(state["source"], state["role"],
+                            state["window"], state.get("cut"),
+                            state["mode"], mask_shape=shape,
+                            sequence=sequence, part=state.get("part")),
+            state.get("part"), state.get("cut"))
         _LOG.info("obvpm.h3: timeline pins %s (%s, %s mode%s, window %s%s)",
                   state["source"], state["role"], state["mode"],
                   _shape_note(shape) if shaped else "",
@@ -1574,10 +1717,13 @@ class H3Assemble:
                         else:
                             bp = os.path.join(btd,
                                               "bridge_%d_%d.mp4" % (i, a))
-                            # the clip's OWN crf, or the splice fails
+                            # the clip's OWN crf and colour, or the
+                            # splice fails (both live in the extradata)
+                            from .nodes_save import source_colour
                             H3SaveVideoWithMCtx._encode_mp4(
                                 bp, part[a - enter:b - enter], None,
-                                source_crf(e["path"], crf))
+                                source_crf(e["path"], crf),
+                                colour=source_colour(e["path"]))
                             pieces.append({"path": bp, "from": 0,
                                            "to": b - a})
                             n_bridge += b - a

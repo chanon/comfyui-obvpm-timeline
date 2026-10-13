@@ -113,7 +113,7 @@ def load(clip_path, tail=False):
             with open(p, "wb") as f:
                 f.write(raw)
             from .preview_route import _decode_audio, _decode_images
-            out = (_decode_images(p), _decode_audio(p))
+            out = _fit_audio(_decode_images(p), _decode_audio(p))
     except Exception:
         _LOG.exception("obvpm.h3: could not read the overlap stored with %s",
                        clip_path)
@@ -122,6 +122,26 @@ def load(clip_path, tail=False):
         _CACHE.clear()
     _CACHE[key] = out
     return out
+
+
+def _fit_audio(images, audio):
+    """The overlap's sound cut to exactly its frames.
+
+    AAC is coded in blocks of 1024 samples, so the blob's audio decodes
+    padded to the next block with near-silence (up to 32 ms: 7 ms for a
+    39 frame overlap, 26 ms for 90). The MP4 says where the sound ends,
+    but the decoded stream does not stop there. A crossfade reads the
+    overlap from its END, so the padding landed on the join itself -- a
+    hole of near-silence right before it, and the rest of the overlap's
+    sound early by as much (issue #22).
+    """
+    if images is None or audio is None:
+        return images, audio
+    want = audio_frames_samples(int(images.shape[0]), audio["sample_rate"])
+    wave = audio["waveform"]
+    if int(wave.shape[-1]) > want:
+        audio = dict(audio, waveform=wave[..., :want])
+    return images, audio
 
 
 _PLANES = {}
