@@ -18,7 +18,14 @@ If these nodes and workflows save you time, consider supporting their developmen
 
 ### Workflow Updates
 
-#### v0.1.4-007 (Latest HEAD)
+#### v0.1.4-007A (Latest HEAD)
+
+- New workflow [`h3_obvpm_timeline_r2v_v0.1.4-007A.json`](workflows/h3_obvpm_timeline_r2v_v0.1.4-007A.json): 007 with fixed model defaults, otherwise the same. It runs on this pack's 0.1.4.
+- **Needs [comfyui-obvpm](https://github.com/chanon/comfyui-obvpm) 0.2.16 or newer** (and comfyui-obvpm-timeline 0.1.4 or newer). With 0.2.16, a workflow first opened while an older comfyui-obvpm was installed no longer loses the names its Get nodes read by (#47), and a model in a hidden field -- the turbo LoRA while `turbo_loader` is off -- no longer brings up ComfyUI's "Missing Models" warning; switched on and missing, it does.
+- The **H3 Model** override now holds `minimax_h3_ref2va_pruned_int8_convrot.safetensors`, the engine presets' own model, instead of `minimax_h3_hybrid_fl2va_ref2va_b30-49.safetensors`, which has since been renamed where it is published (#47). The override is still off by default.
+- The **lightx2v** engine preset uses the published `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors` from [lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo) at 8 steps (it named a file that is not published), and sets the model to `minimax_h3_ref2va_pruned_int8_convrot.safetensors`.
+
+#### v0.1.4-007 (2026-10-08)
 
 - New workflow [`h3_obvpm_timeline_r2v_v0.1.4-007.json`](workflows/h3_obvpm_timeline_r2v_v0.1.4-007.json). It runs on this pack's 0.1.4.
 - **Needs [comfyui-obvpm](https://github.com/chanon/comfyui-obvpm) 0.2.14 or newer and comfyui-obvpm-timeline 0.1.4 or newer.** The Compatibility Check node says so when the workflow loads.
@@ -27,12 +34,6 @@ If these nodes and workflows save you time, consider supporting their developmen
 - Generation and upscale load their VAEs separately: generation defaults to the faster `minimax_h3_video_vae_int8_convrot.safetensors`, while the upscale keeps `minimax_h3_video_vae_fp16.safetensors` for the final quality.
 - A **Megapixels Resolution Reference** note beside the timeline lists the width x height each megapixels setting gives at 16:9 and 4:3.
 - The live preview while sampling comes from the new **H3 Live Preview** node (with `taeh3.safetensors` in `models/vae_approx`) instead of KJNodes' Model Preview Override: the whole clip, pinned frames included, plays under the Result Preview's bar while it samples.
-
-#### v0.1.1-006 (2026-09-28)
-
-- New workflow [`h3_obvpm_timeline_r2v_v0.1.1-006.json`](workflows/h3_obvpm_timeline_r2v_v0.1.1-006.json). It runs on this pack's 0.1.1, with the same requirements as 005.
-- **New latent upscaler model:** the upscale pass now uses `minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors` (the previous file is no longer published). Download it from [Hugging Face](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/blob/main/minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors) into `ComfyUI/models/latent_upscale_models/`.
-- Fixed: an engine preset's `shift_video` did not change the noise schedule (the scheduler always used the model's built-in shift of 12, and the preset value only affected the audio). The shift is now applied once, in H3 Model Optimization, so it shapes the schedule and the sparse attention window too. The included presets all use 12, so their results are unchanged.
 
 Full history in [workflows/README.md](workflows/README.md)
 
@@ -187,7 +188,7 @@ Restart ComfyUI. No extra Python dependencies are required.
 
 ## Workflow
 
-The workflow is available in the [workflows](https://github.com/chanon/comfyui-obvpm-timeline/tree/main/workflows) folder. Use the latest, `h3_obvpm_timeline_r2v_v0.1.4-007.json` (it needs comfyui-obvpm 0.2.14 and this pack's 0.1.4, see [the workflow changelog](workflows/README.md)); the older `-006` and `-004` are kept for setups that cannot update yet.
+The workflow is available in the [workflows](https://github.com/chanon/comfyui-obvpm-timeline/tree/main/workflows) folder. Use the latest, `h3_obvpm_timeline_r2v_v0.1.4-007A.json` (it needs comfyui-obvpm 0.2.16 and this pack's 0.1.4, see [the workflow changelog](workflows/README.md)); the older `-007`, `-006` and `-004` are kept for setups that cannot update yet.
 
 ## Other Notes
 

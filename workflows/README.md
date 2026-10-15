@@ -8,7 +8,14 @@ v`[comfyui-obvpm-timeline nodepack version to use it with]`-`[workflow version n
 
 Use the latest workflow where possible. Older ones are kept for reference or in case a newer one has bugs or compatibility issues with a ComfyUI install.
 
-## v0.1.4-007 (Latest HEAD)
+## v0.1.4-007A (Latest HEAD)
+
+- New workflow [`h3_obvpm_timeline_r2v_v0.1.4-007A.json`](h3_obvpm_timeline_r2v_v0.1.4-007A.json): 007 with fixed model defaults, otherwise the same. It runs on this pack's 0.1.4.
+- **Needs [comfyui-obvpm](https://github.com/chanon/comfyui-obvpm) 0.2.16 or newer** (and comfyui-obvpm-timeline 0.1.4 or newer). With 0.2.16, a workflow first opened while an older comfyui-obvpm was installed no longer loses the names its Get nodes read by (#47), and a model in a hidden field -- the turbo LoRA while `turbo_loader` is off -- no longer brings up ComfyUI's "Missing Models" warning; switched on and missing, it does.
+- The **H3 Model** override now holds `minimax_h3_ref2va_pruned_int8_convrot.safetensors`, the engine presets' own model, instead of `minimax_h3_hybrid_fl2va_ref2va_b30-49.safetensors`, which has since been renamed where it is published (#47). The override is still off by default.
+- The **lightx2v** engine preset uses the published `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors` from [lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo) at 8 steps (it named a file that is not published), and sets the model to `minimax_h3_ref2va_pruned_int8_convrot.safetensors`.
+
+## v0.1.4-007 (2026-10-08)
 
 - New workflow [`h3_obvpm_timeline_r2v_v0.1.4-007.json`](h3_obvpm_timeline_r2v_v0.1.4-007.json). It runs on this pack's 0.1.4.
 - **Needs [comfyui-obvpm](https://github.com/chanon/comfyui-obvpm) 0.2.14 or newer and comfyui-obvpm-timeline 0.1.4 or newer.** The Compatibility Check node says so when the workflow loads.
