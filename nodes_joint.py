@@ -563,6 +563,65 @@ def derive_flags(items):
     return out
 
 
+def upscale_subset(sequence, skip):
+    """The sequence with the clips in `skip` (part ids or clip paths) left
+    out, for an upscale of only some of the timeline.
+
+    Every kept clip is written with the cut it plays IN THE FULL TIMELINE,
+    lineage-derived ends included, so it shows exactly the same frames
+    even when the clip it was derived from is gone. Where a clip is left
+    out the kept ones on either side meet as a cut (the joint splits
+    there, see split_segments), and the seam settings of the kept clip
+    after it are dropped: they were for a join that no longer exists.
+    Empty space between two kept clips stays; at the ends it goes, and so
+    does a `loop` line -- part of a ring is not a ring.
+    """
+    items = sequence_items(sequence)
+    lines = [line for kind, line in items if kind == "clip"]
+
+    def skipped(line):
+        part = na.line_part(line)
+        return (part is not None and part in skip) or clip_of_line(line) in skip
+
+    keep = [not skipped(line) for line in lines]
+    if all(keep):
+        return sequence
+    if not any(keep):
+        raise ValueError(
+            "H3 Timeline: every clip is switched off for the upscale -- "
+            "turn the upscale pill back on for at least one clip.")
+    headers = clip_headers([clip_of_line(line) for line in lines])
+    cuts = shown_cuts(lines, headers, derive_flags(items))
+    out, pending, after_kept, c = [], [], False, 0
+    for kind, value in items:
+        if kind == "gap":
+            if after_kept:
+                pending.append(int(value))
+            continue
+        i, c = c, c + 1
+        if not keep[i]:
+            pending, after_kept = [], False
+            continue
+        _, opts = na.split_seam_opts(value)
+        if not after_kept:
+            opts = {}
+        out.extend("~ %d" % g for g in pending)
+        pending = []
+        enter, exit_ = cuts[i]
+        if exit_ is not None:
+            marker = " @ %d..%d" % (enter or 0, exit_)
+        elif enter:
+            marker = " @ %d" % enter
+        else:
+            marker = ""
+        out.append(clip_of_line(value) + marker
+                   + na.format_seam_opts(opts, na.line_part(value)))
+        after_kept = True
+    _LOG.info("obvpm.h3: upscaling %d of %d clips:\n%s", sum(keep),
+              len(keep), "\n".join(out))
+    return "\n".join(out)
+
+
 def shown_range(layout, headers, cuts):
     """[lo, hi): the joint frames the cut shows of this layout's clips --
     the first clip's enter to the last clip's exit."""

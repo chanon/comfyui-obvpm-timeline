@@ -2071,6 +2071,11 @@ const TL_ROLE = {
 // more pin state.
 const TL_UPSCALE_BG = "rgba(28,106,116,0.92)";
 const TL_UPSCALE_HOVER = "rgba(38,132,144,0.95)";
+// a clip an upscale Run takes: the fill, the selected clip's fill, and
+// its seamless edges (turquoise where generation shows green)
+const TL_UPSCALE_CLIP = "rgba(28,106,116,0.92)";
+const TL_UPSCALE_CLIP_SEL = "rgba(36,158,170,1)";
+const TL_UPSCALE_EDGE = "#4fd6dd";
 // sibling-widget channel: Timeline nodes register {folder, offer,
 // forget} here so the Result Preview can hand them a good take or
 // report a deleted one. Frontend-only on purpose -- the graph stays
@@ -3817,6 +3822,56 @@ app.registerExtension({
             }
             paintRunMode();
 
+            // ---- which clips an upscale Run takes --------------------
+            // The hidden upscale_skip widget holds the clips switched
+            // OFF, so a clip added later is upscaled unless told
+            // otherwise, and empty means the whole timeline. Each is
+            // named by its part id when it has one (the two halves of a
+            // split clip are separate choices), else by its path; a
+            // path also covers every part of that file, which keeps a
+            // choice made before a split.
+            const upSkipWidget = node.widgets?.find(
+                (w) => w.name === "upscale_skip");
+            if (upSkipWidget) {
+                upSkipWidget.hidden = true;
+                (upSkipWidget.options ??= {}).hidden = true;
+            }
+            function upSkipSet() {
+                try {
+                    const v = JSON.parse(upSkipWidget?.value || "[]");
+                    return new Set(Array.isArray(v) ? v.map(String) : []);
+                } catch {
+                    return new Set();
+                }
+            }
+            function upSkipped(e, set = upSkipSet()) {
+                return !!e && e.gap == null
+                    && ((e.part != null && set.has(e.part))
+                        || set.has(e.clip));
+            }
+            // `want(e, i, skippedNow)` -> should entry i be skipped. The
+            // set is rewritten from the entries on screen, so keys of
+            // clips no longer on the timeline do not pile up.
+            function setUpSkip(entries, want) {
+                if (!upSkipWidget) return;
+                const set = upSkipSet();
+                const keys = [];
+                entries.forEach((e, i) => {
+                    if (e.gap != null) return;
+                    if (want(e, i, upSkipped(e, set))) {
+                        const k = e.part ?? e.clip;
+                        if (!keys.includes(k)) keys.push(k);
+                    }
+                });
+                const text = keys.length ? JSON.stringify(keys) : "";
+                if (text === (upSkipWidget.value || "")) return;
+                upSkipWidget.value = text;
+                try { upSkipWidget.callback?.(text); } catch { /* widget */ }
+                tlNoteEdit();
+                node.setDirtyCanvas?.(true, true);
+                void refresh();
+            }
+
             // Whether the sequence is a RING, said where it can be seen.
             // The fact still lives in ONE place, the `loop` line of the
             // sequence text: the button reads it to paint and writes it
@@ -3960,7 +4015,8 @@ app.registerExtension({
             // over the node's real pins. Anything genuinely wired is
             // skipped, so driving the mode from a graph still works.
             dropWidgetSockets(node, ["pin_state", "sequence", "auto_add",
-                                     "snap_cuts_to_grid", "upscaling"]);
+                                     "snap_cuts_to_grid", "upscaling",
+                                     "upscale_skip"]);
             // Editing the keyword re-renders the clip row, so the restore
             // button's enabled look tracks it instead of going stale.
             const rgWidget = node.widgets?.find(
@@ -6336,6 +6392,25 @@ app.registerExtension({
                         el.style.color = i === active ? PAL.text : PAL.sub;
                         return;
                     }
+                    // upscale mode: a clip the Run takes is turquoise
+                    // (brighter when selected), a skipped one muted
+                    const upState = upscaleMode()
+                        ? el.dataset?.obvpmUp : undefined;
+                    if (upState === "off") {
+                        el.style.background = PAL.rest;
+                        el.style.color = PAL.sub;
+                        el.style.borderColor = i === active
+                            ? TL_UPSCALE_EDGE : PAL.edge;
+                        return;
+                    }
+                    if (upState === "on") {
+                        el.style.background = i === active
+                            ? TL_UPSCALE_CLIP_SEL : TL_UPSCALE_CLIP;
+                        el.style.color = "#fff";
+                        el.style.borderColor = i === active
+                            ? "#fff" : "transparent";
+                        return;
+                    }
                     el.style.background =
                         i === active ? PAL.active : PAL.rest;
                     el.style.color =
@@ -6639,6 +6714,17 @@ app.registerExtension({
                 // instead was the old bug: a hole has no meta, so a
                 // boundary against empty space presented exactly like
                 // the end of the timeline and said so.
+                // upscale mode: a seamless join both of whose clips are
+                // upscaled is turquoise; with either skipped the upscale
+                // cuts there, so it is grey
+                const upSeamColor = (seam, Le, Re) => {
+                    if (!upscaleMode() || !upSkipWidget
+                            || seam.kind !== "seamless") {
+                        return TL_COLORS[seam.kind];
+                    }
+                    return upSkipped(Le) || upSkipped(Re)
+                        ? PAL.sub : TL_UPSCALE_EDGE;
+                };
                 const addZone = (i, x, seam, Le, Re) => {
                     const hasLink = !!(seam && seam.kind !== "butt");
                     const zone = document.createElement("div");
@@ -6674,7 +6760,7 @@ app.registerExtension({
                         // ink on a light page, light on a dark one --
                         // so it reads on both.
                         background: atPin ? TL_ROLE.extend.bg
-                            : hasLink && !seam.jump ? TL_COLORS[seam.kind]
+                            : hasLink && !seam.jump ? upSeamColor(seam, Le, Re)
                             : PAL.sub,
                         boxShadow: "0 0 0 2px rgba(0,0,0,0.35)",
                         transition: "height 0.1s",
@@ -8152,6 +8238,11 @@ app.registerExtension({
                         ?? (i === entries.length - 1
                             ? entries[0]?.wrapSeam : undefined);
                     const seamL = i > 0 ? e.seam : e.wrapSeam;
+                    const upOn = upscaleMode() && upSkipWidget
+                        ? !upSkipped(e) : null;
+                    const seamColor = upOn === true ? TL_UPSCALE_EDGE
+                        : upOn === false ? TL_COLORS.butt
+                        : TL_COLORS.seamless;
                     const mkBar = (side, color) => {
                         const bar = document.createElement("div");
                         Object.assign(bar.style, {
@@ -8169,13 +8260,13 @@ app.registerExtension({
                             pinHasRoleAt(i, pst, "prepend", entries)
                                 ? TL_ROLE.prepend.bg
                                 : seamL?.kind === "seamless" && !seamL.jump
-                                    ? TL_COLORS.seamless
+                                    ? seamColor
                                     : TL_COLORS.butt),
                         mkBar("right",
                             pinHasRoleAt(i, pst, "extend", entries)
                                 ? TL_ROLE.extend.bg
                                 : seamR?.kind === "seamless" && !seamR.jump
-                                    ? TL_COLORS.seamless
+                                    ? seamColor
                                     : TL_COLORS.butt));
                     const pinSlot = document.createElement("span");
                     Object.assign(pinSlot.style, {
@@ -8209,6 +8300,57 @@ app.registerExtension({
                                 : "the next generation prepends into this "
                                   + "clip's head";
                         pinSlot.appendChild(pb);
+                    }
+                    // upscale mode has no pin to show, so the slot holds
+                    // this clip's upscale switch instead
+                    if (upscaleMode() && upSkipWidget) {
+                        const off = upSkipped(e);
+                        const ub = document.createElement("button");
+                        ub.textContent = off ? "skip" : "upscale";
+                        Object.assign(ub.style, {
+                            display: "inline-flex", alignItems: "center",
+                            justifyContent: "center", height: "13px",
+                            padding: "0 6px", whiteSpace: "nowrap",
+                            borderRadius: "8px", cursor: "pointer",
+                            background: off ? "none"
+                                : "rgba(255,255,255,0.22)",
+                            border: "1px solid "
+                                + (off ? PAL.edge : "rgba(255,255,255,0.55)"),
+                            color: off ? "inherit" : "#fff",
+                            font: "9px sans-serif",
+                        });
+                        ub.title = (off
+                            ? "left out of the next upscale -- click to "
+                              + "upscale it"
+                            : "upscaled by the next Run -- click to leave "
+                              + "it out")
+                            + "\nshift+click: upscale only this clip "
+                            + "(again: all of them)";
+                        ub.addEventListener("click", (ev) => {
+                            ev.stopPropagation();
+                            if (ev.shiftKey) {
+                                const solo = entries.every((x, k) =>
+                                    x.gap != null || (k === i) !== upSkipped(x));
+                                setUpSkip(entries, (x, k) =>
+                                    solo ? false : k !== i);
+                                return;
+                            }
+                            setUpSkip(entries, (x, k, now) =>
+                                k === i ? !now : now);
+                        });
+                        // a click on the pill is not a click on the block
+                        ub.addEventListener("pointerdown",
+                            (ev) => ev.stopPropagation());
+                        pinSlot.appendChild(ub);
+                        block.dataset.obvpmUp = off ? "off" : "on";
+                        if (off) {
+                            // muted, like a muted node: greyed, dashed
+                            block.style.opacity = "0.4";
+                            block.style.borderStyle = "dashed";
+                            block.title += "\nleft out of the next upscale";
+                        } else {
+                            block.style.borderColor = "transparent";
+                        }
                     }
                     subRow.append(sub, mbadge, pinSlot);
                     const topRow = document.createElement("div");
@@ -8745,7 +8887,13 @@ app.registerExtension({
                     // The duration box is left off for the same reason
                     // the pin is: `length` feeds the generation branch,
                     // which this mode switches off.
-                    value.textContent = "upscale — refine and render the full sequence";
+                    const clipsNow = (lastEntries ?? []).filter(
+                        (x) => x.gap == null);
+                    const skipN = clipsNow.filter((x) => upSkipped(x)).length;
+                    value.textContent = skipN
+                        ? `upscale — refine and render ${clipsNow.length - skipN}`
+                          + ` of ${clipsNow.length} clips`
+                        : "upscale — refine and render the full sequence";
                     value.style.background = TL_UPSCALE_BG;
                     value.style.color = "#fff";
                     value.style.borderColor = "transparent";
@@ -8756,8 +8904,18 @@ app.registerExtension({
                         + "whole timeline as one piece and renders the "
                         + "full sequence instead of generating a new "
                         + "take. Any pin is kept exactly as it is and "
-                        + "comes back when you switch to generation.";
+                        + "comes back when you switch to generation."
+                        + "\nThe pill on each clip picks which clips "
+                        + "are upscaled.";
                     frame.append(value);
+                    if (skipN) {
+                        const allBtn = smallBtn("all",
+                            "Upscale every clip again");
+                        allBtn.style.flexShrink = "0";
+                        allBtn.addEventListener("click", () =>
+                            setUpSkip(lastEntries ?? [], () => false));
+                        frame.append(allBtn);
+                    }
                     return;
                 }
                 if (!st) {

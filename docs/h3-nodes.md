@@ -321,6 +321,7 @@ export). The node itself:
 | `audio_declick` | BOOLEAN | 5 ms taper each side of joins no crossfade covers (default **off**) |
 | `duration_seconds` | FLOAT | how long the next generation should be; the `length` output converts and snaps it |
 | `upscaling` | BOOLEAN (toolbar) | which half of the workflow a Run is for: off generates the next take, on refines the whole timeline and renders the full sequence. Driven by the **upscale** toggle on the strip toolbar past **export**, not from the setup widgets |
+| `upscale_skip` | STRING (hidden) | the clips an upscale Run leaves out, set from the **upscale** / **skip** pill each clip wears while upscaling is on (shift+click: only that clip). A JSON list of part ids, else clip paths; empty upscales the whole timeline. The kept clips go out on `sequence` with the cuts they play in the full timeline, and the upscale splits where a clip is left out |
 
 Outputs: `pin_specs`, `length`, `sequence`, `upscaling`.
 
