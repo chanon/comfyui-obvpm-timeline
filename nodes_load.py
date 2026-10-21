@@ -398,7 +398,6 @@ _PIN_INPUTS = {
 }
 
 _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov")
-_SCAN_DEPTH = 3
 
 # hash cache: {abs_path: (size, mtime_ns, sha256)}. Disposable memoization,
 # never authority.
@@ -406,7 +405,7 @@ _HASH_CACHE = {}
 
 
 def _list_clips():
-    """Video files under the output folder, relative paths, depth-limited.
+    """Video files under the output folder, as relative paths.
 
     Linked folders (symlinks, Windows junctions) are walked like real
     ones -- see resolve_clip_path -- unless the real folder they lead to
@@ -419,9 +418,6 @@ def _list_clips():
     seen = {os.path.normcase(os.path.realpath(root))}
     for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
         rel = os.path.relpath(dirpath, root)
-        depth = 0 if rel == "." else rel.count(os.sep) + 1
-        if depth >= _SCAN_DEPTH:
-            dirnames[:] = []
         dirnames[:] = _walkable(seen, dirpath, dirnames)
         for f in filenames:
             if f.lower().endswith(_VIDEO_EXTS):

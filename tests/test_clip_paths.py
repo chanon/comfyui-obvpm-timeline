@@ -263,6 +263,18 @@ class BackslashFolders(OutputFolder):
             nodes_save._save_prefix("..\\..\\elsewhere", "clip")
 
 
+class ClipListing(OutputFolder):
+    def test_deep_project_clips_are_listed(self):
+        project = "video/H3/OBVPM/project"
+        clips = ["clip_00001.mp4", "video/H3/clip_00001.mp4",
+                 *[f"{project}/clip_{n:05d}.mp4" for n in range(1, 4)],
+                 f"{project}/takes/variants/clip_00004.mp4"]
+        for clip in clips:
+            self.video(clip)
+        self.video(f"{project}/notes.txt")
+        self.assertEqual(nodes_load._list_clips(), sorted(clips))
+
+
 def _link_folder(link, target):
     """A folder link: a Windows junction (no admin rights needed) or a
     symlink. False when this host can make neither."""
