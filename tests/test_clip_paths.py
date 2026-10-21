@@ -297,7 +297,10 @@ class LinkedFolders(OutputFolder):
 
     def tearDown(self):
         for link in self.links:       # the link itself, never what it points at
-            os.rmdir(link)
+            if os.path.islink(link):
+                os.unlink(link)
+            else:
+                os.rmdir(link)
         shutil.rmtree(self.elsewhere, ignore_errors=True)
         super().tearDown()
 
