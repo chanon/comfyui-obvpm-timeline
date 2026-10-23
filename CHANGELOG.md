@@ -4,6 +4,10 @@ Changes to the nodes themselves. The workflows have their own changelog: [workfl
 
 Changes not yet in a release are listed under **Latest HEAD**; they become a numbered version when the pack is released.
 
+## Latest HEAD
+
+- New: **upscale only some clips.** In upscale mode every clip on the Timeline wears an **upscale** pill: click it to leave that clip out (**skip**), shift+click to upscale only that clip (again: all of them), and **all** on the next-run row puts every clip back. A Run then refines and renders only the clips left on. Each keeps exactly the frames it plays in the full timeline -- a cut it takes from the clip it continues included, even when that clip is skipped -- and where a clip is left out the clips either side meet as a cut, so the upscale splits into segments there. Generation is unaffected. Upscaled clips and the seamless joins between them are turquoise while upscale is on, skipped ones muted. The choice is the Timeline's new hidden `upscale_skip` widget (appended last, so saved timelines keep their widgets); it lists the clips left out, so a clip added later is upscaled, and empty -- every saved workflow -- upscales the whole timeline as before.
+
 ## 0.1.4 (2026-10-08)
 
 - New: **H3 Live Preview**, the sampler's picture while it samples, in the Result Preview: each step as a short clip on the take's own timeline (every latent step held for the frames it covers, so no frame rate to set), the pinned frames at the ends included so a join can be judged while it is made, encoded as H.264 on the CPU without holding up sampling. Put it on the model the sampler uses; it decodes with a tiny VAE for H3 from `models/vae_approx` (`taeh3.safetensors`), or the latent's own colours without one. It replaces KJNodes' Model Preview Override, which the Result Preview still shows when that is what is in the graph. See [H3 Live Preview](docs/h3-nodes.md#h3-live-preview).
